@@ -1,99 +1,84 @@
 import { defineStore } from 'pinia';
-import { LocalStorage } from 'quasar';
 import { authAPI } from '../api';
 
 export const useAuthStore = defineStore('auth', {
   state: () => ({
-    user: LocalStorage.getItem('user') || null,
-    token: LocalStorage.getItem('authToken') || null,
-    isAuthenticated: !!LocalStorage.getItem('authToken')
+    user: null,
+    token: localStorage.getItem('token') || null,
+    isAuthenticated: !!localStorage.getItem('token'),
+    loading: false,
+    error: null
   }),
 
   getters: {
     currentUser: (state) => state.user,
     userRole: (state) => state.user?.role,
-    isLoggedIn: (state) => state.isAuthenticated,
-    
-    // Role checks
-    isSuperAdmin: (state) => state.user?.role === 'super_admin',
-    isSuperAccountant: (state) => state.user?.role === 'super_accountant',
-    isUKDirector: (state) => state.user?.role === 'uk_director',
-    isUKAccountant: (state) => state.user?.role === 'uk_accountant',
-    isComplexAdmin: (state) => state.user?.role === 'complex_admin',
-    isWorker: (state) => state.user?.role === 'worker'
+    userName: (state) => state.user?.name,
+    userEmail: (state) => state.user?.email,
+    isAdmin: (state) => ['super_admin', 'uk_director'].includes(state.user?.role)
   },
 
   actions: {
-    /**
-     * Login user
-     */
-    async login(email, password) {
+    async login(credentials) {
+      this.loading = true;
+      this.error = null;
       try {
-        const response = await authAPI.login(email, password);
-        const { token, user } = response.data;
-        
-        this.token = token;
-        this.user = user;
+        const response = await authAPI.login(credentials);
+        this.token = response.data.token;
+        this.user = response.data.user;
         this.isAuthenticated = true;
-        
-        LocalStorage.set('authToken', token);
-        LocalStorage.set('user', user);
-        
-        return { success: true };
+        localStorage.setItem('token', this.token);
+        return response.data;
       } catch (error) {
-        return { success: false, error: error.message };
+        this.error = error.message || 'Login failed';
+        throw error;
+      } finally {
+        this.loading = false;
       }
     },
 
-    /**
-     * Logout user
-     */
     async logout() {
       try {
         await authAPI.logout();
       } catch (error) {
-        console.error('Logout error:', error);
+        console.error('Logout API call failed', error);
       } finally {
-        this.token = null;
         this.user = null;
+        this.token = null;
         this.isAuthenticated = false;
-        
-        LocalStorage.remove('authToken');
-        LocalStorage.remove('user');
+        localStorage.removeItem('token');
       }
     },
 
-    /**
-     * Fetch current user profile
-     */
-    async fetchProfile() {
+    async fetchUser() {
+      if (!this.token) return;
       try {
-        const response = await authAPI.getProfile();
+        const response = await authAPI.me();
         this.user = response.data;
-        LocalStorage.set('user', response.data);
-        return { success: true };
+        this.isAuthenticated = true;
       } catch (error) {
-        return { success: false, error: error.message };
+        this.logout();
+        throw error;
       }
     },
 
-    /**
-     * Check if user has permission
-     */
-    hasPermission(permission) {
-      if (!this.user) return false;
-      return this.user.permissions?.includes(permission) || false;
+    async refreshToken() {
+      try {
+        const response = await authAPI.refresh();
+        this.token = response.data.token;
+        localStorage.setItem('token', this.token);
+      } catch (error) {
+        this.logout();
+        throw error;
+      }
     },
 
-    /**
-     * Check if user has any of the roles
-     */
-    hasRole(roles) {
-      if (!this.user) return false;
-      if (Array.isArray(roles)) {
-        return roles.includes(this.user.role);
-      }
-      return this.user.role === roles;
+    setUser(user) {
+      this.user = user;
+    },
+
+    clearError() {
+      this.error = null;
     }
   }
 });
