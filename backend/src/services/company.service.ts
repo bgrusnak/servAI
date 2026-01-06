@@ -1,245 +1,159 @@
-import { db } from '../db';
-import { AppError } from '../middleware/errorHandler';
+import { AppDataSource } from '../db/data-source';
+import { Company } from '../entities/Company';
 import { logger } from '../utils/logger';
 
-interface Company {
-  id: string;
-  name: string;
-  inn?: string;
-  kpp?: string;
-  address?: string;
-  phone?: string;
-  email?: string;
-  is_active: boolean;
-  created_at: Date;
-  updated_at: Date;
-}
-
-interface CreateCompanyData {
-  name: string;
-  inn?: string;
-  kpp?: string;
-  address?: string;
-  phone?: string;
-  email?: string;
-}
-
-interface UpdateCompanyData {
-  name?: string;
-  inn?: string;
-  kpp?: string;
-  address?: string;
-  phone?: string;
-  email?: string;
-  is_active?: boolean;
-}
+const companyRepository = AppDataSource.getRepository(Company);
 
 export class CompanyService {
-  static async createCompany(data: CreateCompanyData): Promise<Company> {
-    const result = await db.query(
-      `INSERT INTO companies (name, inn, kpp, address, phone, email)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       RETURNING *`,
-      [data.name, data.inn, data.kpp, data.address, data.phone, data.email]
-    );
+  /**
+   * Create company
+   */
+  async createCompany(data: {
+    name: string;
+    legalName: string;
+    taxId: string;
+    email: string;
+    phoneNumber?: string;
+    address?: string;
+    city?: string;
+    country?: string;
+  }): Promise<Company> {
+    try {
+      // Check if company with this tax ID already exists
+      const existing = await companyRepository.findOne({
+        where: { taxId: data.taxId },
+      });
 
-    logger.info('Company created', { companyId: result.rows[0].id, name: data.name });
+      if (existing) {
+        throw new Error('Company with this tax ID already exists');
+      }
 
-    return result.rows[0];
-  }
+      const company = companyRepository.create(data);
+      await companyRepository.save(company);
 
-  static async getCompanyById(companyId: string): Promise<Company | null> {
-    const result = await db.query(
-      'SELECT * FROM companies WHERE id = $1 AND deleted_at IS NULL',
-      [companyId]
-    );
-
-    return result.rows.length > 0 ? result.rows[0] : null;
-  }
-
-  static async listCompanies(
-    page: number = 1,
-    limit: number = 20,
-    includeInactive: boolean = false
-  ): Promise<{ data: Company[]; total: number; page: number; limit: number }> {
-    const offset = (page - 1) * limit;
-
-    let query = 'SELECT * FROM companies WHERE deleted_at IS NULL';
-    if (!includeInactive) {
-      query += ' AND is_active = true';
+      logger.info('Company created', { companyId: company.id, name: company.name });
+      return company;
+    } catch (error) {
+      logger.error('Failed to create company', { error });
+      throw error;
     }
-    query += ' ORDER BY name ASC LIMIT $1 OFFSET $2';
-
-    const result = await db.query(query, [limit, offset]);
-
-    // Count
-    let countQuery = 'SELECT COUNT(*) as total FROM companies WHERE deleted_at IS NULL';
-    if (!includeInactive) {
-      countQuery += ' AND is_active = true';
-    }
-
-    const countResult = await db.query(countQuery);
-
-    return {
-      data: result.rows,
-      total: parseInt(countResult.rows[0].total),
-      page,
-      limit,
-    };
-  }
-
-  static async updateCompany(companyId: string, data: UpdateCompanyData): Promise<Company> {
-    const updates: string[] = [];
-    const values: any[] = [];
-    let paramIndex = 1;
-
-    if (data.name !== undefined) {
-      updates.push(`name = $${paramIndex++}`);
-      values.push(data.name);
-    }
-
-    if (data.inn !== undefined) {
-      updates.push(`inn = $${paramIndex++}`);
-      values.push(data.inn);
-    }
-
-    if (data.kpp !== undefined) {
-      updates.push(`kpp = $${paramIndex++}`);
-      values.push(data.kpp);
-    }
-
-    if (data.address !== undefined) {
-      updates.push(`address = $${paramIndex++}`);
-      values.push(data.address);
-    }
-
-    if (data.phone !== undefined) {
-      updates.push(`phone = $${paramIndex++}`);
-      values.push(data.phone);
-    }
-
-    if (data.email !== undefined) {
-      updates.push(`email = $${paramIndex++}`);
-      values.push(data.email);
-    }
-
-    if (data.is_active !== undefined) {
-      updates.push(`is_active = $${paramIndex++}`);
-      values.push(data.is_active);
-    }
-
-    if (updates.length === 0) {
-      throw new AppError('No fields to update', 400);
-    }
-
-    updates.push(`updated_at = NOW()`);
-    values.push(companyId);
-
-    const result = await db.query(
-      `UPDATE companies
-       SET ${updates.join(', ')}
-       WHERE id = $${paramIndex} AND deleted_at IS NULL
-       RETURNING *`,
-      values
-    );
-
-    if (result.rows.length === 0) {
-      throw new AppError('Company not found', 404);
-    }
-
-    logger.info('Company updated', { companyId });
-
-    return result.rows[0];
   }
 
   /**
-   * Delete company with cascading (fixes CRIT-004)
-   * Database triggers handle cascading automatically
+   * Get company by ID
    */
-  static async deleteCompany(companyId: string): Promise<{
-    message: string;
-    cascaded: {
-      condos: number;
-      buildings: number;
-      units: number;
-      residents: number;
-      invites: number;
-      roles: number;
-    };
-  }> {
-    return await db.transaction(async (client) => {
-      // Get cascade counts before deletion
-      const condosCount = await client.query(
-        'SELECT COUNT(*) as count FROM condos WHERE company_id = $1 AND deleted_at IS NULL',
-        [companyId]
-      );
+  async getCompanyById(companyId: string): Promise<Company | null> {
+    try {
+      return await companyRepository.findOne({
+        where: { id: companyId },
+        relations: ['condos'],
+      });
+    } catch (error) {
+      logger.error('Failed to get company', { error, companyId });
+      throw error;
+    }
+  }
 
-      const buildingsCount = await client.query(
-        `SELECT COUNT(*) as count FROM buildings b
-         INNER JOIN condos c ON c.id = b.condo_id
-         WHERE c.company_id = $1 AND b.deleted_at IS NULL AND c.deleted_at IS NULL`,
-        [companyId]
-      );
-
-      const unitsCount = await client.query(
-        `SELECT COUNT(*) as count FROM units u
-         INNER JOIN condos c ON c.id = u.condo_id
-         WHERE c.company_id = $1 AND u.deleted_at IS NULL AND c.deleted_at IS NULL`,
-        [companyId]
-      );
-
-      const residentsCount = await client.query(
-        `SELECT COUNT(*) as count FROM residents r
-         INNER JOIN units u ON u.id = r.unit_id
-         INNER JOIN condos c ON c.id = u.condo_id
-         WHERE c.company_id = $1 AND r.deleted_at IS NULL AND u.deleted_at IS NULL AND c.deleted_at IS NULL`,
-        [companyId]
-      );
-
-      const invitesCount = await client.query(
-        `SELECT COUNT(*) as count FROM invites i
-         INNER JOIN units u ON u.id = i.unit_id
-         INNER JOIN condos c ON c.id = u.condo_id
-         WHERE c.company_id = $1 AND i.deleted_at IS NULL AND u.deleted_at IS NULL AND c.deleted_at IS NULL`,
-        [companyId]
-      );
-
-      const rolesCount = await client.query(
-        'SELECT COUNT(*) as count FROM user_roles WHERE company_id = $1 AND deleted_at IS NULL',
-        [companyId]
-      );
-
-      // Soft delete company (triggers will cascade)
-      const result = await client.query(
-        'UPDATE companies SET deleted_at = NOW() WHERE id = $1 AND deleted_at IS NULL RETURNING id',
-        [companyId]
-      );
-
-      if (result.rowCount === 0) {
-        throw new AppError('Company not found', 404);
-      }
-
-      logger.warn('Company deleted with cascading', {
-        companyId,
-        condos: parseInt(condosCount.rows[0].count),
-        buildings: parseInt(buildingsCount.rows[0].count),
-        units: parseInt(unitsCount.rows[0].count),
-        residents: parseInt(residentsCount.rows[0].count),
-        invites: parseInt(invitesCount.rows[0].count),
-        roles: parseInt(rolesCount.rows[0].count),
+  /**
+   * Get all companies
+   */
+  async getAllCompanies(
+    limit: number = 50,
+    offset: number = 0
+  ): Promise<{ companies: Company[]; total: number }> {
+    try {
+      const [companies, total] = await companyRepository.findAndCount({
+        where: { isActive: true },
+        order: { name: 'ASC' },
+        take: limit,
+        skip: offset,
       });
 
-      return {
-        message: 'Company and all related entities deleted successfully',
-        cascaded: {
-          condos: parseInt(condosCount.rows[0].count),
-          buildings: parseInt(buildingsCount.rows[0].count),
-          units: parseInt(unitsCount.rows[0].count),
-          residents: parseInt(residentsCount.rows[0].count),
-          invites: parseInt(invitesCount.rows[0].count),
-          roles: parseInt(rolesCount.rows[0].count),
-        },
-      };
-    });
+      return { companies, total };
+    } catch (error) {
+      logger.error('Failed to get companies', { error });
+      throw error;
+    }
+  }
+
+  /**
+   * Update company
+   */
+  async updateCompany(
+    companyId: string,
+    data: Partial<{
+      name: string;
+      legalName: string;
+      email: string;
+      phoneNumber: string;
+      address: string;
+      city: string;
+      country: string;
+    }>
+  ): Promise<Company> {
+    try {
+      const company = await companyRepository.findOne({
+        where: { id: companyId },
+      });
+
+      if (!company) {
+        throw new Error('Company not found');
+      }
+
+      Object.assign(company, data);
+      await companyRepository.save(company);
+
+      logger.info('Company updated', { companyId });
+      return company;
+    } catch (error) {
+      logger.error('Failed to update company', { error, companyId });
+      throw error;
+    }
+  }
+
+  /**
+   * Delete company (soft delete)
+   */
+  async deleteCompany(companyId: string): Promise<void> {
+    try {
+      const company = await companyRepository.findOne({
+        where: { id: companyId },
+      });
+
+      if (!company) {
+        throw new Error('Company not found');
+      }
+
+      company.isActive = false;
+      await companyRepository.save(company);
+
+      logger.info('Company deleted', { companyId });
+    } catch (error) {
+      logger.error('Failed to delete company', { error, companyId });
+      throw error;
+    }
+  }
+
+  /**
+   * Search companies by name
+   */
+  async searchCompanies(query: string): Promise<Company[]> {
+    try {
+      return await companyRepository
+        .createQueryBuilder('company')
+        .where('company.is_active = :isActive', { isActive: true })
+        .andWhere(
+          '(LOWER(company.name) LIKE LOWER(:query) OR LOWER(company.legal_name) LIKE LOWER(:query))',
+          { query: `%${query}%` }
+        )
+        .orderBy('company.name', 'ASC')
+        .take(20)
+        .getMany();
+    } catch (error) {
+      logger.error('Failed to search companies', { error, query });
+      throw error;
+    }
   }
 }
+
+export const companyService = new CompanyService();
