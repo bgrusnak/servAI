@@ -47,16 +47,29 @@ export const config = {
 
   stripe: {
     secretKey: process.env.STRIPE_SECRET_KEY || '',
+    publishableKey: process.env.STRIPE_PUBLISHABLE_KEY || '',
     webhookSecret: process.env.STRIPE_WEBHOOK_SECRET || '',
   },
 
+  s3: {
+    endpoint: process.env.S3_ENDPOINT || 'http://localhost:9000',
+    region: process.env.S3_REGION || 'us-east-1',
+    bucket: process.env.S3_BUCKET || 'servai',
+    accessKeyId: process.env.S3_ACCESS_KEY_ID || '',
+    secretAccessKey: process.env.S3_SECRET_ACCESS_KEY || '',
+  },
+
   cors: {
-    origin: process.env.CORS_ORIGIN || 'http://localhost:5173',
+    allowedOrigins: (process.env.ALLOWED_ORIGINS || 'http://localhost:5173').split(','),
     credentials: true,
   },
 
   rateLimit: {
     windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS || '60000', 10),
     maxRequests: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS || '100', 10),
+  },
+
+  retention: {
+    auditLogs: parseInt(process.env.AUDIT_LOGS_RETENTION_DAYS || '90', 10),
   },
 };
