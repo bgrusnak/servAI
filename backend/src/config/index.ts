@@ -2,6 +2,23 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
+// Validate critical env variables
+const requiredEnvVars = [
+  'DATABASE_URL',
+  'REDIS_URL',
+  'JWT_SECRET',
+];
+
+const missingEnvVars = requiredEnvVars.filter(key => !process.env[key]);
+
+if (missingEnvVars.length > 0 && process.env.NODE_ENV === 'production') {
+  throw new Error(`Missing required environment variables: ${missingEnvVars.join(', ')}`);
+}
+
+if (process.env.JWT_SECRET === 'dev_jwt_secret' && process.env.NODE_ENV === 'production') {
+  throw new Error('JWT_SECRET must be changed from default value in production!');
+}
+
 export const config = {
   env: process.env.NODE_ENV || 'development',
   port: parseInt(process.env.PORT || '3000', 10),
@@ -12,6 +29,7 @@ export const config = {
       max: parseInt(process.env.DB_POOL_MAX || '20', 10),
       min: parseInt(process.env.DB_POOL_MIN || '5', 10),
       idle: parseInt(process.env.DB_POOL_IDLE || '10000', 10),
+      connectionTimeoutMillis: parseInt(process.env.DB_POOL_TIMEOUT || '5000', 10),
     },
   },
   
@@ -20,7 +38,7 @@ export const config = {
   },
   
   jwt: {
-    secret: process.env.JWT_SECRET || 'dev_jwt_secret',
+    secret: process.env.JWT_SECRET || 'dev_jwt_secret_CHANGE_THIS',
     expiresIn: process.env.JWT_EXPIRES_IN || '7d',
   },
   

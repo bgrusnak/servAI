@@ -28,49 +28,66 @@ async function getExecutedMigrations(): Promise<Migration[]> {
 
 async function executeMigration(name: string, sql: string): Promise<void> {
   await db.transaction(async (client) => {
-    await client.query(sql);
-    await client.query(
-      'INSERT INTO migrations (name) VALUES ($1)',
-      [name]
-    );
-    logger.info(`Migration executed: ${name}`);
+    try {
+      await client.query(sql);
+      await client.query(
+        'INSERT INTO migrations (name) VALUES ($1)',
+        [name]
+      );
+      logger.info(`✓ Migration executed successfully: ${name}`);
+    } catch (error) {
+      logger.error(`✗ Migration failed: ${name}`, { error });
+      throw new Error(`Migration ${name} failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
   });
 }
 
 async function runMigrations(): Promise<void> {
   try {
-    logger.info('Starting migrations...');
+    logger.info('=== Starting database migrations ===');
     
     await createMigrationsTable();
     
     const executedMigrations = await getExecutedMigrations();
     const executedNames = new Set(executedMigrations.map(m => m.name));
     
+    logger.info(`Already executed migrations: ${executedMigrations.length}`);
+    
     const migrationsDir = join(__dirname, 'migrations');
-    const files = await readdir(migrationsDir);
+    let files: string[];
+    
+    try {
+      files = await readdir(migrationsDir);
+    } catch (error) {
+      logger.warn('Migrations directory not found, skipping migrations');
+      return;
+    }
     
     const migrationFiles = files
       .filter(f => f.endsWith('.sql'))
       .sort();
     
-    let executed = 0;
+    const pendingMigrations = migrationFiles.filter(f => !executedNames.has(f));
     
-    for (const file of migrationFiles) {
-      if (!executedNames.has(file)) {
-        const filePath = join(migrationsDir, file);
-        const sql = await readFile(filePath, 'utf-8');
-        await executeMigration(file, sql);
-        executed++;
-      }
+    if (pendingMigrations.length === 0) {
+      logger.info('✓ No new migrations to execute');
+      logger.info('=== Migrations completed ===');
+      return;
     }
     
-    if (executed === 0) {
-      logger.info('No new migrations to execute');
-    } else {
-      logger.info(`Successfully executed ${executed} migration(s)`);
+    logger.info(`Found ${pendingMigrations.length} pending migration(s)`);
+    
+    for (const file of pendingMigrations) {
+      logger.info(`Executing migration: ${file}`);
+      const filePath = join(migrationsDir, file);
+      const sql = await readFile(filePath, 'utf-8');
+      await executeMigration(file, sql);
     }
+    
+    logger.info(`✓ Successfully executed ${pendingMigrations.length} migration(s)`);
+    logger.info('=== Migrations completed ===');
   } catch (error) {
-    logger.error('Migration failed', { error });
+    logger.error('!!! Migration process failed !!!', { error });
     throw error;
   }
 }
@@ -78,7 +95,7 @@ async function runMigrations(): Promise<void> {
 if (require.main === module) {
   runMigrations()
     .then(() => {
-      logger.info('Migrations completed');
+      logger.info('Migrations completed successfully');
       process.exit(0);
     })
     .catch((error) => {

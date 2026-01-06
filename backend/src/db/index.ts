@@ -11,14 +11,25 @@ class Database {
       max: config.database.pool.max,
       min: config.database.pool.min,
       idleTimeoutMillis: config.database.pool.idle,
+      connectionTimeoutMillis: config.database.pool.connectionTimeoutMillis,
     });
 
     this.pool.on('error', (err) => {
       logger.error('Unexpected error on idle client', err);
     });
 
-    this.pool.on('connect', () => {
-      logger.info('New database connection established');
+    this.pool.on('connect', (client) => {
+      logger.debug('New database connection established');
+      
+      // Auto-release client after 30 seconds if not released manually
+      const timeout = setTimeout(() => {
+        logger.warn('Client held for too long, forcing release');
+        client.release();
+      }, 30000);
+      
+      client.once('release', () => {
+        clearTimeout(timeout);
+      });
     });
   }
 
@@ -27,10 +38,16 @@ class Database {
     try {
       const result = await this.pool.query<T>(text, params);
       const duration = Date.now() - start;
-      logger.debug('Executed query', { text, duration, rows: result.rowCount });
+      
+      if (duration > 1000) {
+        logger.warn('Slow query detected', { text: text.substring(0, 100), duration, rows: result.rowCount });
+      } else {
+        logger.debug('Query executed', { duration, rows: result.rowCount });
+      }
+      
       return result;
     } catch (error) {
-      logger.error('Database query error', { text, error });
+      logger.error('Database query error', { text: text.substring(0, 100), error });
       throw error;
     }
   }
@@ -62,7 +79,7 @@ class Database {
 
   async healthCheck(): Promise<boolean> {
     try {
-      const result = await this.query('SELECT NOW()');
+      const result = await this.query('SELECT NOW() as time, version() as version');
       return result.rowCount !== null && result.rowCount > 0;
     } catch (error) {
       logger.error('Database health check failed', { error });

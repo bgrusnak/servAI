@@ -5,7 +5,7 @@ servAI is a SaaS platform for property management companies and residential comp
 ## Technology Stack
 
 - **Backend**: Node.js + Express, PostgreSQL, BullMQ
-- **Frontend**: Vue 3 + Quasar
+- **Frontend**: Vue 3 + Quasar (planned)
 - **Hosting**: Docker (backend, frontend, worker, database)
 - **AI**: Perplexity Sonar API for NLU and response generation
 - **Integrations**: Telegram Bot, Stripe Payments
@@ -15,87 +15,164 @@ servAI is a SaaS platform for property management companies and residential comp
 ### Prerequisites
 
 - Docker and Docker Compose
-- Node.js 18+ (for local development)
-- PostgreSQL 15+ (if running without Docker)
-- Redis 7+ (if running without Docker)
+- Node.js 18+ (for local development without Docker)
 
 ### Installation
 
-1. Clone the repository:
+1. **Clone the repository:**
 ```bash
 git clone https://github.com/bgrusnak/servAI.git
 cd servAI
 ```
 
-2. Copy environment file:
+2. **⚠️ IMPORTANT: Configure environment variables**
 ```bash
 cp .env.example .env
 ```
 
-3. Edit `.env` and set your API keys:
-- `TELEGRAM_BOT_TOKEN`
-- `STRIPE_SECRET_KEY`
-- `STRIPE_WEBHOOK_SECRET`
-- `PERPLEXITY_API_KEY`
-- `JWT_SECRET`
+3. **Edit `.env` and set required values:**
 
-4. Start with Docker Compose:
+**CRITICAL - Must change in production:**
+- `JWT_SECRET` - Use a strong random string (min 32 characters)
+- `POSTGRES_PASSWORD` - Strong database password
+
+**Required for full functionality:**
+- `TELEGRAM_BOT_TOKEN` - From @BotFather
+- `PERPLEXITY_API_KEY` - From Perplexity AI
+- `STRIPE_SECRET_KEY` - From Stripe Dashboard (for payments)
+- `STRIPE_WEBHOOK_SECRET` - From Stripe Webhooks
+
+**Production only:**
+- `ALLOWED_ORIGINS` - Comma-separated list of allowed domains
+
+4. **Start services:**
 ```bash
 docker-compose up -d
 ```
 
-5. Run migrations:
+5. **Wait for services to be ready:**
 ```bash
-docker-compose exec backend npm run migrate
+# Check backend health
+curl http://localhost:3000/health
+
+# Check if migrations completed
+curl http://localhost:3000/ready
 ```
 
-### Development
+**Migrations run automatically** when backend starts. No manual steps needed!
+
+6. **View logs:**
+```bash
+# All services
+docker-compose logs -f
+
+# Specific service
+docker-compose logs -f backend
+docker-compose logs -f worker
+```
+
+### Stopping Services
+
+```bash
+# Stop all services
+docker-compose down
+
+# Stop and remove volumes (⚠️ deletes all data)
+docker-compose down -v
+```
+
+### Development Without Docker
 
 #### Backend
 
 ```bash
 cd backend
 npm install
+
+# Make sure PostgreSQL and Redis are running locally
+# Update .env with local connection strings
+
 npm run dev
 ```
 
-#### Run migrations
+#### Worker
 
 ```bash
+cd backend
+npm run worker
+```
+
+#### Run migrations manually (if needed)
+
+```bash
+cd backend
 npm run migrate
 ```
 
-#### Create new migration
+### Troubleshooting
 
-```bash
-npm run migrate:create <migration_name>
-```
+**Backend won't start:**
+- Check if PostgreSQL is healthy: `docker-compose ps`
+- View backend logs: `docker-compose logs backend`
+- Verify DATABASE_URL in .env is correct
 
-### API Documentation
+**Migrations failed:**
+- Check backend logs for specific error
+- Migrations are transactional - failed migration won't partially apply
+- Fix the issue and restart: `docker-compose restart backend`
+
+**Worker not processing jobs:**
+- Check if Redis is running: `docker-compose ps redis`
+- View worker logs: `docker-compose logs worker`
+- Verify REDIS_URL in .env
+
+**Connection refused errors:**
+- Wait 30-40 seconds after `docker-compose up` for all services to start
+- Check health status: `curl http://localhost:3000/health`
+
+## API Documentation
 
 API documentation is available in `openapi.yaml`.
 
-### Project Structure
+**Base URL:** `http://localhost:3000/api`
+
+**Health checks:**
+- `GET /health` - Simple health check
+- `GET /ready` - Readiness check (includes DB and migrations)
+
+**API endpoints:**
+- `POST /api/auth/register` - User registration
+- `POST /api/auth/login` - User login
+- `GET /api/companies` - List companies (super_admin only)
+- `GET /api/condos` - List condos
+- `GET /api/units` - List units
+- `GET /api/users/me` - Current user info
+
+## Project Structure
 
 ```
 servAI/
 ├── backend/
 │   ├── src/
 │   │   ├── config/          # Configuration
-│   │   ├── db/              # Database and migrations
+│   │   ├── db/              # Database, migrations
+│   │   │   └── migrations/  # SQL migration files
 │   │   ├── middleware/      # Express middleware
 │   │   ├── routes/          # API routes
-│   │   ├── services/        # Business logic
+│   │   ├── services/        # Business logic (planned)
 │   │   ├── utils/           # Utilities
 │   │   ├── server.ts        # Express server
-│   │   └── worker.ts        # Background worker
+│   │   └── worker.ts        # Background worker (BullMQ)
+│   ├── logs/                # Application logs (Docker volume)
 │   ├── Dockerfile
 │   ├── package.json
 │   └── tsconfig.json
-├── frontend/               # Vue 3 + Quasar (to be implemented)
-├── docs/                   # Documentation
-├── docker-compose.yml
-├── .env.example
+├── frontend/                # Vue 3 + Quasar (planned)
+├── docs/                    # Documentation
+│   ├── BRIEF V1.md         # MVP requirements
+│   └── tasks.md            # Task breakdown
+├── docker-compose.yml       # Docker orchestration
+├── .env.example             # Environment template
 └── README.md
 ```
 
@@ -108,7 +185,7 @@ servAI/
 - Payment notifications and history
 - Task management for staff
 
-### Admin Panel
+### Admin Panel (Planned)
 - Multi-tenant architecture (companies/condos)
 - Unit management and Excel import
 - Service request queue
@@ -121,6 +198,17 @@ servAI/
 - **Perplexity Sonar**: NLU and AI response generation
 - **Stripe**: Payment processing
 - **BullMQ**: Background jobs (imports, billing, notifications)
+
+## Security Notes
+
+⚠️ **Before deploying to production:**
+
+1. Change `JWT_SECRET` to a strong random value
+2. Use strong database passwords
+3. Set `ALLOWED_ORIGINS` to your actual domain(s)
+4. Never commit `.env` file to git
+5. Use HTTPS for all external communications
+6. Keep API keys in secure secret management (not in .env in production)
 
 ## License
 
