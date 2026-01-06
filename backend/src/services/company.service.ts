@@ -5,13 +5,11 @@ import { logger } from '../utils/logger';
 interface Company {
   id: string;
   name: string;
-  legal_name?: string;
   inn?: string;
   kpp?: string;
   address?: string;
   phone?: string;
   email?: string;
-  website?: string;
   is_active: boolean;
   created_at: Date;
   updated_at: Date;
@@ -19,60 +17,68 @@ interface Company {
 
 interface CreateCompanyData {
   name: string;
-  legal_name?: string;
   inn?: string;
   kpp?: string;
   address?: string;
   phone?: string;
   email?: string;
-  website?: string;
 }
 
 interface UpdateCompanyData {
   name?: string;
-  legal_name?: string;
   inn?: string;
   kpp?: string;
   address?: string;
   phone?: string;
   email?: string;
-  website?: string;
   is_active?: boolean;
 }
 
 export class CompanyService {
-  /**
-   * List companies (user sees only companies where they have roles)
-   */
+  static async createCompany(data: CreateCompanyData): Promise<Company> {
+    const result = await db.query(
+      `INSERT INTO companies (name, inn, kpp, address, phone, email)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING *`,
+      [data.name, data.inn, data.kpp, data.address, data.phone, data.email]
+    );
+
+    logger.info('Company created', { companyId: result.rows[0].id, name: data.name });
+
+    return result.rows[0];
+  }
+
+  static async getCompanyById(companyId: string): Promise<Company | null> {
+    const result = await db.query(
+      'SELECT * FROM companies WHERE id = $1 AND deleted_at IS NULL',
+      [companyId]
+    );
+
+    return result.rows.length > 0 ? result.rows[0] : null;
+  }
+
   static async listCompanies(
-    userId: string,
     page: number = 1,
-    limit: number = 20
+    limit: number = 20,
+    includeInactive: boolean = false
   ): Promise<{ data: Company[]; total: number; page: number; limit: number }> {
     const offset = (page - 1) * limit;
 
-    // Get companies where user has any role
-    const result = await db.query(
-      `SELECT DISTINCT c.*
-       FROM companies c
-       INNER JOIN user_roles ur ON ur.company_id = c.id
-       WHERE ur.user_id = $1 
-         AND ur.deleted_at IS NULL 
-         AND c.deleted_at IS NULL
-       ORDER BY c.name
-       LIMIT $2 OFFSET $3`,
-      [userId, limit, offset]
-    );
+    let query = 'SELECT * FROM companies WHERE deleted_at IS NULL';
+    if (!includeInactive) {
+      query += ' AND is_active = true';
+    }
+    query += ' ORDER BY name ASC LIMIT $1 OFFSET $2';
 
-    const countResult = await db.query(
-      `SELECT COUNT(DISTINCT c.id) as total
-       FROM companies c
-       INNER JOIN user_roles ur ON ur.company_id = c.id
-       WHERE ur.user_id = $1 
-         AND ur.deleted_at IS NULL 
-         AND c.deleted_at IS NULL`,
-      [userId]
-    );
+    const result = await db.query(query, [limit, offset]);
+
+    // Count
+    let countQuery = 'SELECT COUNT(*) as total FROM companies WHERE deleted_at IS NULL';
+    if (!includeInactive) {
+      countQuery += ' AND is_active = true';
+    }
+
+    const countResult = await db.query(countQuery);
 
     return {
       data: result.rows,
@@ -82,92 +88,7 @@ export class CompanyService {
     };
   }
 
-  /**
-   * Get company by ID (check user access)
-   */
-  static async getCompanyById(companyId: string, userId: string): Promise<Company | null> {
-    const result = await db.query(
-      `SELECT c.*
-       FROM companies c
-       INNER JOIN user_roles ur ON ur.company_id = c.id
-       WHERE c.id = $1 
-         AND ur.user_id = $2
-         AND ur.deleted_at IS NULL
-         AND c.deleted_at IS NULL
-       LIMIT 1`,
-      [companyId, userId]
-    );
-
-    return result.rows.length > 0 ? result.rows[0] : null;
-  }
-
-  /**
-   * Create company and assign creator as company_admin
-   */
-  static async createCompany(data: CreateCompanyData, creatorId: string): Promise<Company> {
-    // Check INN uniqueness if provided
-    if (data.inn) {
-      const existing = await db.query(
-        'SELECT id FROM companies WHERE inn = $1 AND deleted_at IS NULL',
-        [data.inn]
-      );
-
-      if (existing.rows.length > 0) {
-        throw new AppError('Company with this INN already exists', 409);
-      }
-    }
-
-    // Create company and assign role in transaction
-    const result = await db.transaction(async (client) => {
-      const companyResult = await client.query(
-        `INSERT INTO companies (name, legal_name, inn, kpp, address, phone, email, website)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-         RETURNING *`,
-        [
-          data.name,
-          data.legal_name,
-          data.inn,
-          data.kpp,
-          data.address,
-          data.phone,
-          data.email,
-          data.website,
-        ]
-      );
-
-      const company = companyResult.rows[0];
-
-      // Assign creator as company_admin
-      await client.query(
-        `INSERT INTO user_roles (user_id, role, company_id, granted_by)
-         VALUES ($1, 'company_admin', $2, $1)`,
-        [creatorId, company.id]
-      );
-
-      return company;
-    });
-
-    logger.info('Company created', { companyId: result.id, name: data.name, creatorId });
-
-    return result;
-  }
-
-  /**
-   * Update company
-   */
   static async updateCompany(companyId: string, data: UpdateCompanyData): Promise<Company> {
-    // Check INN uniqueness if changing
-    if (data.inn) {
-      const existing = await db.query(
-        'SELECT id FROM companies WHERE inn = $1 AND id != $2 AND deleted_at IS NULL',
-        [data.inn, companyId]
-      );
-
-      if (existing.rows.length > 0) {
-        throw new AppError('Company with this INN already exists', 409);
-      }
-    }
-
     const updates: string[] = [];
     const values: any[] = [];
     let paramIndex = 1;
@@ -175,11 +96,6 @@ export class CompanyService {
     if (data.name !== undefined) {
       updates.push(`name = $${paramIndex++}`);
       values.push(data.name);
-    }
-
-    if (data.legal_name !== undefined) {
-      updates.push(`legal_name = $${paramIndex++}`);
-      values.push(data.legal_name);
     }
 
     if (data.inn !== undefined) {
@@ -207,11 +123,6 @@ export class CompanyService {
       values.push(data.email);
     }
 
-    if (data.website !== undefined) {
-      updates.push(`website = $${paramIndex++}`);
-      values.push(data.website);
-    }
-
     if (data.is_active !== undefined) {
       updates.push(`is_active = $${paramIndex++}`);
       values.push(data.is_active);
@@ -221,6 +132,7 @@ export class CompanyService {
       throw new AppError('No fields to update', 400);
     }
 
+    updates.push(`updated_at = NOW()`);
     values.push(companyId);
 
     const result = await db.query(
@@ -241,47 +153,93 @@ export class CompanyService {
   }
 
   /**
-   * Soft delete company
+   * Delete company with cascading (fixes CRIT-004)
+   * Database triggers handle cascading automatically
    */
-  static async deleteCompany(companyId: string): Promise<void> {
-    const result = await db.query(
-      'UPDATE companies SET deleted_at = NOW() WHERE id = $1 AND deleted_at IS NULL',
-      [companyId]
-    );
+  static async deleteCompany(companyId: string): Promise<{
+    message: string;
+    cascaded: {
+      condos: number;
+      buildings: number;
+      units: number;
+      residents: number;
+      invites: number;
+      roles: number;
+    };
+  }> {
+    return await db.transaction(async (client) => {
+      // Get cascade counts before deletion
+      const condosCount = await client.query(
+        'SELECT COUNT(*) as count FROM condos WHERE company_id = $1 AND deleted_at IS NULL',
+        [companyId]
+      );
 
-    if (result.rowCount === 0) {
-      throw new AppError('Company not found', 404);
-    }
+      const buildingsCount = await client.query(
+        `SELECT COUNT(*) as count FROM buildings b
+         INNER JOIN condos c ON c.id = b.condo_id
+         WHERE c.company_id = $1 AND b.deleted_at IS NULL AND c.deleted_at IS NULL`,
+        [companyId]
+      );
 
-    logger.info('Company deleted', { companyId });
-  }
+      const unitsCount = await client.query(
+        `SELECT COUNT(*) as count FROM units u
+         INNER JOIN condos c ON c.id = u.condo_id
+         WHERE c.company_id = $1 AND u.deleted_at IS NULL AND c.deleted_at IS NULL`,
+        [companyId]
+      );
 
-  /**
-   * Check if user has access to company with specific roles
-   */
-  static async checkUserAccess(
-    companyId: string,
-    userId: string,
-    requiredRoles?: string[]
-  ): Promise<boolean> {
-    let query = `
-      SELECT 1
-      FROM user_roles
-      WHERE company_id = $1 
-        AND user_id = $2
-        AND is_active = true
-        AND deleted_at IS NULL
-    `;
+      const residentsCount = await client.query(
+        `SELECT COUNT(*) as count FROM residents r
+         INNER JOIN units u ON u.id = r.unit_id
+         INNER JOIN condos c ON c.id = u.condo_id
+         WHERE c.company_id = $1 AND r.deleted_at IS NULL AND u.deleted_at IS NULL AND c.deleted_at IS NULL`,
+        [companyId]
+      );
 
-    const params: any[] = [companyId, userId];
+      const invitesCount = await client.query(
+        `SELECT COUNT(*) as count FROM invites i
+         INNER JOIN units u ON u.id = i.unit_id
+         INNER JOIN condos c ON c.id = u.condo_id
+         WHERE c.company_id = $1 AND i.deleted_at IS NULL AND u.deleted_at IS NULL AND c.deleted_at IS NULL`,
+        [companyId]
+      );
 
-    if (requiredRoles && requiredRoles.length > 0) {
-      query += ' AND role = ANY($3)';
-      params.push(requiredRoles);
-    }
+      const rolesCount = await client.query(
+        'SELECT COUNT(*) as count FROM user_roles WHERE company_id = $1 AND deleted_at IS NULL',
+        [companyId]
+      );
 
-    const result = await db.query(query, params);
+      // Soft delete company (triggers will cascade)
+      const result = await client.query(
+        'UPDATE companies SET deleted_at = NOW() WHERE id = $1 AND deleted_at IS NULL RETURNING id',
+        [companyId]
+      );
 
-    return result.rows.length > 0;
+      if (result.rowCount === 0) {
+        throw new AppError('Company not found', 404);
+      }
+
+      logger.warn('Company deleted with cascading', {
+        companyId,
+        condos: parseInt(condosCount.rows[0].count),
+        buildings: parseInt(buildingsCount.rows[0].count),
+        units: parseInt(unitsCount.rows[0].count),
+        residents: parseInt(residentsCount.rows[0].count),
+        invites: parseInt(invitesCount.rows[0].count),
+        roles: parseInt(rolesCount.rows[0].count),
+      });
+
+      return {
+        message: 'Company and all related entities deleted successfully',
+        cascaded: {
+          condos: parseInt(condosCount.rows[0].count),
+          buildings: parseInt(buildingsCount.rows[0].count),
+          units: parseInt(unitsCount.rows[0].count),
+          residents: parseInt(residentsCount.rows[0].count),
+          invites: parseInt(invitesCount.rows[0].count),
+          roles: parseInt(rolesCount.rows[0].count),
+        },
+      };
+    });
   }
 }
