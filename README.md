@@ -1,487 +1,339 @@
-# servAI - Smart Condo Management Platform 🏛️
+# servAI - Smart Condo Management Platform
 
-**Modern property management system powered by AI and automation.**
+🏠 **Comprehensive platform for managing condominiums with AI-powered Telegram bot assistant**
 
-[![Production Ready](https://img.shields.io/badge/production-ready-brightgreen)](EXTERNAL_AUDIT_REPORT.md)
-[![Security Score](https://img.shields.io/badge/security-9.5%2F10-brightgreen)](EXTERNAL_AUDIT_REPORT.md)
-[![Test Coverage](https://img.shields.io/badge/coverage-70%25-green)](backend/__tests__)
-[![License](https://img.shields.io/badge/license-MIT-blue)](#license)
+## Features
 
----
+### Core Platform
+- Multi-condo management
+- Unit & resident management
+- Financial tracking (invoices, payments)
+- Voting system
+- Ticket management
+- Vehicle access control
+- Utility meter readings
+- Document management
+- Audit logging
 
-## 🚀 Quick Start
+### AI Telegram Bot
+- Natural language conversation
+- Intent recognition via Perplexity AI
+- OCR for meter readings from photos
+- Multi-language support
+- Context-aware responses
+- **Production-ready rate limiting with Bull queue**
 
+## Tech Stack
+
+### Backend
+- **Node.js** + **TypeScript**
+- **Express.js** - REST API
+- **PostgreSQL** - Database
+- **Redis** - Caching & Bull queue
+- **Bull** - Job queue for Telegram rate limiting
+- **Telegram Bot API** - Bot interface
+- **Perplexity AI (Sonar)** - Intent recognition & OCR
+- **Stripe** - Payment processing
+- **Prometheus** - Metrics
+- **Winston** - Logging
+
+### Frontend
+- **Vue.js 3** + **TypeScript**
+- **Vuetify** - UI components
+- **Pinia** - State management
+- **Vite** - Build tool
+
+### Infrastructure
+- **Docker** + **Docker Compose**
+- **PostgreSQL 15**
+- **Redis 7**
+
+## Quick Start
+
+### Prerequisites
+- Docker & Docker Compose
+- Node.js 18+ (for local development)
+- Telegram Bot Token (from [@BotFather](https://t.me/botfather))
+- Perplexity API Key (from [perplexity.ai](https://www.perplexity.ai/))
+
+### Setup
+
+1. **Clone repository**
 ```bash
-# Clone repository
 git clone https://github.com/bgrusnak/servAI.git
-cd servAI/backend
-
-# Install dependencies
-npm install
-
-# Setup environment
-cp .env.example .env
-# Edit .env with your configuration
-
-# Run migrations
-npm run migrate
-
-# Start development server
-npm run dev
-
-# Server running at http://localhost:3000
+cd servAI
 ```
 
----
+2. **Configure environment**
+```bash
+cp .env.example .env
+# Edit .env and set:
+# - TELEGRAM_BOT_TOKEN
+# - PERPLEXITY_API_KEY
+# - JWT_SECRET (generate random string)
+```
 
-## 🎯 Features
+3. **Start services**
+```bash
+docker-compose up -d
+```
 
-### ✅ Core Functionality
+4. **Run database migrations**
+```bash
+docker-compose exec backend npm run migrate
+```
 
-- **Multi-Tenant Architecture** - Companies, condos, buildings, units
-- **Role-Based Access Control** - 5 roles with hierarchical permissions
-- **Invite System** - Secure token-based onboarding
-- **Authentication** - JWT with refresh tokens
-- **Email Verification** - One-time token verification
-- **Password Reset** - Secure reset flow with rate limiting
+5. **Access application**
+- Backend API: http://localhost:3000
+- Health check: http://localhost:3000/health
+- Metrics: http://localhost:3000/metrics
 
-### 🔐 Security (9.5/10)
+## Telegram Bot Rate Limiting
 
-- **OWASP Top 10 Compliant** - All vulnerabilities addressed
-- **Rate Limiting** - Redis-backed with graceful fallback
-- **SQL Injection Prevention** - Parameterized queries only
-- **XSS Protection** - Helmet middleware configured
-- **Secure Tokens** - 256-bit with SHA-256 hashing
-- **Transaction Safety** - Row-level locking, atomic operations
+### Implementation
 
-### 📊 Monitoring & Observability
+The bot uses **Bull queue** with Redis for production-ready rate limiting:
 
-- **Prometheus Metrics** - HTTP, database, business metrics
-- **Health Checks** - Liveness + readiness probes
-- **Structured Logging** - Winston with request ID tracing
-- **Error Tracking** - Comprehensive error handling
+```typescript
+// Configurable via environment
+TELEGRAM_RATE_LIMIT_PER_SECOND=25  // Default: 25 msg/sec
+```
 
-### 🧪 Testing (70% Coverage)
+### Features
 
-- **Unit Tests** - 18 test suites
-- **Integration Tests** - Full API flow testing
-- **Security Tests** - Race conditions, SQL injection, rate limiting
+✅ **Automatic rate limiting** (25 messages/second by default)
+✅ **429 handling** - Respects Telegram's `Retry-After` header
+✅ **FloodWait handling** - Delays messages to same chat
+✅ **Priority support** - Critical messages sent first
+✅ **Exponential backoff** - 3 retries with increasing delays
+✅ **Graceful fallback** - Direct send if queue fails
+✅ **Metrics** - Queue size, delays, errors via Prometheus
 
----
+### Why Bull Queue?
 
-## 🏗️ Architecture
+| Feature | Without Queue | With Bull Queue |
+|---------|--------------|------------------|
+| **Non-blocking** | ❌ Blocks event loop | ✅ Async processing |
+| **Rate limiting** | ❌ Manual throttling | ✅ Built-in limiter |
+| **Retry logic** | ⚠️ Basic | ✅ Advanced with backoff |
+| **Scalability** | ❌ Single instance | ✅ Multi-instance via Redis |
+| **Monitoring** | ❌ None | ✅ Prometheus metrics |
+| **Priority** | ❌ FIFO only | ✅ Priority queue |
 
-### Technology Stack
+### Telegram API Limits
 
-**Backend:**
-- Node.js 18+ (LTS)
-- TypeScript 5.3 (strict mode)
-- Express 4.18
-- PostgreSQL 14+
-- Redis 7+
+| Limit Type | Value | Our Protection |
+|-----------|-------|----------------|
+| Group messages | 20/min | ✅ Tracked per chat |
+| Different chats | 30/sec | ✅ Global limiter (25/sec) |
+| Same chat | 1/sec | ✅ FloodWait handler |
 
-**Security:**
-- JWT (jsonwebtoken)
-- bcrypt (password hashing)
-- helmet (security headers)
-- Zod (input validation)
+### Queue Metrics
 
-**Monitoring:**
-- Winston (logging)
-- Prometheus (metrics)
-- Grafana (dashboards)
+```prometheus
+telegram_queue_size          # Current queue size
+telegram_queue_delayed       # Delayed jobs count
+telegram_messages_total{status="queued|sent|rate_limited|flood_wait"}
+```
+
+## Architecture
 
 ### Database Schema
 
 ```
-users
-├── companies
-│   └── condos
-│       ├── buildings
-│       │   └── entrances
-│       │       └── units
-│       └── residents (many-to-many with users)
-└── invites
-    refresh_tokens
-    password_reset_tokens
-    email_verification_tokens
+condos → buildings → units → residents ← users
+                              ↓
+                        telegram_users → conversations
+                              ↓
+                        user_context
 ```
 
----
+### Services
 
-## 📚 API Documentation
+- **telegram.service.ts** - Bot logic + Queue
+- **perplexity.service.ts** - AI integration
+- **auth.service.ts** - Authentication
+- **payment.service.ts** - Stripe integration
+
+## Development
+
+### Local Development (without Docker)
+
+```bash
+# Install dependencies
+cd backend && npm install
+cd ../frontend && npm install
+
+# Start PostgreSQL and Redis
+docker-compose up -d postgres redis
+
+# Run migrations
+cd backend && npm run migrate
+
+# Start backend
+npm run dev
+
+# Start frontend (separate terminal)
+cd frontend && npm run dev
+```
+
+### Testing
+
+```bash
+# Backend tests
+cd backend
+npm test
+npm run test:coverage
+
+# Frontend tests
+cd frontend
+npm test
+```
+
+### Code Quality
+
+```bash
+# Linting
+npm run lint
+npm run lint:fix
+
+# Formatting
+npm run format
+```
+
+## Environment Variables
+
+### Required
+
+```env
+TELEGRAM_BOT_TOKEN=your_bot_token
+PERPLEXITY_API_KEY=your_api_key
+JWT_SECRET=strong_random_string_change_in_production
+```
+
+### Optional
+
+```env
+# Telegram
+TELEGRAM_USE_WEBHOOK=false              # Use polling (dev) or webhook (prod)
+TELEGRAM_WEBHOOK_URL=https://api.example.com
+TELEGRAM_RATE_LIMIT_PER_SECOND=25      # Message rate limit
+
+# AI
+SONAR_MODEL=llama-3.1-sonar-small-128k-online
+SONAR_MAX_TOKENS=4096
+SONAR_TEMPERATURE=0.2
+CONVERSATION_HISTORY_LIMIT=20
+INTENT_CONFIDENCE_THRESHOLD=0.7
+
+# Database
+DB_POOL_MAX=20
+DB_POOL_MIN=5
+
+# Rate Limiting (REST API)
+RATE_LIMIT_WINDOW_MS=60000
+RATE_LIMIT_MAX_REQUESTS=100
+```
+
+See [.env.example](.env.example) for full list.
+
+## Deployment
+
+### Production Checklist
+
+- [ ] Change `JWT_SECRET` to strong random string
+- [ ] Set `NODE_ENV=production`
+- [ ] Configure `TELEGRAM_USE_WEBHOOK=true`
+- [ ] Set up HTTPS endpoint for `TELEGRAM_WEBHOOK_URL`
+- [ ] Configure `ALLOWED_ORIGINS` for CORS
+- [ ] Set strong `POSTGRES_PASSWORD`
+- [ ] Configure backup strategy for PostgreSQL
+- [ ] Set up monitoring (Prometheus + Grafana)
+- [ ] Configure log aggregation
+- [ ] Review rate limits based on load
+
+### Docker Production
+
+```bash
+# Build production image
+docker-compose -f docker-compose.prod.yml build
+
+# Start services
+docker-compose -f docker-compose.prod.yml up -d
+
+# View logs
+docker-compose logs -f backend
+```
+
+## API Documentation
 
 ### Authentication
 
 ```bash
 # Register
 POST /api/v1/auth/register
-Body: { email, password, first_name, last_name }
+Content-Type: application/json
+
+{
+  "email": "user@example.com",
+  "password": "SecurePass123",
+  "firstName": "John",
+  "lastName": "Doe"
+}
 
 # Login
 POST /api/v1/auth/login
-Body: { email, password }
-Response: { access_token, refresh_token, expires_in }
+Content-Type: application/json
 
-# Refresh Token
-POST /api/v1/auth/refresh
-Body: { refresh_token }
+{
+  "email": "user@example.com",
+  "password": "SecurePass123"
+}
 
-# Logout
-POST /api/v1/auth/logout
-Body: { refresh_token }
+Response:
+{
+  "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "user": {...}
+}
 ```
 
-### Companies (CRUD)
+### Telegram Bot
 
-```bash
-# List
-GET /api/v1/companies?page=1&limit=20
-Headers: Authorization: Bearer <token>
+Talk to your bot on Telegram:
+1. Find your bot (search by username)
+2. Send `/start <invite_token>` with invite link from admin
+3. Chat naturally - AI will understand intent
+4. Send meter photos - OCR will read values
 
-# Create
-POST /api/v1/companies
-Body: { name, email, phone, address }
+## Contributing
 
-# Get by ID
-GET /api/v1/companies/:id
+1. Fork repository
+2. Create feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit changes (`git commit -m 'Add amazing feature'`)
+4. Push to branch (`git push origin feature/amazing-feature`)
+5. Open Pull Request
 
-# Update
-PATCH /api/v1/companies/:id
-Body: { name?, email?, phone? }
+## License
 
-# Delete (soft)
-DELETE /api/v1/companies/:id
-```
+MIT License - see [LICENSE](LICENSE) file
 
-### Invites
+## Support
 
-```bash
-# Generate Invite
-POST /api/v1/invites
-Body: { email, unit_id, role, expires_in_days? }
+- 📧 Email: support@servai.example
+- 🐛 Issues: [GitHub Issues](https://github.com/bgrusnak/servAI/issues)
+- 💬 Telegram: [@servai_support](https://t.me/servai_support)
 
-# Validate Invite
-GET /api/v1/invites/validate/:token
+## Roadmap
 
-# Accept Invite
-POST /api/v1/invites/accept
-Body: { token, password?, first_name?, last_name? }
-
-# List Invites
-GET /api/v1/invites?status=pending&page=1
-```
-
-### Password Reset
-
-```bash
-# Request Reset
-POST /api/v1/password-reset/request
-Body: { email }
-
-# Validate Token
-GET /api/v1/password-reset/validate/:token
-
-# Reset Password
-POST /api/v1/password-reset/reset
-Body: { token, new_password }
-```
-
-### Email Verification
-
-```bash
-# Verify Email
-POST /api/v1/email-verification/verify
-Body: { token }
-
-# Resend Verification
-POST /api/v1/email-verification/resend
-Headers: Authorization: Bearer <token>
-
-# Check Status
-GET /api/v1/email-verification/status
-Headers: Authorization: Bearer <token>
-```
-
-### Monitoring
-
-```bash
-# Health Check
-GET /health
-Response: { status: "ok", checks: {...} }
-
-# Liveness Probe
-GET /health/liveness
-
-# Readiness Probe
-GET /health/readiness
-
-# Prometheus Metrics
-GET /metrics
-```
-
-**Full API documentation:** See [API_DOCS.md](API_DOCS.md)
+- [x] Core platform features
+- [x] Telegram bot with AI
+- [x] Rate limiting with Bull queue
+- [ ] Mobile app (React Native)
+- [ ] Email notifications
+- [ ] Advanced analytics dashboard
+- [ ] Multi-language UI
+- [ ] Integration with smart home devices
 
 ---
 
-## 👨‍💻 Development
-
-### Setup
-
-```bash
-# Install dependencies
-npm install
-
-# Setup database
-creatdb servai_dev
-npm run migrate
-
-# Run tests
-npm test
-npm run test:coverage
-
-# Lint
-npm run lint
-npm run lint:fix
-
-# Format
-npm run format
-```
-
-### Environment Variables
-
-```env
-# Required
-DATABASE_URL=postgresql://user:pass@localhost:5432/servai_dev
-REDIS_URL=redis://localhost:6379
-JWT_SECRET=your_secret_min_32_chars
-
-# Email (optional for dev)
-EMAIL_API_KEY=sendgrid_api_key
-EMAIL_FROM=noreply@servai.app
-
-# App
-NODE_ENV=development
-PORT=3000
-APP_URL=http://localhost:3000
-CORS_ORIGIN=http://localhost:5173
-```
-
-### Database Migrations
-
-```bash
-# Create migration
-cp backend/src/db/migrations/000_template.sql backend/src/db/migrations/011_your_migration.sql
-
-# Edit migration file
-vim backend/src/db/migrations/011_your_migration.sql
-
-# Run migration
-npm run migrate
-
-# Verify
-psql servai_dev -c "SELECT * FROM schema_migrations;"
-```
-
----
-
-## 🚀 Production Deployment
-
-### Requirements
-
-- **Server:** 4 vCPU, 8GB RAM minimum
-- **Database:** PostgreSQL 14+ (managed service recommended)
-- **Cache:** Redis 7+ (managed service recommended)
-- **Node.js:** v18+ LTS
-- **Domain:** SSL/TLS certificate
-
-### Deployment Guide
-
-See [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md) for detailed instructions.
-
-### Quick Deploy
-
-```bash
-# 1. Clone and build
-git clone https://github.com/bgrusnak/servAI.git
-cd servAI/backend
-npm ci --production
-npm run build
-
-# 2. Setup environment
-cp .env.production .env
-# Edit .env with production values
-
-# 3. Run migrations
-npm run migrate
-
-# 4. Start with PM2
-pm2 start ecosystem.config.js --env production
-
-# 5. Configure Nginx reverse proxy
-# (See DEPLOYMENT_GUIDE.md)
-```
-
----
-
-## 📊 Performance
-
-### Benchmarks (Single Server)
-
-| Endpoint | RPS | P95 Latency | P99 Latency |
-|----------|-----|-------------|-------------|
-| `/health` | 2000+ | <50ms | <100ms |
-| Login | 500+ | <200ms | <500ms |
-| CRUD (GET) | 1000+ | <100ms | <200ms |
-| CRUD (POST) | 500+ | <200ms | <500ms |
-
-**Load Testing Guide:** See [LOAD_TESTING_GUIDE.md](LOAD_TESTING_GUIDE.md)
-
----
-
-## 🔒 Security
-
-### Audit Results
-
-**External Audit Score:** **9.3/10** (Excellent)  
-**Security Score:** **9.5/10** (Excellent)  
-**Status:** **APPROVED FOR PRODUCTION** ✅
-
-See [EXTERNAL_AUDIT_REPORT.md](EXTERNAL_AUDIT_REPORT.md) for full audit.
-
-### Security Features
-
-- ✅ OWASP Top 10 compliance
-- ✅ Rate limiting (Redis-backed)
-- ✅ Secure password hashing (bcrypt)
-- ✅ JWT with refresh tokens
-- ✅ SQL injection prevention
-- ✅ XSS protection
-- ✅ CSRF protection (stateless API)
-- ✅ Secure token generation (crypto)
-- ✅ Row-level locking
-- ✅ Transaction safety
-
-### Reporting Security Issues
-
-Email: [security@servai.app](mailto:security@servai.app)
-
----
-
-## 🧪 Testing
-
-### Run Tests
-
-```bash
-# All tests
-npm test
-
-# With coverage
-npm run test:coverage
-
-# Unit tests only
-npm run test:unit
-
-# Integration tests
-npm run test:integration
-
-# Security tests
-npm run test:security
-
-# Watch mode
-npm run test:watch
-```
-
-### Test Coverage
-
-```
-Statements   : 70.2%
-Branches     : 65.8%
-Functions    : 68.5%
-Lines        : 72.1%
-```
-
-**Target:** 80%+ coverage
-
----
-
-## 📝 Documentation
-
-### Available Docs
-
-- **[API Documentation](API_DOCS.md)** - Complete API reference
-- **[Deployment Guide](DEPLOYMENT_GUIDE.md)** - Production deployment
-- **[Runbook](RUNBOOK.md)** - Operations and troubleshooting
-- **[Load Testing](LOAD_TESTING_GUIDE.md)** - Performance testing
-- **[Security Audit](EXTERNAL_AUDIT_REPORT.md)** - Independent audit report
-- **[Changelog](CHANGELOG.md)** - Version history
-- **[Testing Guide](TESTING.md)** - Test strategy and coverage
-
----
-
-## 👥 Team
-
-### Roles
-
-| Role | Permissions |
-|------|-------------|
-| **super_admin** | Full system access |
-| **company_admin** | Manage company and all condos |
-| **condo_manager** | Manage specific condo |
-| **owner** | Manage owned units |
-| **tenant** | View only access |
-
----
-
-## 🛠️ Maintenance
-
-### Daily Tasks
-- Monitor error rates in Grafana
-- Check application logs
-- Verify backup completion
-
-### Weekly Tasks
-- Review security alerts
-- Check disk space
-- Review slow queries
-- Update dependencies (security)
-
-### Monthly Tasks
-- Security audit
-- Performance review
-- Backup restoration test
-- Capacity planning
-
----
-
-## 📞 Support
-
-**Documentation:** https://docs.servai.app  
-**Status Page:** https://status.servai.app  
-**Email:** [support@servai.app](mailto:support@servai.app)  
-**Emergency:** [oncall@servai.app](mailto:oncall@servai.app)
-
----
-
-## 📄 License
-
-MIT License - see [LICENSE](LICENSE) file for details.
-
----
-
-## ⭐ Acknowledgments
-
-- Express.js team
-- PostgreSQL community
-- Redis team
-- All open-source contributors
-
----
-
-**Version:** 0.3.2  
-**Status:** Production Ready 🚀  
-**Last Updated:** January 6, 2026
-
----
-
-**Made with ❤️ by the servAI Team**
+**Built with ❤️ by servAI Team**
