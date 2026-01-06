@@ -1,0 +1,102 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: servai-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-servai}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-servai_dev_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-servai}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-servai}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: servai-redis
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: servai-backend
+    environment:
+      NODE_ENV: ${NODE_ENV:-development}
+      PORT: ${BACKEND_PORT:-3000}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-servai}:${POSTGRES_PASSWORD:-servai_dev_pass}@postgres:5432/${POSTGRES_DB:-servai}
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: ${JWT_SECRET:-dev_jwt_secret_change_in_production}
+      JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-7d}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET}
+      PERPLEXITY_API_KEY: ${PERPLEXITY_API_KEY}
+      SONAR_MODEL: ${SONAR_MODEL:-llama-3.1-sonar-small-128k-online}
+    ports:
+      - "${BACKEND_PORT:-3000}:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+      - /app/node_modules
+    command: npm run dev
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: servai-worker
+    environment:
+      NODE_ENV: ${NODE_ENV:-development}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-servai}:${POSTGRES_PASSWORD:-servai_dev_pass}@postgres:5432/${POSTGRES_DB:-servai}
+      REDIS_URL: redis://redis:6379
+      PERPLEXITY_API_KEY: ${PERPLEXITY_API_KEY}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      SONAR_MODEL: ${SONAR_MODEL:-llama-3.1-sonar-small-128k-online}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+      - /app/node_modules
+    command: npm run worker
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: servai-frontend
+    environment:
+      NODE_ENV: ${NODE_ENV:-development}
+      VUE_APP_API_URL: ${VUE_APP_API_URL:-http://localhost:3000}
+    ports:
+      - "${FRONTEND_PORT:-8080}:8080"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    command: npm run serve
+
+volumes:
+  postgres_data:
+  redis_data:
