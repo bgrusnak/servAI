@@ -1,21 +1,21 @@
 import winston from 'winston';
 import { config } from '../config';
 
-// Custom format to include request ID if available
-const customFormat = winston.format.printf(({ level, message, timestamp, requestId, ...meta }) => {
-  let log = `[${timestamp}] ${level.toUpperCase()}`;
+// Custom format to include request ID
+const customFormat = winston.format.printf(({ level, message, timestamp, requestId, ...metadata }) => {
+  let msg = `${timestamp} [${level.toUpperCase()}]`;
   
   if (requestId) {
-    log += ` [req:${requestId}]`;
+    msg += ` [${requestId}]`;
   }
   
-  log += `: ${message}`;
+  msg += `: ${message}`;
   
-  if (Object.keys(meta).length > 0) {
-    log += ` ${JSON.stringify(meta)}`;
+  if (Object.keys(metadata).length > 0) {
+    msg += ` ${JSON.stringify(metadata)}`;
   }
   
-  return log;
+  return msg;
 });
 
 export const logger = winston.createLogger({
@@ -23,8 +23,11 @@ export const logger = winston.createLogger({
   format: winston.format.combine(
     winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
     winston.format.errors({ stack: true }),
-    customFormat
+    config.env === 'production'
+      ? winston.format.json()  // JSON in production for log aggregation
+      : customFormat  // Pretty format in development
   ),
+  defaultMeta: { service: 'servai-backend' },
   transports: [
     new winston.transports.Console({
       format: winston.format.combine(
@@ -35,7 +38,7 @@ export const logger = winston.createLogger({
   ],
 });
 
-// Production: add file transports
+// Add file transport in production
 if (config.env === 'production') {
   logger.add(
     new winston.transports.File({
@@ -49,19 +52,18 @@ if (config.env === 'production') {
   logger.add(
     new winston.transports.File({
       filename: 'logs/combined.log',
-      maxsize: 10485760,
+      maxsize: 10485760, // 10MB
       maxFiles: 10,
     })
   );
 }
 
-/**
- * Helper to log with request context
- */
-export function logWithRequest(req: any, level: string, message: string, meta?: any) {
-  logger.log(level, message, {
-    requestId: req.id,
-    userId: req.user?.id,
-    ...meta,
-  });
-}
+// Helper to log with request ID
+export const logWithRequest = (req: any) => {
+  return {
+    info: (message: string, meta?: any) => logger.info(message, { requestId: req.id, ...meta }),
+    warn: (message: string, meta?: any) => logger.warn(message, { requestId: req.id, ...meta }),
+    error: (message: string, meta?: any) => logger.error(message, { requestId: req.id, ...meta }),
+    debug: (message: string, meta?: any) => logger.debug(message, { requestId: req.id, ...meta }),
+  };
+};
