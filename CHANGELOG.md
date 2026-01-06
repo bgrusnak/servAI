@@ -2,6 +2,83 @@
 
 All notable changes to servAI project will be documented in this file.
 
+## [0.3.0] - 2026-01-06
+
+### Added
+
+**Invite System:**
+- ✅ Generate secure invite tokens (64-character hex)
+- ✅ Create invite for unit with email/phone hints
+- ✅ Configurable TTL (default 7 days)
+- ✅ Max uses limit (optional, can be unlimited)
+- ✅ Validate invite endpoint (public, no auth)
+- ✅ Accept invite endpoint (creates resident record)
+- ✅ Auto-increment usage counter on acceptance
+- ✅ Auto-deactivate when max uses reached
+- ✅ List invites by unit (active/expired filter)
+- ✅ Invite statistics (total, active, expired, exhausted, total uses)
+- ✅ Deactivate invite manually
+- ✅ Delete invite (soft delete)
+- ✅ Full invite details with unit, condo, company info
+
+**Residents Management:**
+- ✅ Create resident (link user to unit)
+- ✅ Automatic role assignment (resident role for condo)
+- ✅ Get resident by ID with full details
+- ✅ List residents by unit (active/inactive filter)
+- ✅ List units for user (my units)
+- ✅ Update resident (owner status, dates)
+- ✅ Move out resident (sets inactive + moved_out_at)
+- ✅ Auto-deactivate resident role when no active residences
+- ✅ Delete resident (soft delete)
+- ✅ Owner vs tenant distinction
+- ✅ Move in/out date tracking
+- ✅ Transaction-safe resident creation with role assignment
+
+**Buildings Management:**
+- ✅ CRUD for buildings
+- ✅ List buildings by condo
+- ✅ Duplicate number validation per condo
+- ✅ Floors and units count tracking
+- ✅ Address support
+- ✅ Pagination support
+- ✅ Access control (condo-based)
+
+**Entrances Management:**
+- ✅ CRUD for entrances
+- ✅ List entrances by building
+- ✅ Duplicate number validation per building
+- ✅ Floors and units count tracking
+- ✅ Pagination support
+- ✅ Access control (via building → condo)
+
+**Services Layer:**
+- ✅ InviteService with token generation and validation
+- ✅ ResidentService with role management
+- ✅ BuildingService with hierarchy support
+- ✅ EntranceService with hierarchy support
+
+**API Routes:**
+- ✅ `/api/invites` - Invite management
+- ✅ `/api/residents` - Resident management
+- ✅ `/api/buildings` - Building management
+- ✅ `/api/entrances` - Entrance management
+
+### Changed
+
+- ⚡ Complete hierarchy now available: Company → Condo → Building → Entrance → Unit
+- ⚡ Resident role automatically managed based on active residences
+- ⚡ Invite acceptance creates resident and assigns role in single transaction
+
+### Security
+
+- 🔒 Invite tokens are cryptographically secure (32 bytes)
+- 🔒 Public invite validation doesn't expose sensitive data
+- 🔒 Invite acceptance requires authentication
+- 🔒 Role-based access control on all endpoints
+
+---
+
 ## [0.2.0] - 2026-01-06
 
 ### Added
@@ -174,12 +251,6 @@ All notable changes to servAI project will be documented in this file.
 
 ## Upcoming Features
 
-**v0.3.0 - Residents & Invites:**
-- 🔄 Invite generation endpoints
-- 🔄 Invite acceptance flow
-- 🔄 Resident management
-- 🔄 Unit assignment
-
 **v0.4.0 - Tickets System:**
 - 🔄 Create ticket
 - 🔄 List tickets with filters
@@ -187,6 +258,8 @@ All notable changes to servAI project will be documented in this file.
 - 🔄 Add comments
 - 🔄 File attachments
 - 🔄 Notifications
+- 🔄 Assignment workflow
+- 🔄 Status history tracking
 
 **v0.5.0 - Telegram Bot:**
 - 🔄 Bot setup and webhooks
@@ -194,18 +267,22 @@ All notable changes to servAI project will be documented in this file.
 - 🔄 NLU with Perplexity Sonar
 - 🔄 Context management
 - 🔄 Message history
+- 🔄 Intent recognition
+- 🔄 Rich replies with buttons
 
 **v0.6.0 - Meter Readings:**
 - 🔄 Submit readings
 - 🔄 Photo upload
 - 🔄 Verification workflow
 - 🔄 History and statistics
+- 🔄 Reminders
 
 **v0.7.0 - Frontend:**
 - 🔄 Vue 3 + Quasar setup
 - 🔄 Admin dashboard
 - 🔄 Authentication flow
 - 🔄 CRUD interfaces
+- 🔄 Responsive design
 
 **v0.8.0 - Billing:**
 - 🔄 Stripe integration
