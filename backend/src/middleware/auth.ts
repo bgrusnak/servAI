@@ -1,11 +1,11 @@
 import { Request, Response, NextFunction } from 'express';
-import jwt from 'jsonwebtoken';
 import { config } from '../config';
 import { AppError } from './errorHandler';
 import { db } from '../db';
 import { redis } from '../utils/redis';
 import { logger } from '../utils/logger';
 import { CONSTANTS } from '../config/constants';
+import { AuthService } from '../services/auth.service';
 
 export interface AuthUser {
   id: string;
@@ -80,7 +80,7 @@ async function loadUserFromDB(userId: string): Promise<AuthUser | null> {
         '[]'
       ) as roles
     FROM users u
-    LEFT JOIN user_roles ur ON ur.user_id = u.id AND ur.is_active = true
+    LEFT JOIN user_roles ur ON ur.user_id = u.id AND ur.is_active = true AND ur.deleted_at IS NULL
     WHERE u.id = $1 AND u.deleted_at IS NULL
     GROUP BY u.id
   `, [userId]);
@@ -122,15 +122,13 @@ export const authenticate = async (
 
     const token = authHeader.substring(7);
     
-    let decoded: any;
-    try {
-      decoded = jwt.verify(token, config.jwt.secret);
-    } catch (error) {
-      throw new AppError('Invalid or expired token', 401);
-    }
+    // Verify and decode token
+    const decoded = AuthService.verifyAccessToken(token);
 
-    if (!decoded.userId) {
-      throw new AppError('Invalid token payload', 401);
+    // Check if token has been revoked
+    const isRevoked = await AuthService.isTokenRevoked(decoded.tokenId);
+    if (isRevoked) {
+      throw new AppError('Token has been revoked', 401);
     }
 
     // Try cache first

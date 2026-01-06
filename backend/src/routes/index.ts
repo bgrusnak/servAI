@@ -1,24 +1,26 @@
 import { Router } from 'express';
 import { authRouter } from './auth';
-import { companiesRouter } from './companies';
-import { condosRouter } from './condos';
-import { unitsRouter } from './units';
-import { usersRouter } from './users';
 
 const apiRouter = Router();
 
-apiRouter.get('/', (req, res) => {
-  res.json({
-    name: 'servAI API',
-    version: '1.0.0',
-    status: 'running',
-  });
+// Auth routes
+apiRouter.use('/auth', authRouter);
+
+// Placeholder routes (to be implemented)
+apiRouter.get('/companies', (req, res) => {
+  res.status(501).json({ message: 'Companies endpoint - to be implemented' });
 });
 
-apiRouter.use('/auth', authRouter);
-apiRouter.use('/companies', companiesRouter);
-apiRouter.use('/condos', condosRouter);
-apiRouter.use('/units', unitsRouter);
-apiRouter.use('/users', usersRouter);
+apiRouter.get('/condos', (req, res) => {
+  res.status(501).json({ message: 'Condos endpoint - to be implemented' });
+});
+
+apiRouter.get('/units', (req, res) => {
+  res.status(501).json({ message: 'Units endpoint - to be implemented' });
+});
+
+apiRouter.get('/users/me', (req, res) => {
+  res.status(501).json({ message: 'User profile endpoint - to be implemented' });
+});
 
 export { apiRouter };

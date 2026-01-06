@@ -1,4 +1,4 @@
-import { Worker, Job } from 'bullmq';
+import { Worker, Job, Queue } from 'bullmq';
 import IORedis from 'ioredis';
 import { config } from './config';
 import { logger } from './utils/logger';
@@ -53,87 +53,154 @@ const processors = {
     return { success: true };
   },
 
-  // Cleanup jobs
+  // Cleanup jobs with batching
   'cleanup:invites': async (job: Job) => {
     logger.info('Cleaning up expired invites', { jobId: job.id });
     
-    // Soft delete expired invites
-    const deleted = await db.transaction(async (client) => {
-      const result = await client.query(
-        `UPDATE invites 
-         SET deleted_at = NOW()
-         WHERE id IN (
-           SELECT id FROM invites 
-           WHERE expires_at < NOW() 
-           AND is_active = true 
-           AND deleted_at IS NULL
-           FOR UPDATE SKIP LOCKED
-         )
-         RETURNING id`
-      );
-      return result.rowCount || 0;
-    });
+    let totalDeleted = 0;
+    let hasMore = true;
     
-    logger.info('Expired invites soft deleted', { count: deleted });
-    return { success: true, deleted };
+    while (hasMore) {
+      const deleted = await db.transaction(async (client) => {
+        const result = await client.query(
+          `UPDATE invites 
+           SET deleted_at = NOW()
+           WHERE id IN (
+             SELECT id FROM invites 
+             WHERE expires_at < NOW() 
+             AND is_active = true 
+             AND deleted_at IS NULL
+             LIMIT $1
+             FOR UPDATE SKIP LOCKED
+           )
+           RETURNING id`,
+          [CONSTANTS.CLEANUP_BATCH_SIZE]
+        );
+        return result.rowCount || 0;
+      });
+      
+      totalDeleted += deleted;
+      hasMore = deleted >= CONSTANTS.CLEANUP_BATCH_SIZE;
+      
+      if (hasMore) {
+        await new Promise(resolve => setTimeout(resolve, 100)); // Small delay between batches
+      }
+    }
+    
+    logger.info('Expired invites soft deleted', { count: totalDeleted });
+    return { success: true, deleted: totalDeleted };
   },
 
   'cleanup:audit-logs': async (job: Job) => {
     logger.info('Cleaning up old audit logs', { jobId: job.id });
     
-    // Soft delete old audit logs
-    const result = await db.query(
-      `UPDATE audit_logs 
-       SET deleted_at = NOW()
-       WHERE created_at < NOW() - INTERVAL '1 day' * $1
-       AND deleted_at IS NULL
-       RETURNING id`,
-      [config.retention.auditLogs]
-    );
+    let totalDeleted = 0;
+    let hasMore = true;
     
-    logger.info('Old audit logs soft deleted', { count: result.rowCount });
-    return { success: true, deleted: result.rowCount || 0 };
+    while (hasMore) {
+      const result = await db.query(
+        `UPDATE audit_logs 
+         SET deleted_at = NOW()
+         WHERE id IN (
+           SELECT id FROM audit_logs
+           WHERE created_at < NOW() - INTERVAL '1 day' * $1
+           AND deleted_at IS NULL
+           LIMIT $2
+         )
+         RETURNING id`,
+        [config.retention.auditLogs, CONSTANTS.CLEANUP_BATCH_SIZE]
+      );
+      
+      const deleted = result.rowCount || 0;
+      totalDeleted += deleted;
+      hasMore = deleted >= CONSTANTS.CLEANUP_BATCH_SIZE;
+      
+      if (hasMore) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+    }
+    
+    logger.info('Old audit logs soft deleted', { count: totalDeleted });
+    return { success: true, deleted: totalDeleted };
   },
   
   'cleanup:telegram-messages': async (job: Job) => {
     logger.info('Cleaning up old telegram messages', { jobId: job.id });
     
-    // Soft delete old telegram messages
-    const result = await db.query(
-      `UPDATE telegram_messages 
-       SET deleted_at = NOW()
-       WHERE created_at < NOW() - INTERVAL '1 day' * $1
-       AND deleted_at IS NULL
-       RETURNING id`,
-      [CONSTANTS.TELEGRAM_MESSAGES_RETENTION_DAYS]
-    );
+    let totalDeleted = 0;
+    let hasMore = true;
     
-    logger.info('Old telegram messages soft deleted', { count: result.rowCount });
-    return { success: true, deleted: result.rowCount || 0 };
+    while (hasMore) {
+      const result = await db.query(
+        `UPDATE telegram_messages 
+         SET deleted_at = NOW()
+         WHERE id IN (
+           SELECT id FROM telegram_messages
+           WHERE created_at < NOW() - INTERVAL '1 day' * $1
+           AND deleted_at IS NULL
+           LIMIT $2
+         )
+         RETURNING id`,
+        [CONSTANTS.TELEGRAM_MESSAGES_RETENTION_DAYS, CONSTANTS.CLEANUP_BATCH_SIZE]
+      );
+      
+      const deleted = result.rowCount || 0;
+      totalDeleted += deleted;
+      hasMore = deleted >= CONSTANTS.CLEANUP_BATCH_SIZE;
+      
+      if (hasMore) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+    }
+    
+    logger.info('Old telegram messages soft deleted', { count: totalDeleted });
+    return { success: true, deleted: totalDeleted };
   },
   
   'cleanup:refresh-tokens': async (job: Job) => {
     logger.info('Cleaning up old refresh tokens', { jobId: job.id });
     
-    // Soft delete old revoked refresh tokens (keep for audit trail)
-    const result = await db.query(
-      `UPDATE refresh_tokens 
-       SET deleted_at = NOW()
-       WHERE revoked_at < NOW() - INTERVAL '1 day' * $1
-       AND deleted_at IS NULL
-       RETURNING id`,
-      [CONSTANTS.REFRESH_TOKENS_RETENTION_DAYS]
-    );
+    let totalDeleted = 0;
+    let hasMore = true;
     
-    logger.info('Old refresh tokens soft deleted', { count: result.rowCount });
-    return { success: true, deleted: result.rowCount || 0 };
+    while (hasMore) {
+      const result = await db.query(
+        `UPDATE refresh_tokens 
+         SET deleted_at = NOW()
+         WHERE id IN (
+           SELECT id FROM refresh_tokens
+           WHERE revoked_at < NOW() - INTERVAL '1 day' * $1
+           AND deleted_at IS NULL
+           LIMIT $2
+         )
+         RETURNING id`,
+        [CONSTANTS.REFRESH_TOKENS_RETENTION_DAYS, CONSTANTS.CLEANUP_BATCH_SIZE]
+      );
+      
+      const deleted = result.rowCount || 0;
+      totalDeleted += deleted;
+      hasMore = deleted >= CONSTANTS.CLEANUP_BATCH_SIZE;
+      
+      if (hasMore) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+    }
+    
+    logger.info('Old refresh tokens soft deleted', { count: totalDeleted });
+    return { success: true, deleted: totalDeleted };
   },
 };
 
-// Create workers for each queue
+// Create workers and queues
 const workers: Worker[] = [];
+const queues: Queue[] = [];
 
 Object.entries(processors).forEach(([queueName, processor]) => {
+  // Create queue for scheduling
+  const queue = new Queue(queueName, { connection: connection.duplicate() });
+  queues.push(queue);
+
+  // Create worker
   const worker = new Worker(
     queueName,
     async (job: Job) => {
@@ -145,7 +212,7 @@ Object.entries(processors).forEach(([queueName, processor]) => {
       }
     },
     {
-      connection: connection.duplicate(), // Each worker gets its own connection
+      connection: connection.duplicate(),
       concurrency: 5,
       limiter: {
         max: 10,
@@ -166,10 +233,55 @@ Object.entries(processors).forEach(([queueName, processor]) => {
   logger.info(`Worker started for queue: ${queueName}`);
 });
 
+// Schedule cleanup jobs
+async function scheduleCleanupJobs() {
+  const cleanupQueue = queues.find(q => q.name === 'cleanup:invites');
+  
+  if (cleanupQueue) {
+    // Schedule cleanup jobs to run daily at 2 AM
+    await cleanupQueue.add('cleanup-invites', {}, {
+      repeat: { pattern: '0 2 * * *' }, // Cron: every day at 2 AM
+      jobId: 'cleanup-invites-daily',
+    });
+  }
+
+  const auditQueue = queues.find(q => q.name === 'cleanup:audit-logs');
+  if (auditQueue) {
+    await auditQueue.add('cleanup-audit', {}, {
+      repeat: { pattern: '0 3 * * *' },
+      jobId: 'cleanup-audit-daily',
+    });
+  }
+
+  const telegramQueue = queues.find(q => q.name === 'cleanup:telegram-messages');
+  if (telegramQueue) {
+    await telegramQueue.add('cleanup-telegram', {}, {
+      repeat: { pattern: '0 4 * * *' },
+      jobId: 'cleanup-telegram-daily',
+    });
+  }
+
+  const tokensQueue = queues.find(q => q.name === 'cleanup:refresh-tokens');
+  if (tokensQueue) {
+    await tokensQueue.add('cleanup-tokens', {}, {
+      repeat: { pattern: '0 5 * * *' },
+      jobId: 'cleanup-tokens-daily',
+    });
+  }
+
+  logger.info('Cleanup jobs scheduled');
+}
+
+// Schedule jobs after workers start
+scheduleCleanupJobs().catch(err => {
+  logger.error('Failed to schedule cleanup jobs', { error: err });
+});
+
 // Graceful shutdown
 const shutdown = async () => {
   logger.info('Shutting down workers...');
   await Promise.all(workers.map(w => w.close()));
+  await Promise.all(queues.map(q => q.close()));
   await connection.quit();
   await db.end();
   logger.info('Workers shut down gracefully');
@@ -179,4 +291,4 @@ const shutdown = async () => {
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
-logger.info(`Worker started with ${workers.length} queues`);
+logger.info(`Worker started with ${workers.length} queues and cleanup jobs scheduled`);
