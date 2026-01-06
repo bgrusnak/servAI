@@ -21,7 +21,7 @@
 - OCR for meter readings from photos
 - Multi-language support
 - Context-aware responses
-- **Production-ready rate limiting with Bull queue**
+- **Production-ready rate limiting with BullMQ**
 
 ## Tech Stack
 
@@ -29,8 +29,9 @@
 - **Node.js** + **TypeScript**
 - **Express.js** - REST API
 - **PostgreSQL** - Database
-- **Redis** - Caching & Bull queue
-- **Bull** - Job queue for Telegram rate limiting
+- **Redis** - Caching & BullMQ queue
+- **BullMQ** - Modern job queue for Telegram rate limiting
+- **IORedis** - High-performance Redis client
 - **Telegram Bot API** - Bot interface
 - **Perplexity AI (Sonar)** - Intent recognition & OCR
 - **Stripe** - Payment processing
@@ -92,7 +93,7 @@ docker-compose exec backend npm run migrate
 
 ### Implementation
 
-The bot uses **Bull queue** with Redis for production-ready rate limiting:
+The bot uses **BullMQ** (modern successor to Bull) with Redis for production-ready rate limiting:
 
 ```typescript
 // Configurable via environment
@@ -109,16 +110,18 @@ TELEGRAM_RATE_LIMIT_PER_SECOND=25  // Default: 25 msg/sec
 ✅ **Graceful fallback** - Direct send if queue fails
 ✅ **Metrics** - Queue size, delays, errors via Prometheus
 
-### Why Bull Queue?
+### Why BullMQ?
 
-| Feature | Without Queue | With Bull Queue |
-|---------|--------------|------------------|
+| Feature | Without Queue | With BullMQ |
+|---------|--------------|-------------|
 | **Non-blocking** | ❌ Blocks event loop | ✅ Async processing |
 | **Rate limiting** | ❌ Manual throttling | ✅ Built-in limiter |
 | **Retry logic** | ⚠️ Basic | ✅ Advanced with backoff |
 | **Scalability** | ❌ Single instance | ✅ Multi-instance via Redis |
 | **Monitoring** | ❌ None | ✅ Prometheus metrics |
 | **Priority** | ❌ FIFO only | ✅ Priority queue |
+| **Modern API** | ❌ Bull (legacy) | ✅ BullMQ (TypeScript-first) |
+| **Performance** | ⚠️ Redis 3.x | ✅ Redis 7.x optimized |
 
 ### Telegram API Limits
 
@@ -150,7 +153,8 @@ condos → buildings → units → residents ← users
 
 ### Services
 
-- **telegram.service.ts** - Bot logic + Queue
+- **telegram.service.ts** - Bot logic + BullMQ Queue
+- **worker.ts** - Background job processor (BullMQ Worker)
 - **perplexity.service.ts** - AI integration
 - **auth.service.ts** - Authentication
 - **payment.service.ts** - Stripe integration
@@ -172,6 +176,9 @@ cd backend && npm run migrate
 
 # Start backend
 npm run dev
+
+# Start worker (separate terminal)
+npm run worker
 
 # Start frontend (separate terminal)
 cd frontend && npm run dev
@@ -209,6 +216,7 @@ npm run format
 TELEGRAM_BOT_TOKEN=your_bot_token
 PERPLEXITY_API_KEY=your_api_key
 JWT_SECRET=strong_random_string_change_in_production
+REDIS_URL=redis://localhost:6379
 ```
 
 ### Optional
@@ -251,6 +259,7 @@ See [.env.example](.env.example) for full list.
 - [ ] Set up monitoring (Prometheus + Grafana)
 - [ ] Configure log aggregation
 - [ ] Review rate limits based on load
+- [ ] Scale worker instances based on queue load
 
 ### Docker Production
 
@@ -258,11 +267,14 @@ See [.env.example](.env.example) for full list.
 # Build production image
 docker-compose -f docker-compose.prod.yml build
 
-# Start services
+# Start services (includes backend + worker)
 docker-compose -f docker-compose.prod.yml up -d
 
 # View logs
-docker-compose logs -f backend
+docker-compose logs -f backend worker
+
+# Scale workers if needed
+docker-compose up -d --scale worker=3
 ```
 
 ## API Documentation
@@ -327,7 +339,8 @@ MIT License - see [LICENSE](LICENSE) file
 
 - [x] Core platform features
 - [x] Telegram bot with AI
-- [x] Rate limiting with Bull queue
+- [x] Rate limiting with BullMQ (modern)
+- [x] Background worker for cleanup jobs
 - [ ] Mobile app (React Native)
 - [ ] Email notifications
 - [ ] Advanced analytics dashboard
