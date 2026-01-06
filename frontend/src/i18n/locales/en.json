@@ -6,6 +6,7 @@
   "auth": {
     "login": "Login",
     "logout": "Logout",
+    "logoutConfirm": "Are you sure you want to logout?",
     "email": "Email",
     "password": "Password",
     "rememberMe": "Remember me",
@@ -92,7 +93,12 @@
     "ukDirector": "UK Director",
     "ukAccountant": "UK Accountant",
     "complexAdmin": "Complex Administrator",
-    "worker": "Worker"
+    "worker": "Worker",
+    "super_admin": "Super Admin",
+    "super_accountant": "Super Accountant",
+    "uk_director": "UK Director",
+    "uk_accountant": "UK Accountant",
+    "complex_admin": "Complex Administrator"
   },
   "validation": {
     "required": "This field is required",

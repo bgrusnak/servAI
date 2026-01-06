@@ -6,6 +6,7 @@
   "auth": {
     "login": "Войти",
     "logout": "Выйти",
+    "logoutConfirm": "Вы уверены, что хотите выйти?",
     "email": "Email",
     "password": "Пароль",
     "rememberMe": "Запомнить меня",
@@ -92,7 +93,12 @@
     "ukDirector": "Директор УК",
     "ukAccountant": "Бухгалтер УК",
     "complexAdmin": "Администратор ЖК",
-    "worker": "Сотрудник"
+    "worker": "Сотрудник",
+    "super_admin": "Супер-админ",
+    "super_accountant": "Супер-бухгалтер",
+    "uk_director": "Директор УК",
+    "uk_accountant": "Бухгалтер УК",
+    "complex_admin": "Администратор ЖК"
   },
   "validation": {
     "required": "Это поле обязательно",
