@@ -118,7 +118,10 @@ class TelegramService {
    */
   private async initializeMessageQueue(): Promise<void> {
     try {
-      const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
+      const redisUrl = process.env.REDIS_URL;
+      if (!redisUrl) {
+        throw new Error('REDIS_URL is required for message queue');
+      }
       
       this.messageQueue = new Queue<QueuedMessage>('telegram-outgoing-messages', redisUrl, {
         defaultJobOptions: {
@@ -180,7 +183,7 @@ class TelegramService {
           
           // Handle FloodWait (too many messages to same chat)
           if (error.message?.includes('FLOOD_WAIT')) {
-            const match = error.message.match(/FLOOD_WAIT_(\d+)/);
+            const match = error.message.match(/FLOOD_WAIT_(\\d+)/);
             const waitSeconds = match ? parseInt(match[1]) : 60;
             logger.warn('Telegram flood wait', {
               telegramId,
@@ -248,6 +251,7 @@ class TelegramService {
       }, 5000);
 
       logger.info('Telegram message queue initialized', {
+        redisUrl: redisUrl.replace(/:[^:]*@/, ':***@'), // Hide password in logs
         rateLimit: TELEGRAM_RATE_LIMIT_PER_SECOND,
         intervalMs: MESSAGE_INTERVAL_MS
       });
@@ -264,7 +268,7 @@ class TelegramService {
     if (!this.bot) return;
 
     // Handle /start command
-    this.bot.onText(/\/start(.*)/, async (msg, match) => {
+    this.bot.onText(/\\/start(.*)/, async (msg, match) => {
       await this.handleStart(msg, match?.[1]?.trim());
     });
 
@@ -310,7 +314,7 @@ class TelegramService {
       // New user - require invite token
       if (!inviteToken) {
         await this.sendMessage(telegramId,
-          'Добро пожаловать в servAI! Для регистрации нужна ссылка-приглашение.\n\n' +
+          'Добро пожаловать в servAI! Для регистрации нужна ссылка-приглашение.\\n\\n' +
           'Попросите администратора вашего дома выслать вам ссылку.');
         telegramMessagesTotal.inc({ type: 'start', status: 'no_invite' });
         return;
@@ -439,14 +443,14 @@ class TelegramService {
       // Send welcome message
       const address = `${invite.condo_name}, ${invite.building_name}, Квартира ${invite.unit_number}`;
       await this.sendMessage(telegramId,
-        `Добро пожаловать в servAI! 🏠\n\n` +
-        `Ваш адрес: ${address}\n\n` +
-        `Я помогу вам:\n` +
-        `• Передать показания счётчиков\n` +
-        `• Сообщить о проблемах\n` +
-        `• Посмотреть счета\n` +
-        `• Участвовать в голосованиях\n` +
-        `• Управлять доступом автомобилей\n\n` +
+        `Добро пожаловать в servAI! 🏠\\n\\n` +
+        `Ваш адрес: ${address}\\n\\n` +
+        `Я помогу вам:\\n` +
+        `• Передать показания счётчиков\\n` +
+        `• Сообщить о проблемах\\n` +
+        `• Посмотреть счета\\n` +
+        `• Участвовать в голосованиях\\n` +
+        `• Управлять доступом автомобилей\\n\\n` +
         `Чем могу помочь?`);
 
       telegramActiveUsers.inc();
@@ -562,7 +566,7 @@ class TelegramService {
 
       if (ocrResult.success && ocrResult.value) {
         await this.sendMessage(msg.from.id,
-          `Распознал: ${ocrResult.meter_type || 'счётчик'} = ${ocrResult.value}\n\n` +
+          `Распознал: ${ocrResult.meter_type || 'счётчик'} = ${ocrResult.value}\\n\\n` +
           `Это верно? Ответьте 'да' для подтверждения или отправьте правильное значение.`);
         
         // Save pending reading in context
