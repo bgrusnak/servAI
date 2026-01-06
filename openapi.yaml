@@ -1,0 +1,1223 @@
+openapi: 3.0.3
+info:
+  title: servAI API
+  version: 1.0.0
+  description: >
+    REST API для AI‑платформы управления многоквартирными комплексами servAI.
+    Содержит эндпоинты для админ‑панели, телеграм‑бота, интеграции со Stripe и служебные операции.
+
+servers:
+  - url: https://api.servai.example.com/api/v1
+    description: Production
+  - url: https://staging.api.servai.example.com/api/v1
+    description: Staging
+
+tags:
+  - name: Auth
+    description: Аутентификация и управление пользователями
+  - name: Tenants
+    description: Управление УК и ЖК
+  - name: Units
+    description: Объекты (квартиры и помещения)
+  - name: Residents
+    description: Жители и их привязка к объектам
+  - name: Staff
+    description: Сотрудники УК и ЖК
+  - name: Tickets
+    description: Обращения (тикеты)
+  - name: Meters
+    description: Счётчики и показания
+  - name: Billing
+    description: Тарифы, счета и платежи
+  - name: Polls
+    description: Опросы и голосования
+  - name: AccessControl
+    description: Контроль въезда (ворота, номера авто)
+  - name: Files
+    description: Загрузка и управление файлами
+  - name: Telegram
+    description: Интеграция с Telegram‑ботом
+  - name: Stripe
+    description: Вебхуки Stripe
+  - name: Admin
+    description: Функции супер‑админа платформы
+  - name: System
+    description: Служебные эндпоинты
+
+paths:
+  /health:
+    get:
+      tags: [System]
+      summary: Health check
+      operationId: healthCheck
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+
+  ########################
+  # AUTH
+  ########################
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Вход в админ‑панель
+      operationId: login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email:
+                  type: string
+                  format: email
+                password:
+                  type: string
+      responses:
+        '200':
+          description: Успешный вход
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthTokens'
+        '401':
+          description: Неверные учётные данные
+
+  /auth/me:
+    get:
+      tags: [Auth]
+      summary: Получить профиль текущего пользователя
+      operationId: getMe
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Профиль пользователя
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+
+  ########################
+  # TENANTS (УК и ЖК)
+  ########################
+  /platform/companies:
+    get:
+      tags: [Admin]
+      summary: Список УК (только супер‑админ)
+      operationId: listCompanies
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/CursorParam'
+        - $ref: '#/components/parameters/LimitParam'
+      responses:
+        '200':
+          description: Список УК
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedCompanies'
+
+    post:
+      tags: [Admin]
+      summary: Создать УК (только супер‑админ)
+      operationId: createCompany
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CompanyCreate'
+      responses:
+        '201':
+          description: УК создана
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Company'
+
+  /companies/{companyId}:
+    get:
+      tags: [Tenants]
+      summary: Получить данные УК
+      operationId: getCompany
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/CompanyId'
+      responses:
+        '200':
+          description: Данные УК
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Company'
+
+    patch:
+      tags: [Tenants]
+      summary: Обновить настройки УК (директор УК или супер‑админ)
+      operationId: updateCompany
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/CompanyId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CompanyUpdate'
+      responses:
+        '200':
+          description: Обновлённые данные УК
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Company'
+
+  /companies/{companyId}/condos:
+    get:
+      tags: [Tenants]
+      summary: Список ЖК компании
+      operationId: listCondos
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/CompanyId'
+        - $ref: '#/components/parameters/CursorParam'
+        - $ref: '#/components/parameters/LimitParam'
+      responses:
+        '200':
+          description: Список ЖК
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedCondos'
+
+    post:
+      tags: [Tenants]
+      summary: Создать ЖК
+      operationId: createCondo
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/CompanyId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CondoCreate'
+      responses:
+        '201':
+          description: ЖК создан
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Condo'
+
+  /condos/{condoId}:
+    get:
+      tags: [Tenants]
+      summary: Получить данные ЖК
+      operationId: getCondo
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/CondoId'
+      responses:
+        '200':
+          description: Данные ЖК
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Condo'
+
+    patch:
+      tags: [Tenants]
+      summary: Обновить настройки ЖК
+      operationId: updateCondo
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/CondoId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CondoUpdate'
+      responses:
+        '200':
+          description: Обновлённые данные ЖК
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Condo'
+
+  ########################
+  # UNITS (объекты)
+  ########################
+  /condos/{condoId}/units/import:
+    post:
+      tags: [Units]
+      summary: Импорт объектов ЖК из Excel
+      operationId: importUnits
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/CondoId'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+      responses:
+        '202':
+          description: Импорт поставлен в очередь
+
+  /condos/{condoId}/units:
+    get:
+      tags: [Units]
+      summary: Список объектов ЖК
+      operationId: listUnits
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/CondoId'
+        - $ref: '#/components/parameters/CursorParam'
+        - $ref: '#/components/parameters/LimitParam'
+      responses:
+        '200':
+          description: Список объектов
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedUnits'
+
+  /units/{unitId}:
+    get:
+      tags: [Units]
+      summary: Получить данные объекта
+      operationId: getUnit
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/UnitId'
+      responses:
+        '200':
+          description: Данные объекта
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Unit'
+
+    patch:
+      tags: [Units]
+      summary: Обновить объект
+      operationId: updateUnit
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/UnitId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UnitUpdate'
+      responses:
+        '200':
+          description: Обновлённый объект
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Unit'
+
+  ########################
+  # RESIDENTS & INVITES
+  ########################
+  /units/{unitId}/invites:
+    post:
+      tags: [Residents]
+      summary: Создать invite‑ссылку для объекта
+      operationId: createUnitInvite
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/UnitId'
+      responses:
+        '201':
+          description: Invite создан
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Invite'
+
+    get:
+      tags: [Residents]
+      summary: Список invite‑ссылок объекта
+      operationId: listUnitInvites
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/UnitId'
+      responses:
+        '200':
+          description: Список invite‑ссылок
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Invite'
+
+  /invites/{inviteId}:
+    delete:
+      tags: [Residents]
+      summary: Отозвать invite‑ссылку
+      operationId: revokeInvite
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/InviteId'
+      responses:
+        '204':
+          description: Invite отозван
+
+  ########################
+  # TICKETS (обращения)
+  ########################
+  /tickets:
+    get:
+      tags: [Tickets]
+      summary: Список обращений (по ролям)
+      operationId: listTickets
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/CursorParam'
+        - $ref: '#/components/parameters/LimitParam'
+        - name: status
+          in: query
+          schema:
+            type: string
+        - name: condoId
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Список обращений
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedTickets'
+
+  /tickets/{ticketId}:
+    get:
+      tags: [Tickets]
+      summary: Получить обращение
+      operationId: getTicket
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/TicketId'
+      responses:
+        '200':
+          description: Обращение
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Ticket'
+
+    patch:
+      tags: [Tickets]
+      summary: Обновить статус/назначение обращения
+      operationId: updateTicket
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/TicketId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TicketUpdate'
+      responses:
+        '200':
+          description: Обновлённое обращение
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Ticket'
+
+  /tickets/{ticketId}/comments:
+    post:
+      tags: [Tickets]
+      summary: Добавить комментарий к обращению
+      operationId: addTicketComment
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/TicketId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text]
+              properties:
+                text:
+                  type: string
+      responses:
+        '201':
+          description: Комментарий добавлен
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TicketComment'
+
+  ########################
+  # METERS
+  ########################
+  /units/{unitId}/meters/readings/import:
+    post:
+      tags: [Meters]
+      summary: Импорт исторических показаний счётчиков
+      operationId: importMeterReadings
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/UnitId'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+      responses:
+        '202':
+          description: Импорт показаний поставлен в очередь
+
+  /units/{unitId}/meters/readings:
+    get:
+      tags: [Meters]
+      summary: История показаний объекта
+      operationId: listMeterReadings
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/UnitId'
+        - $ref: '#/components/parameters/CursorParam'
+        - $ref: '#/components/parameters/LimitParam'
+      responses:
+        '200':
+          description: Список показаний
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedMeterReadings'
+
+  ########################
+  # BILLING
+  ########################
+  /condos/{condoId}/tariffs:
+    get:
+      tags: [Billing]
+      summary: Список тарифов ЖК
+      operationId: listTariffs
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/CondoId'
+      responses:
+        '200':
+          description: Тарифы ЖК
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Tariff'
+
+    patch:
+      tags: [Billing]
+      summary: Обновить тарифы ЖК
+      operationId: updateTariffs
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/CondoId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                $ref: '#/components/schemas/TariffUpdate'
+      responses:
+        '200':
+          description: Обновлённые тарифы
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Tariff'
+
+  /units/{unitId}/invoices:
+    get:
+      tags: [Billing]
+      summary: Список счетов для объекта
+      operationId: listUnitInvoices
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/UnitId'
+      responses:
+        '200':
+          description: Счета объекта
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Invoice'
+
+  /units/{unitId}/invoices/{invoiceId}/pdf:
+    get:
+      tags: [Billing]
+      summary: Скачать PDF‑счёт
+      operationId: downloadInvoicePdf
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/UnitId'
+        - $ref: '#/components/parameters/InvoiceId'
+      responses:
+        '200':
+          description: PDF файл
+          content:
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+
+  ########################
+  # POLLS
+  ########################
+  /condos/{condoId}/polls:
+    post:
+      tags: [Polls]
+      summary: Создать опрос
+      operationId: createPoll
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/CondoId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PollCreate'
+      responses:
+        '201':
+          description: Опрос создан
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Poll'
+
+    get:
+      tags: [Polls]
+      summary: Список опросов ЖК
+      operationId: listPolls
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/CondoId'
+        - $ref: '#/components/parameters/CursorParam'
+        - $ref: '#/components/parameters/LimitParam'
+      responses:
+        '200':
+          description: Опросы
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedPolls'
+
+  ########################
+  # ACCESS CONTROL (ворота)
+  ########################
+  /units/{unitId}/vehicles:
+    get:
+      tags: [AccessControl]
+      summary: Список постоянных номеров объекта
+      operationId: listUnitVehicles
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/UnitId'
+      responses:
+        '200':
+          description: Номера авто
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Vehicle'
+
+    post:
+      tags: [AccessControl]
+      summary: Добавить/обновить постоянный номер
+      operationId: addUnitVehicle
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/UnitId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VehicleCreate'
+      responses:
+        '201':
+          description: Номер сохранён
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Vehicle'
+
+  ########################
+  # TELEGRAM WEBHOOK
+  ########################
+  /integrations/telegram/webhook:
+    post:
+      tags: [Telegram]
+      summary: Webhook Telegram‑бота
+      operationId: telegramWebhook
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Update обработан
+
+  ########################
+  # STRIPE WEBHOOK
+  ########################
+  /integrations/stripe/webhook:
+    post:
+      tags: [Stripe]
+      summary: Webhook Stripe
+      operationId: stripeWebhook
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Event обработан
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    CompanyId:
+      name: companyId
+      in: path
+      required: true
+      schema:
+        type: string
+    CondoId:
+      name: condoId
+      in: path
+      required: true
+      schema:
+        type: string
+    UnitId:
+      name: unitId
+      in: path
+      required: true
+      schema:
+        type: string
+    TicketId:
+      name: ticketId
+      in: path
+      required: true
+      schema:
+        type: string
+    InviteId:
+      name: inviteId
+      in: path
+      required: true
+      schema:
+        type: string
+    InvoiceId:
+      name: invoiceId
+      in: path
+      required: true
+      schema:
+        type: string
+    CursorParam:
+      name: cursor
+      in: query
+      schema:
+        type: string
+      description: Курсор для пагинации
+    LimitParam:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+
+  schemas:
+    AuthTokens:
+      type: object
+      properties:
+        accessToken:
+          type: string
+        expiresIn:
+          type: integer
+          description: Секунд до истечения
+        user:
+          $ref: '#/components/schemas/User'
+
+    User:
+      type: object
+      properties:
+        id:
+          type: string
+        email:
+          type: string
+          format: email
+        role:
+          type: string
+          description: Глобальная или роль в рамках УК/ЖК (super_admin, super_accountant, company_director, company_accountant, condo_admin, staff, …)
+        firstName:
+          type: string
+        lastName:
+          type: string
+        telegramUserId:
+          type: string
+          nullable: true
+        language:
+          type: string
+          description: Язык интерфейса (для админ‑панели)
+        companyId:
+          type: string
+          nullable: true
+
+    Company:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        country:
+          type: string
+        registrationNumber:
+          type: string
+        billingCurrency:
+          type: string
+        isBlocked:
+          type: boolean
+        createdAt:
+          type: string
+          format: date-time
+
+    CompanyCreate:
+      type: object
+      required: [name, country, billingCurrency]
+      properties:
+        name:
+          type: string
+        country:
+          type: string
+        registrationNumber:
+          type: string
+        billingCurrency:
+          type: string
+
+    CompanyUpdate:
+      type: object
+      properties:
+        name:
+          type: string
+        billingCurrency:
+          type: string
+        isBlocked:
+          type: boolean
+
+    PaginatedCompanies:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Company'
+        nextCursor:
+          type: string
+          nullable: true
+
+    Condo:
+      type: object
+      properties:
+        id:
+          type: string
+        companyId:
+          type: string
+        name:
+          type: string
+        address:
+          type: string
+        settings:
+          type: object
+
+    CondoCreate:
+      type: object
+      required: [name, address]
+      properties:
+        name:
+          type: string
+        address:
+          type: string
+
+    CondoUpdate:
+      type: object
+      properties:
+        name:
+          type: string
+        address:
+          type: string
+        settings:
+          type: object
+
+    PaginatedCondos:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Condo'
+        nextCursor:
+          type: string
+          nullable: true
+
+    Unit:
+      type: object
+      properties:
+        id:
+          type: string
+        condoId:
+          type: string
+        building:
+          type: string
+        entrance:
+          type: string
+          nullable: true
+        floor:
+          type: integer
+        number:
+          type: string
+        type:
+          type: string
+        area:
+          type: number
+        isActive:
+          type: boolean
+
+    UnitUpdate:
+      type: object
+      properties:
+        building:
+          type: string
+        entrance:
+          type: string
+        floor:
+          type: integer
+        type:
+          type: string
+        area:
+          type: number
+
+    PaginatedUnits:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Unit'
+        nextCursor:
+          type: string
+          nullable: true
+
+    Invite:
+      type: object
+      properties:
+        id:
+          type: string
+        unitId:
+          type: string
+        url:
+          type: string
+        expiresAt:
+          type: string
+          format: date-time
+        createdAt:
+          type: string
+          format: date-time
+
+    Ticket:
+      type: object
+      properties:
+        id:
+          type: string
+        condoId:
+          type: string
+        unitId:
+          type: string
+          nullable: true
+        status:
+          type: string
+          enum: [new, assigned, in_progress, review, resolved, closed]
+        category:
+          type: string
+        createdByUserId:
+          type: string
+        assignedToUserId:
+          type: string
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    TicketUpdate:
+      type: object
+      properties:
+        status:
+          type: string
+        assignedToUserId:
+          type: string
+
+    TicketComment:
+      type: object
+      properties:
+        id:
+          type: string
+        ticketId:
+          type: string
+        authorId:
+          type: string
+        text:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+
+    PaginatedTickets:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Ticket'
+        nextCursor:
+          type: string
+          nullable: true
+
+    MeterReading:
+      type: object
+      properties:
+        id:
+          type: string
+        unitId:
+          type: string
+        meterType:
+          type: string
+        value:
+          type: number
+        readingDate:
+          type: string
+          format: date
+        createdAt:
+          type: string
+          format: date-time
+
+    PaginatedMeterReadings:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/MeterReading'
+        nextCursor:
+          type: string
+          nullable: true
+
+    Tariff:
+      type: object
+      properties:
+        id:
+          type: string
+        condoId:
+          type: string
+        type:
+          type: string
+          description: meter_based / area_based / fixed
+        name:
+          type: string
+        unitType:
+          type: string
+          description: тип объекта (жилое/коммерческое и т.п.)
+        price:
+          type: number
+          format: double
+
+    TariffUpdate:
+      type: object
+      properties:
+        id:
+          type: string
+        price:
+          type: number
+          format: double
+
+    Invoice:
+      type: object
+      properties:
+        id:
+          type: string
+        unitId:
+          type: string
+        period:
+          type: string
+          example: '2026-01'
+        totalAmount:
+          type: number
+        currency:
+          type: string
+        status:
+          type: string
+          enum: [draft, issued, paid, partially_paid, overdue]
+
+    Vehicle:
+      type: object
+      properties:
+        id:
+          type: string
+        unitId:
+          type: string
+        plateNumber:
+          type: string
+
+    VehicleCreate:
+      type: object
+      required: [plateNumber]
+      properties:
+        plateNumber:
+          type: string
+
+    Poll:
+      type: object
+      properties:
+        id:
+          type: string
+        condoId:
+          type: string
+        question:
+          type: string
+        options:
+          type: array
+          items:
+            type: string
+        multiSelect:
+          type: boolean
+        allowCustomOption:
+          type: boolean
+        targetScope:
+          type: string
+          enum: [condo, entrance]
+        deadline:
+          type: string
+          format: date-time
+
+    PollCreate:
+      type: object
+      required: [question, options, deadline, targetScope]
+      properties:
+        question:
+          type: string
+        options:
+          type: array
+          items:
+            type: string
+        multiSelect:
+          type: boolean
+        allowCustomOption:
+          type: boolean
+        targetScope:
+          type: string
+          enum: [condo, entrance]
+        entranceId:
+          type: string
+          nullable: true
+        deadline:
+          type: string
+          format: date-time
+
+    PaginatedPolls:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Poll'
+        nextCursor:
+          type: string
+          nullable: true
