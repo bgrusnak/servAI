@@ -14,6 +14,21 @@ export class AppError extends Error {
   }
 }
 
+// Sanitize error messages for production
+function sanitizeErrorMessage(err: Error | AppError, statusCode: number): string {
+  if (config.env === 'production' && statusCode >= 500) {
+    // Don't leak internal details in production
+    return 'Internal server error';
+  }
+  
+  if (config.env === 'production' && err.message.includes('violates')) {
+    // Don't leak database constraint details
+    return 'Invalid request';
+  }
+  
+  return err.message;
+}
+
 export const errorHandler = (
   err: Error | AppError,
   req: Request,
@@ -33,8 +48,13 @@ export const errorHandler = (
     isOperational,
   });
 
+  const message = sanitizeErrorMessage(err, statusCode);
+
   res.status(statusCode).json({
-    error: err.message,
-    ...(config.env === 'development' && { stack: err.stack }),
+    error: message,
+    ...(config.env === 'development' && { 
+      stack: err.stack,
+      details: err.message 
+    }),
   });
 };

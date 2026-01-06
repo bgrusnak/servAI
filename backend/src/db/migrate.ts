@@ -2,6 +2,7 @@ import { readdir, readFile } from 'fs/promises';
 import { join } from 'path';
 import { db } from './index';
 import { logger } from '../utils/logger';
+import { CONSTANTS } from '../config/constants';
 
 interface Migration {
   id: number;
@@ -29,67 +30,76 @@ async function getExecutedMigrations(): Promise<Migration[]> {
 async function executeMigration(name: string, sql: string): Promise<void> {
   await db.transaction(async (client) => {
     try {
+      // Execute the migration SQL
       await client.query(sql);
+      
+      // Record successful migration
       await client.query(
         'INSERT INTO migrations (name) VALUES ($1)',
         [name]
       );
+      
       logger.info(`✓ Migration executed successfully: ${name}`);
     } catch (error) {
       logger.error(`✗ Migration failed: ${name}`, { error });
-      throw new Error(`Migration ${name} failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      throw new Error(
+        `Migration ${name} failed: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
     }
   });
 }
 
 async function runMigrations(): Promise<void> {
-  try {
-    logger.info('=== Starting database migrations ===');
-    
-    await createMigrationsTable();
-    
-    const executedMigrations = await getExecutedMigrations();
-    const executedNames = new Set(executedMigrations.map(m => m.name));
-    
-    logger.info(`Already executed migrations: ${executedMigrations.length}`);
-    
-    const migrationsDir = join(__dirname, 'migrations');
-    let files: string[];
-    
+  // Use advisory lock to prevent concurrent migrations
+  return await db.withAdvisoryLock(CONSTANTS.DB_ADVISORY_LOCK_ID, async () => {
     try {
-      files = await readdir(migrationsDir);
-    } catch (error) {
-      logger.warn('Migrations directory not found, skipping migrations');
-      return;
-    }
-    
-    const migrationFiles = files
-      .filter(f => f.endsWith('.sql'))
-      .sort();
-    
-    const pendingMigrations = migrationFiles.filter(f => !executedNames.has(f));
-    
-    if (pendingMigrations.length === 0) {
-      logger.info('✓ No new migrations to execute');
+      logger.info('=== Starting database migrations ===');
+      
+      await createMigrationsTable();
+      
+      const executedMigrations = await getExecutedMigrations();
+      const executedNames = new Set(executedMigrations.map(m => m.name));
+      
+      logger.info(`Already executed migrations: ${executedMigrations.length}`);
+      
+      const migrationsDir = join(__dirname, 'migrations');
+      let files: string[];
+      
+      try {
+        files = await readdir(migrationsDir);
+      } catch (error) {
+        logger.warn('Migrations directory not found, skipping migrations');
+        return;
+      }
+      
+      const migrationFiles = files
+        .filter(f => f.endsWith('.sql'))
+        .sort();
+      
+      const pendingMigrations = migrationFiles.filter(f => !executedNames.has(f));
+      
+      if (pendingMigrations.length === 0) {
+        logger.info('✓ No new migrations to execute');
+        logger.info('=== Migrations completed ===');
+        return;
+      }
+      
+      logger.info(`Found ${pendingMigrations.length} pending migration(s)`);
+      
+      for (const file of pendingMigrations) {
+        logger.info(`Executing migration: ${file}`);
+        const filePath = join(migrationsDir, file);
+        const sql = await readFile(filePath, 'utf-8');
+        await executeMigration(file, sql);
+      }
+      
+      logger.info(`✓ Successfully executed ${pendingMigrations.length} migration(s)`);
       logger.info('=== Migrations completed ===');
-      return;
+    } catch (error) {
+      logger.error('!!! Migration process failed !!!', { error });
+      throw error;
     }
-    
-    logger.info(`Found ${pendingMigrations.length} pending migration(s)`);
-    
-    for (const file of pendingMigrations) {
-      logger.info(`Executing migration: ${file}`);
-      const filePath = join(migrationsDir, file);
-      const sql = await readFile(filePath, 'utf-8');
-      await executeMigration(file, sql);
-    }
-    
-    logger.info(`✓ Successfully executed ${pendingMigrations.length} migration(s)`);
-    logger.info('=== Migrations completed ===');
-  } catch (error) {
-    logger.error('!!! Migration process failed !!!', { error });
-    throw error;
-  }
+  });
 }
 
 if (require.main === module) {
