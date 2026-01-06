@@ -1,5 +1,5 @@
-import { db } from '../db';
 import { PoolClient } from 'pg';
+import { db } from '../db';
 import { AppError } from '../middleware/errorHandler';
 import { logger } from '../utils/logger';
 
@@ -39,10 +39,19 @@ interface UpdateResidentData {
 
 export class ResidentService {
   /**
-   * Create resident with transaction (fixes CRIT-002)
-   * Accessible from invite acceptance
+   * Create resident - PUBLIC API (wraps atomic version)
    */
-  static async createResidentInTransaction(
+  static async createResident(data: CreateResidentData): Promise<Resident> {
+    return await db.transaction(async (client) => {
+      return await this.createResidentAtomic(data, client);
+    });
+  }
+
+  /**
+   * Create resident atomically - INTERNAL (FIXES CRIT-002)
+   * Can be called within existing transaction
+   */
+  static async createResidentAtomic(
     data: CreateResidentData,
     client: PoolClient
   ): Promise<Resident> {
@@ -68,73 +77,89 @@ export class ResidentService {
 
     const condoId = unitCheck.rows[0].condo_id;
 
-    // Check if already exists with row lock to prevent race condition
-    const existing = await client.query(
+    // Lock existing active residents for this user+unit combination
+    // This prevents race condition (CRIT-002)
+    const existingCheck = await client.query(
       `SELECT id FROM residents 
        WHERE user_id = $1 AND unit_id = $2 AND is_active = true AND deleted_at IS NULL
-       FOR UPDATE`,  // Lock rows if exist
+       FOR UPDATE`,  // <-- Lock to prevent concurrent inserts
       [data.user_id, data.unit_id]
     );
 
-    if (existing.rows.length > 0) {
+    if (existingCheck.rows.length > 0) {
       throw new AppError('User is already an active resident of this unit', 409);
     }
 
     // Create resident record
-    const residentResult = await client.query(
-      `INSERT INTO residents (user_id, unit_id, is_owner, moved_in_at)
-       VALUES ($1, $2, $3, $4)
-       RETURNING *`,
-      [
-        data.user_id,
-        data.unit_id,
-        data.is_owner || false,
-        data.moved_in_at || new Date(),
-      ]
-    );
+    let residentResult;
+    try {
+      residentResult = await client.query(
+        `INSERT INTO residents (user_id, unit_id, is_owner, moved_in_at)
+         VALUES ($1, $2, $3, $4)
+         RETURNING *`,
+        [
+          data.user_id,
+          data.unit_id,
+          data.is_owner || false,
+          data.moved_in_at || new Date(),
+        ]
+      );
+    } catch (error: any) {
+      // Database constraint violation (if unique constraint exists)
+      if (error.code === '23505') {
+        throw new AppError('User is already an active resident of this unit', 409);
+      }
+      throw error;
+    }
 
     // Check if user already has resident role for this condo
     const roleCheck = await client.query(
-      `SELECT id, is_active FROM user_roles 
-       WHERE user_id = $1 AND condo_id = $2 AND role = $3 AND deleted_at IS NULL`,
+      'SELECT id, is_active FROM user_roles WHERE user_id = $1 AND condo_id = $2 AND role = $3 AND deleted_at IS NULL',
       [data.user_id, condoId, 'resident']
     );
 
     if (roleCheck.rows.length === 0) {
       // Create resident role
-      await client.query(
-        `INSERT INTO user_roles (user_id, role, condo_id)
-         VALUES ($1, 'resident', $2)`,
-        [data.user_id, condoId]
-      );
-      logger.info('Resident role created', { userId: data.user_id, condoId });
+      try {
+        await client.query(
+          `INSERT INTO user_roles (user_id, role, condo_id)
+           VALUES ($1, 'resident', $2)`,
+          [data.user_id, condoId]
+        );
+      } catch (error: any) {
+        // Race condition - role created by another transaction
+        if (error.code === '23505') {
+          // Update existing role to active
+          await client.query(
+            'UPDATE user_roles SET is_active = true WHERE user_id = $1 AND condo_id = $2 AND role = $3',
+            [data.user_id, condoId, 'resident']
+          );
+        } else {
+          throw new AppError('Failed to assign resident role', 500, error);
+        }
+      }
     } else if (!roleCheck.rows[0].is_active) {
-      // Reactivate existing role
+      // Reactivate role if exists but inactive
       await client.query(
         'UPDATE user_roles SET is_active = true WHERE id = $1',
         [roleCheck.rows[0].id]
       );
-      logger.info('Resident role reactivated', { userId: data.user_id, condoId });
     }
 
+    const resident = residentResult.rows[0];
+
     logger.info('Resident created', {
-      residentId: residentResult.rows[0].id,
-      userId: data.user_id,
+      residentId: resident.id,
       unitId: data.unit_id,
+      condoId,
     });
 
-    return residentResult.rows[0];
+    return resident;
   }
 
   /**
-   * Create resident (standalone, with its own transaction)
+   * Get resident by ID with details
    */
-  static async createResident(data: CreateResidentData): Promise<Resident> {
-    return await db.transaction(async (client) => {
-      return await this.createResidentInTransaction(data, client);
-    });
-  }
-
   static async getResidentById(residentId: string): Promise<ResidentWithDetails | null> {
     const result = await db.query(
       `SELECT 
@@ -157,16 +182,40 @@ export class ResidentService {
   }
 
   /**
-   * List residents by unit with pagination (fixes MED-004)
+   * List residents by unit (with pagination)
    */
   static async listResidentsByUnit(
     unitId: string,
     page: number = 1,
     limit: number = 20,
     includeInactive: boolean = false
-  ): Promise<{ data: ResidentWithDetails[]; total: number; page: number; limit: number }> {
-    const offset = (page - 1) * limit;
+  ): Promise<{
+    data: ResidentWithDetails[];
+    total: number;
+    page: number;
+    limit: number;
+    totalPages: number;
+  }> {
+    // Validate pagination params
+    const validPage = Math.max(1, page);
+    const validLimit = Math.min(Math.max(1, limit), 100);
+    const offset = (validPage - 1) * validLimit;
 
+    // Count total
+    let countQuery = `
+      SELECT COUNT(*) as total
+      FROM residents r
+      WHERE r.unit_id = $1 AND r.deleted_at IS NULL
+    `;
+
+    if (!includeInactive) {
+      countQuery += ' AND r.is_active = true';
+    }
+
+    const countResult = await db.query(countQuery, [unitId]);
+    const total = parseInt(countResult.rows[0].total);
+
+    // Get paginated data
     let query = `
       SELECT 
         r.*,
@@ -189,24 +238,20 @@ export class ResidentService {
 
     query += ' ORDER BY r.is_owner DESC, r.created_at ASC LIMIT $2 OFFSET $3';
 
-    const result = await db.query(query, [unitId, limit, offset]);
-
-    // Get total count
-    let countQuery = 'SELECT COUNT(*) as total FROM residents WHERE unit_id = $1 AND deleted_at IS NULL';
-    if (!includeInactive) {
-      countQuery += ' AND is_active = true';
-    }
-
-    const countResult = await db.query(countQuery, [unitId]);
+    const result = await db.query(query, [unitId, validLimit, offset]);
 
     return {
       data: result.rows,
-      total: parseInt(countResult.rows[0].total),
-      page,
-      limit,
+      total,
+      page: validPage,
+      limit: validLimit,
+      totalPages: Math.ceil(total / validLimit),
     };
   }
 
+  /**
+   * List units for a user (where they are resident)
+   */
   static async listUnitsByUser(
     userId: string,
     includeInactive: boolean = false
@@ -240,6 +285,9 @@ export class ResidentService {
     return result.rows;
   }
 
+  /**
+   * Update resident
+   */
   static async updateResident(
     residentId: string,
     data: UpdateResidentData
@@ -291,56 +339,67 @@ export class ResidentService {
     return result.rows[0];
   }
 
+  /**
+   * Move out resident (set inactive and moved_out_at)
+   */
   static async moveOutResident(residentId: string): Promise<void> {
-    const result = await db.query(
-      `UPDATE residents
-       SET is_active = false, moved_out_at = NOW()
-       WHERE id = $1 AND deleted_at IS NULL
-       RETURNING user_id, unit_id`,
-      [residentId]
-    );
-
-    if (result.rows.length === 0) {
-      throw new AppError('Resident not found', 404);
-    }
-
-    const { user_id, unit_id } = result.rows[0];
-
-    const unitResult = await db.query(
-      'SELECT condo_id FROM units WHERE id = $1',
-      [unit_id]
-    );
-    const condoId = unitResult.rows[0].condo_id;
-
-    const otherResidences = await db.query(
-      `SELECT r.id
-       FROM residents r
-       INNER JOIN units u ON u.id = r.unit_id
-       WHERE r.user_id = $1 
-         AND u.condo_id = $2 
-         AND r.is_active = true 
-         AND r.id != $3
-         AND r.deleted_at IS NULL`,
-      [user_id, condoId, residentId]
-    );
-
-    if (otherResidences.rows.length === 0) {
-      await db.query(
-        `UPDATE user_roles
-         SET is_active = false
-         WHERE user_id = $1 AND condo_id = $2 AND role = 'resident'`,
-        [user_id, condoId]
+    await db.transaction(async (client) => {
+      const result = await client.query(
+        `UPDATE residents
+         SET is_active = false, moved_out_at = NOW()
+         WHERE id = $1 AND deleted_at IS NULL
+         RETURNING user_id, unit_id`,
+        [residentId]
       );
 
-      logger.info('Resident role deactivated (no active residences)', {
-        userId: user_id,
-        condoId,
-      });
-    }
+      if (result.rows.length === 0) {
+        throw new AppError('Resident not found', 404);
+      }
 
-    logger.info('Resident moved out', { residentId });
+      const { user_id, unit_id } = result.rows[0];
+
+      // Get condo_id for role management
+      const unitResult = await client.query(
+        'SELECT condo_id FROM units WHERE id = $1',
+        [unit_id]
+      );
+      const condoId = unitResult.rows[0].condo_id;
+
+      // Check if user has any other active residences in the same condo
+      const otherResidences = await client.query(
+        `SELECT r.id
+         FROM residents r
+         INNER JOIN units u ON u.id = r.unit_id
+         WHERE r.user_id = $1 
+           AND u.condo_id = $2 
+           AND r.is_active = true 
+           AND r.id != $3
+           AND r.deleted_at IS NULL`,
+        [user_id, condoId, residentId]
+      );
+
+      // If no other active residences, deactivate resident role
+      if (otherResidences.rows.length === 0) {
+        await client.query(
+          `UPDATE user_roles
+           SET is_active = false
+           WHERE user_id = $1 AND condo_id = $2 AND role = 'resident'`,
+          [user_id, condoId]
+        );
+
+        logger.info('Resident role deactivated (no active residences)', {
+          userId: user_id,
+          condoId,
+        });
+      }
+
+      logger.info('Resident moved out', { residentId });
+    });
   }
 
+  /**
+   * Delete resident (soft delete)
+   */
   static async deleteResident(residentId: string): Promise<void> {
     const result = await db.query(
       'UPDATE residents SET deleted_at = NOW() WHERE id = $1 AND deleted_at IS NULL',
