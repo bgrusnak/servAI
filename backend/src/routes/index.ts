@@ -2,7 +2,11 @@ import { Router } from 'express';
 import { authRouter } from './auth';
 import { companiesRouter } from './companies';
 import { condosRouter } from './condos';
+import { buildingsRouter } from './buildings';
+import { entrancesRouter } from './entrances';
 import { unitsRouter } from './units';
+import { invitesRouter } from './invites';
+import { residentsRouter } from './residents';
 
 const apiRouter = Router();
 
@@ -12,7 +16,11 @@ apiRouter.use('/auth', authRouter);
 // Protected routes (require authentication)
 apiRouter.use('/companies', companiesRouter);
 apiRouter.use('/condos', condosRouter);
+apiRouter.use('/buildings', buildingsRouter);
+apiRouter.use('/entrances', entrancesRouter);
 apiRouter.use('/units', unitsRouter);
+apiRouter.use('/invites', invitesRouter);
+apiRouter.use('/residents', residentsRouter);
 
 // Health check for API
 apiRouter.get('/ping', (req, res) => {
