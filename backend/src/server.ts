@@ -1,7 +1,9 @@
+import 'reflect-metadata';
 import express from 'express';
 import { createServer } from 'http';
 import cors from 'cors';
 import helmet from 'helmet';
+import path from 'path';
 import { config } from './config';
 import { logger } from './utils/logger';
 import { errorHandler } from './middleware/errorHandler';
@@ -9,6 +11,7 @@ import { requestLogger } from './middleware/requestLogger';
 import { metricsMiddleware } from './middleware/metricsMiddleware';
 import { telegramService } from './services/telegram.service';
 import { websocketService } from './services/websocket.service';
+import { AppDataSource } from './db/data-source';
 
 // Import routes
 import authRoutes from './routes/auth';
@@ -43,6 +46,10 @@ app.use(
     credentials: config.cors.credentials,
   })
 );
+
+// Static files for uploads
+const uploadsDir = process.env.UPLOAD_DIR || path.join(process.cwd(), 'uploads');
+app.use('/uploads', express.static(uploadsDir));
 
 // Request parsing
 app.use(express.json({ limit: '10mb' }));
@@ -105,18 +112,22 @@ async function initializeServices() {
   if (servicesInitialized) return;
   
   try {
+    // Initialize TypeORM
+    await AppDataSource.initialize();
+    logger.info('TypeORM DataSource initialized');
+    
     // Initialize Telegram bot
     await telegramService.initialize();
-    logger.info('Telegram bot initialized successfully');
+    logger.info('Telegram bot initialized');
     
     // Initialize WebSocket server
     websocketService.initialize(httpServer);
-    logger.info('WebSocket server initialized successfully');
+    logger.info('WebSocket server initialized');
     
     servicesInitialized = true;
   } catch (error) {
     logger.error('Failed to initialize services:', error);
-    // Don't crash server - services are optional
+    process.exit(1);
   }
 }
 
@@ -127,8 +138,11 @@ async function shutdown() {
   try {
     await telegramService.shutdown();
     logger.info('Telegram bot stopped');
+    
+    await AppDataSource.destroy();
+    logger.info('Database connections closed');
   } catch (error) {
-    logger.error('Error stopping Telegram bot:', error);
+    logger.error('Error during shutdown:', error);
   }
   
   httpServer.close(() => {
@@ -149,11 +163,13 @@ process.on('SIGINT', shutdown);
 // Start server
 if (require.main === module) {
   httpServer.listen(config.port, async () => {
+    logger.info(`servAI Backend v${require('../package.json').version}`);
     logger.info(`Server running on port ${config.port}`);
     logger.info(`Environment: ${config.env}`);
-    logger.info(`Metrics available at http://localhost:${config.port}/metrics`);
-    logger.info(`Health check at http://localhost:${config.port}/health`);
-    logger.info(`WebSocket endpoint: ws://localhost:${config.port}/ws`);
+    logger.info(`Metrics: http://localhost:${config.port}/metrics`);
+    logger.info(`Health: http://localhost:${config.port}/health`);
+    logger.info(`WebSocket: ws://localhost:${config.port}/ws`);
+    logger.info(`Uploads: ${uploadsDir}`);
     
     // Initialize services after server starts
     await initializeServices();
