@@ -1,97 +1,106 @@
-import IORedis from 'ioredis';
+import Redis from 'ioredis';
 import { config } from '../config';
 import { logger } from './logger';
-import { CONSTANTS } from '../config/constants';
 
+/**
+ * Redis client with error handling
+ */
 class RedisClient {
-  private client: IORedis;
-  private isReady: boolean = false;
+  private client: Redis;
+  private isConnected: boolean = false;
 
   constructor() {
-    this.client = new IORedis(config.redis.url, {
+    this.client = new Redis(config.redis.url, {
+      keyPrefix: config.redis.keyPrefix,
+      retryStrategy: (times: number) => {
+        const delay = Math.min(times * 50, 2000);
+        return delay;
+      },
       maxRetriesPerRequest: 3,
-      enableReadyCheck: true,
-      lazyConnect: false,
     });
 
     this.client.on('connect', () => {
-      logger.info('Redis client connected');
+      this.isConnected = true;
+      logger.info('Redis connected');
     });
 
-    this.client.on('ready', () => {
-      this.isReady = true;
-      logger.info('Redis client ready');
-    });
-
-    this.client.on('error', (err) => {
-      logger.error('Redis client error', { error: err });
-      this.isReady = false;
+    this.client.on('error', (error) => {
+      this.isConnected = false;
+      logger.error('Redis error', { error });
     });
 
     this.client.on('close', () => {
-      this.isReady = false;
-      logger.warn('Redis client connection closed');
+      this.isConnected = false;
+      logger.warn('Redis connection closed');
     });
   }
 
-  getClient(): IORedis {
+  /**
+   * Get Redis client
+   */
+  getClient(): Redis {
     return this.client;
   }
 
+  /**
+   * Check if connected
+   */
+  isReady(): boolean {
+    return this.isConnected;
+  }
+
+  /**
+   * Ping Redis
+   */
+  async ping(): Promise<string> {
+    return await this.client.ping();
+  }
+
+  /**
+   * Get value
+   */
   async get(key: string): Promise<string | null> {
-    if (!this.isReady) {
-      logger.warn('Redis not ready, skipping GET');
-      return null;
-    }
-    try {
-      return await this.client.get(key);
-    } catch (error) {
-      logger.error('Redis GET error', { key, error });
-      return null;
-    }
+    return await this.client.get(key);
   }
 
-  async set(key: string, value: string, ttlSeconds?: number): Promise<void> {
-    if (!this.isReady) {
-      logger.warn('Redis not ready, skipping SET');
-      return;
+  /**
+   * Set value with optional TTL
+   */
+  async set(key: string, value: string, ttl?: number): Promise<'OK'> {
+    if (ttl) {
+      return await this.client.set(key, value, 'EX', ttl);
     }
-    try {
-      if (ttlSeconds) {
-        await this.client.setex(key, ttlSeconds, value);
-      } else {
-        await this.client.set(key, value);
-      }
-    } catch (error) {
-      logger.error('Redis SET error', { key, error });
-    }
+    return await this.client.set(key, value);
   }
 
-  async del(key: string): Promise<void> {
-    if (!this.isReady) {
-      return;
-    }
-    try {
-      await this.client.del(key);
-    } catch (error) {
-      logger.error('Redis DEL error', { key, error });
-    }
+  /**
+   * Delete key
+   */
+  async del(key: string): Promise<number> {
+    return await this.client.del(key);
   }
 
-  async healthCheck(): Promise<boolean> {
-    try {
-      const result = await this.client.ping();
-      return result === 'PONG';
-    } catch (error) {
-      logger.error('Redis health check failed', { error });
-      return false;
-    }
+  /**
+   * Increment value
+   */
+  async incr(key: string): Promise<number> {
+    return await this.client.incr(key);
   }
 
+  /**
+   * Set expiry
+   */
+  async expire(key: string, seconds: number): Promise<number> {
+    return await this.client.expire(key, seconds);
+  }
+
+  /**
+   * Close connection
+   */
   async close(): Promise<void> {
     await this.client.quit();
-    logger.info('Redis client closed');
   }
 }
 
+// Export singleton
 export const redis = new RedisClient();
