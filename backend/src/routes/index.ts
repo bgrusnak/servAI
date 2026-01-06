@@ -1,26 +1,22 @@
 import { Router } from 'express';
 import { authRouter } from './auth';
+import { companiesRouter } from './companies';
+import { condosRouter } from './condos';
+import { unitsRouter } from './units';
 
 const apiRouter = Router();
 
-// Auth routes
+// Auth routes (public)
 apiRouter.use('/auth', authRouter);
 
-// Placeholder routes (to be implemented)
-apiRouter.get('/companies', (req, res) => {
-  res.status(501).json({ message: 'Companies endpoint - to be implemented' });
-});
+// Protected routes (require authentication)
+apiRouter.use('/companies', companiesRouter);
+apiRouter.use('/condos', condosRouter);
+apiRouter.use('/units', unitsRouter);
 
-apiRouter.get('/condos', (req, res) => {
-  res.status(501).json({ message: 'Condos endpoint - to be implemented' });
-});
-
-apiRouter.get('/units', (req, res) => {
-  res.status(501).json({ message: 'Units endpoint - to be implemented' });
-});
-
-apiRouter.get('/users/me', (req, res) => {
-  res.status(501).json({ message: 'User profile endpoint - to be implemented' });
+// Health check for API
+apiRouter.get('/ping', (req, res) => {
+  res.json({ message: 'pong', timestamp: new Date().toISOString() });
 });
 
 export { apiRouter };
