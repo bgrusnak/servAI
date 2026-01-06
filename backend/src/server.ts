@@ -6,6 +6,7 @@ import { logger } from './utils/logger';
 import { errorHandler } from './middleware/errorHandler';
 import { requestLogger } from './middleware/requestLogger';
 import { metricsMiddleware } from './middleware/metricsMiddleware';
+import { telegramService } from './services/telegram.service';
 
 // Import routes
 import authRoutes from './routes/auth';
@@ -19,6 +20,7 @@ import residentRoutes from './routes/residents';
 import passwordResetRoutes from './routes/password-reset';
 import emailVerificationRoutes from './routes/email-verification';
 import monitoringRoutes from './routes/monitoring';
+import telegramRoutes from './routes/telegram';
 
 const app = express();
 
@@ -57,6 +59,7 @@ apiV1Router.use('/invites', inviteRoutes);
 apiV1Router.use('/residents', residentRoutes);
 apiV1Router.use('/password-reset', passwordResetRoutes);
 apiV1Router.use('/email-verification', emailVerificationRoutes);
+apiV1Router.use('/telegram', telegramRoutes);
 
 app.use('/api/v1', apiV1Router);
 
@@ -68,23 +71,48 @@ app.use((req, res) => {
 // Error handler (must be last)
 app.use(errorHandler);
 
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  logger.info('SIGTERM received, shutting down gracefully');
-  process.exit(0);
-});
+// Initialize Telegram bot
+let botInitialized = false;
 
-process.on('SIGINT', () => {
-  logger.info('SIGINT received, shutting down gracefully');
+async function initializeBot() {
+  if (botInitialized) return;
+  
+  try {
+    await telegramService.initialize();
+    botInitialized = true;
+    logger.info('Telegram bot initialized successfully');
+  } catch (error) {
+    logger.error('Failed to initialize Telegram bot:', error);
+    // Don't crash server if bot fails - it's optional
+  }
+}
+
+// Graceful shutdown
+async function shutdown() {
+  logger.info('Shutting down gracefully');
+  
+  try {
+    await telegramService.shutdown();
+    logger.info('Telegram bot stopped');
+  } catch (error) {
+    logger.error('Error stopping Telegram bot:', error);
+  }
+  
   process.exit(0);
-});
+}
+
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
 
 // Start server
 if (require.main === module) {
-  app.listen(config.port, () => {
+  app.listen(config.port, async () => {
     logger.info(`Server running on port ${config.port}`);
     logger.info(`Environment: ${config.env}`);
     logger.info(`Metrics available at http://localhost:${config.port}/metrics`);
+    
+    // Initialize Telegram bot after server starts
+    await initializeBot();
   });
 }
 
