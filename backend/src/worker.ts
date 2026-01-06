@@ -57,13 +57,16 @@ const processors = {
   'cleanup:invites': async (job: Job) => {
     logger.info('Cleaning up expired invites', { jobId: job.id });
     
-    // Use transaction with SELECT FOR UPDATE to prevent race conditions
+    // Soft delete expired invites
     const deleted = await db.transaction(async (client) => {
       const result = await client.query(
-        `DELETE FROM invites 
+        `UPDATE invites 
+         SET deleted_at = NOW()
          WHERE id IN (
            SELECT id FROM invites 
-           WHERE expires_at < NOW() AND is_active = true
+           WHERE expires_at < NOW() 
+           AND is_active = true 
+           AND deleted_at IS NULL
            FOR UPDATE SKIP LOCKED
          )
          RETURNING id`
@@ -71,31 +74,58 @@ const processors = {
       return result.rowCount || 0;
     });
     
-    logger.info('Expired invites cleaned', { count: deleted });
+    logger.info('Expired invites soft deleted', { count: deleted });
     return { success: true, deleted };
   },
 
   'cleanup:audit-logs': async (job: Job) => {
     logger.info('Cleaning up old audit logs', { jobId: job.id });
+    
+    // Soft delete old audit logs
     const result = await db.query(
-      `DELETE FROM audit_logs 
+      `UPDATE audit_logs 
+       SET deleted_at = NOW()
        WHERE created_at < NOW() - INTERVAL '1 day' * $1
+       AND deleted_at IS NULL
        RETURNING id`,
       [config.retention.auditLogs]
     );
-    logger.info('Old audit logs cleaned', { count: result.rowCount });
+    
+    logger.info('Old audit logs soft deleted', { count: result.rowCount });
     return { success: true, deleted: result.rowCount || 0 };
   },
   
   'cleanup:telegram-messages': async (job: Job) => {
     logger.info('Cleaning up old telegram messages', { jobId: job.id });
+    
+    // Soft delete old telegram messages
     const result = await db.query(
-      `DELETE FROM telegram_messages 
+      `UPDATE telegram_messages 
+       SET deleted_at = NOW()
        WHERE created_at < NOW() - INTERVAL '1 day' * $1
+       AND deleted_at IS NULL
        RETURNING id`,
       [CONSTANTS.TELEGRAM_MESSAGES_RETENTION_DAYS]
     );
-    logger.info('Old telegram messages cleaned', { count: result.rowCount });
+    
+    logger.info('Old telegram messages soft deleted', { count: result.rowCount });
+    return { success: true, deleted: result.rowCount || 0 };
+  },
+  
+  'cleanup:refresh-tokens': async (job: Job) => {
+    logger.info('Cleaning up old refresh tokens', { jobId: job.id });
+    
+    // Soft delete old revoked refresh tokens (keep for audit trail)
+    const result = await db.query(
+      `UPDATE refresh_tokens 
+       SET deleted_at = NOW()
+       WHERE revoked_at < NOW() - INTERVAL '1 day' * $1
+       AND deleted_at IS NULL
+       RETURNING id`,
+      [CONSTANTS.REFRESH_TOKENS_RETENTION_DAYS]
+    );
+    
+    logger.info('Old refresh tokens soft deleted', { count: result.rowCount });
     return { success: true, deleted: result.rowCount || 0 };
   },
 };

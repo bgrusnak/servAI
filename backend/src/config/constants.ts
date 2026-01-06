@@ -8,6 +8,7 @@ export const CONSTANTS = {
   // Cache TTL
   CACHE_USER_TTL_SECONDS: 300, // 5 minutes
   CACHE_ROLES_TTL_SECONDS: 300,
+  CACHE_REFRESH_TOKEN_TTL_SECONDS: 604800, // 7 days
   
   // Rate limiting
   RATE_LIMIT_AUTH_WINDOW_MS: 900000, // 15 minutes
@@ -17,14 +18,16 @@ export const CONSTANTS = {
   
   // Token TTL
   JWT_ACCESS_TOKEN_TTL: '15m',
-  JWT_REFRESH_TOKEN_TTL: '7d',
+  JWT_REFRESH_TOKEN_TTL_DAYS: 7,
+  JWT_REFRESH_TOKEN_ROTATION: true, // Rotate on use
   
   // Invite defaults
   INVITE_DEFAULT_TTL_DAYS: 7,
   INVITE_MAX_USES_DEFAULT: null, // unlimited
   
-  // Cleanup retention
+  // Cleanup retention (days)
   TELEGRAM_MESSAGES_RETENTION_DAYS: 365,
+  REFRESH_TOKENS_RETENTION_DAYS: 30, // Keep revoked tokens for audit
   
   // Pagination
   DEFAULT_PAGE_SIZE: 20,
