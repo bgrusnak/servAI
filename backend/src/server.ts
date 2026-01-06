@@ -5,6 +5,7 @@ import { config } from './config';
 import { logger } from './utils/logger';
 import { errorHandler } from './middleware/errorHandler';
 import { requestLogger } from './middleware/requestLogger';
+import { metricsMiddleware } from './middleware/metricsMiddleware';
 
 // Import routes
 import authRoutes from './routes/auth';
@@ -17,6 +18,7 @@ import inviteRoutes from './routes/invites';
 import residentRoutes from './routes/residents';
 import passwordResetRoutes from './routes/password-reset';
 import emailVerificationRoutes from './routes/email-verification';
+import monitoringRoutes from './routes/monitoring';
 
 const app = express();
 
@@ -33,13 +35,14 @@ app.use(
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 
+// Metrics collection
+app.use(metricsMiddleware);
+
 // Request logging
 app.use(requestLogger);
 
-// Health check
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
-});
+// Monitoring endpoints (no /api prefix)
+app.use('/', monitoringRoutes);
 
 // API routes (v1)
 const apiV1Router = express.Router();
@@ -81,6 +84,7 @@ if (require.main === module) {
   app.listen(config.port, () => {
     logger.info(`Server running on port ${config.port}`);
     logger.info(`Environment: ${config.env}`);
+    logger.info(`Metrics available at http://localhost:${config.port}/metrics`);
   });
 }
 
