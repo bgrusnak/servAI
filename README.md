@@ -4,11 +4,26 @@ servAI is a SaaS platform for property management companies and residential comp
 
 ## Technology Stack
 
-- **Backend**: Node.js + Express, PostgreSQL, BullMQ
+- **Backend**: Node.js + Express, PostgreSQL, BullMQ, Redis
 - **Frontend**: Vue 3 + Quasar (planned)
 - **Hosting**: Docker (backend, frontend, worker, database)
 - **AI**: Perplexity Sonar API for NLU and response generation
 - **Integrations**: Telegram Bot, Stripe Payments
+
+## Architecture Highlights
+
+✅ **Single migration approach** - One complete schema, no migration conflicts  
+✅ **Soft delete everywhere** - All tables have `deleted_at`, nothing is lost  
+✅ **Database views** - `*_active` views for easy querying without soft-deleted records  
+✅ **Refresh token rotation** - Enterprise-grade auth with automatic token rotation  
+✅ **Token revocation check** - Access tokens verified against revocation in real-time  
+✅ **Redis caching** - User data and auth cached for performance  
+✅ **Distributed rate limiting** - Redis-backed rate limiter works across multiple instances  
+✅ **Advisory locks** - Prevent concurrent migrations  
+✅ **Batch cleanup** - Cleanup jobs process records in batches to avoid table locks  
+✅ **Scheduled jobs** - Automatic cleanup with cron patterns  
+✅ **Password validation** - Configurable password strength requirements  
+✅ **Connection leak detection** - Automatic detection and cleanup of leaked DB connections  
 
 ## Quick Start (Development)
 
@@ -33,7 +48,7 @@ cp .env.example .env
 3. **Edit `.env` and set required values:**
 
 **CRITICAL - Must change in production:**
-- `JWT_SECRET` - Use a strong random string (min 32 characters)
+- `JWT_SECRET` - Use a strong random string (min 32 characters): `openssl rand -base64 32`
 - `POSTGRES_PASSWORD` - Strong database password
 
 **Required for full functionality:**
@@ -44,6 +59,13 @@ cp .env.example .env
 
 **Production only:**
 - `ALLOWED_ORIGINS` - Comma-separated list of allowed domains (e.g., `https://yourdomain.com,https://admin.yourdomain.com`)
+
+**Optional tunables:**
+- `CACHE_USER_TTL_SECONDS` - User cache TTL (default: 300)
+- `JWT_REFRESH_TOKEN_TTL_DAYS` - Refresh token lifetime (default: 7)
+- `JWT_REFRESH_TOKEN_ROTATION` - Enable token rotation (default: true)
+- `PASSWORD_MIN_LENGTH` - Minimum password length (default: 8)
+- `CLEANUP_BATCH_SIZE` - Cleanup batch size (default: 1000)
 
 4. **Start services:**
 ```bash
@@ -62,7 +84,7 @@ curl http://localhost:3000/ready
 curl http://localhost:3000/health/integrations
 ```
 
-**Migrations run automatically** when backend starts. No manual steps needed!
+**Migration runs automatically** when backend starts. Only ONE migration file with complete schema!
 
 6. **View logs:**
 ```bash
@@ -84,6 +106,55 @@ docker-compose down
 docker-compose down -v
 ```
 
+## Database Architecture
+
+### Soft Delete Pattern
+
+All tables have `deleted_at TIMESTAMP WITH TIME ZONE` column. Instead of `DELETE`, we use:
+
+```sql
+UPDATE table_name SET deleted_at = NOW() WHERE id = $1;
+```
+
+### Database Views
+
+For convenience, active records views are created automatically:
+
+- `companies_active` - only non-deleted companies
+- `users_active` - only non-deleted users
+- `tickets_active` - only non-deleted tickets
+- etc.
+
+**Usage in queries:**
+```sql
+-- Instead of:
+SELECT * FROM users WHERE deleted_at IS NULL;
+
+-- Use:
+SELECT * FROM users_active;
+```
+
+**All existing code uses base tables with explicit `WHERE deleted_at IS NULL` for consistency.**
+
+### Token Management
+
+**Access Token (15 min):**
+- Short-lived JWT
+- Contains `userId` and `tokenId` (refresh token ID)
+- Verified on every request
+- Checked against revocation (Redis + DB)
+
+**Refresh Token (7 days):**
+- Long-lived, stored in database
+- Automatically rotated on use (old revoked, new issued)
+- Tracks IP and User-Agent for security
+- Rate limited (10 refreshes per minute per user)
+
+**Logout:**
+- Single device: revokes one refresh token
+- All devices: revokes all user's refresh tokens
+- Revoked tokens cached in Redis for fast checks
+
 ## Production Deployment
 
 ### Prerequisites
@@ -91,6 +162,7 @@ docker-compose down -v
 - Docker and Docker Compose
 - Valid SSL certificates
 - Domain name configured
+- Secrets management (Vault, AWS Secrets Manager, etc.)
 
 ### Production Setup
 
@@ -103,7 +175,7 @@ cp .env.example .env.production
 
 **REQUIRED:**
 - `NODE_ENV=production`
-- `JWT_SECRET` - Strong random string (use `openssl rand -base64 32`)
+- `JWT_SECRET` - Strong random string (`openssl rand -base64 32`)
 - `POSTGRES_PASSWORD` - Strong password
 - `DATABASE_URL` - Production database URL
 - `REDIS_URL` - Production Redis URL
@@ -123,6 +195,7 @@ docker-compose -f docker-compose.prod.yml --env-file .env.production up -d
 ```bash
 curl https://yourdomain.com/health
 curl https://yourdomain.com/ready
+curl https://yourdomain.com/health/integrations
 ```
 
 ### Production Features
@@ -136,28 +209,37 @@ curl https://yourdomain.com/ready
 - ✅ Health checks for all services
 - ✅ Redis persistence (AOF)
 - ✅ Network isolation
+- ✅ Advisory locks for migrations
+- ✅ Connection leak detection
 
 ### Backup and Restore
 
 **Database Backup:**
 ```bash
 # Create backup
-docker-compose -f docker-compose.prod.yml exec postgres pg_dump -U $POSTGRES_USER $POSTGRES_DB > backup_$(date +%Y%m%d).sql
+docker-compose -f docker-compose.prod.yml exec postgres \
+  pg_dump -U $POSTGRES_USER $POSTGRES_DB > backup_$(date +%Y%m%d_%H%M%S).sql
 
 # Or use the backup volume
-docker-compose -f docker-compose.prod.yml exec postgres pg_dump -U $POSTGRES_USER $POSTGRES_DB > /backups/backup_$(date +%Y%m%d).sql
+docker-compose -f docker-compose.prod.yml exec postgres \
+  pg_dump -U $POSTGRES_USER $POSTGRES_DB > /backups/backup_$(date +%Y%m%d_%H%M%S).sql
 ```
 
 **Database Restore:**
 ```bash
 # Restore from backup
-cat backup_20260106.sql | docker-compose -f docker-compose.prod.yml exec -T postgres psql -U $POSTGRES_USER $POSTGRES_DB
+cat backup_20260106_160000.sql | \
+  docker-compose -f docker-compose.prod.yml exec -T postgres \
+  psql -U $POSTGRES_USER $POSTGRES_DB
 ```
 
-**Automated Backups:**
-Set up a cron job:
+**Automated Backups (cron):**
 ```bash
-0 2 * * * cd /path/to/servAI && docker-compose -f docker-compose.prod.yml exec postgres pg_dump -U servai servai > /backups/servai_$(date +\%Y\%m\%d).sql
+# Add to crontab
+0 2 * * * cd /path/to/servAI && docker-compose -f docker-compose.prod.yml exec -T postgres pg_dump -U servai servai | gzip > /backups/servai_$(date +\%Y\%m\%d).sql.gz
+
+# Cleanup old backups (keep 30 days)
+0 3 * * * find /backups -name 'servai_*.sql.gz' -mtime +30 -delete
 ```
 
 ## Development Without Docker
@@ -188,21 +270,78 @@ cd backend
 npm run migrate
 ```
 
-## Health Checks
+## API Documentation
 
-### Endpoints
+### Health Checks
 
 - `GET /health` - Simple liveness probe (always returns 200)
 - `GET /ready` - Readiness probe (checks DB, Redis, migrations)
 - `GET /health/integrations` - External integration health (Telegram, Perplexity, Stripe)
 
-### Monitoring
+### Authentication
 
-Recommended monitoring setup:
+**Register (TODO):**
+```bash
+POST /api/auth/register
+Content-Type: application/json
 
-1. **Liveness**: Monitor `/health` - should always return 200
-2. **Readiness**: Monitor `/ready` - 200 = ready to serve traffic
-3. **Integrations**: Monitor `/health/integrations` - detect external API issues
+{
+  "email": "user@example.com",
+  "password": "SecurePass123",
+  "first_name": "John",
+  "last_name": "Doe"
+}
+```
+
+**Login (TODO):**
+```bash
+POST /api/auth/login
+Content-Type: application/json
+
+{
+  "email": "user@example.com",
+  "password": "SecurePass123"
+}
+
+Response:
+{
+  "accessToken": "eyJhbG...",
+  "refreshToken": "a1b2c3d4..."
+}
+```
+
+**Refresh Token:**
+```bash
+POST /api/auth/refresh
+Content-Type: application/json
+
+{
+  "refreshToken": "a1b2c3d4..."
+}
+
+Response:
+{
+  "accessToken": "eyJhbG...",
+  "refreshToken": "e5f6g7h8..."  # New token (rotated)
+}
+```
+
+**Logout:**
+```bash
+POST /api/auth/logout
+Authorization: Bearer <accessToken>
+Content-Type: application/json
+
+{
+  "refreshToken": "a1b2c3d4..."
+}
+```
+
+**Logout All Devices:**
+```bash
+POST /api/auth/logout-all
+Authorization: Bearer <accessToken>
+```
 
 ## Troubleshooting
 
@@ -210,72 +349,93 @@ Recommended monitoring setup:
 - Check if PostgreSQL is healthy: `docker-compose ps`
 - View backend logs: `docker-compose logs backend`
 - Verify DATABASE_URL in .env is correct
+- Check if port 3000 is available
 
 **Migrations failed:**
-- Check backend logs for specific error
+- Check backend logs for specific error: `docker-compose logs backend | grep -i migration`
 - Migrations are transactional - failed migration won't partially apply
+- Migration uses advisory locks - only one instance can run migrations
 - Fix the issue and restart: `docker-compose restart backend`
 
 **Worker not processing jobs:**
 - Check if Redis is running: `docker-compose ps redis`
 - View worker logs: `docker-compose logs worker`
 - Verify REDIS_URL in .env
+- Check scheduled jobs: worker schedules cleanup jobs on startup
 
-**Connection refused errors:**
-- Wait 30-40 seconds after `docker-compose up` for all services to start
-- Check health status: `curl http://localhost:3000/health`
+**Token errors:**
+- "Token has been revoked" - user logged out or tokens refreshed
+- "Too many refresh requests" - rate limit hit (10/min per user)
+- "Invalid refresh token" - token expired or doesn't exist
+- Check Redis for blacklisted tokens: `redis-cli KEYS "token:revoked:*"`
 
 **Rate limiting issues:**
 - Rate limiter uses Redis for distributed state
 - If Redis is down, rate limiting falls back to memory (not distributed)
 - Check Redis: `docker-compose logs redis`
+- Clear rate limits: `redis-cli FLUSHDB` (dev only!)
 
 **Cache not working:**
 - Auth caching requires Redis
 - If Redis is unavailable, falls back to DB queries (slower but works)
 - Check `/ready` endpoint for Redis status
+- Clear cache: `redis-cli KEYS "user:*" | xargs redis-cli DEL`
 
-## API Documentation
+**Cleanup jobs not running:**
+- Check worker logs: `docker-compose logs worker | grep cleanup`
+- Jobs scheduled on worker startup with cron patterns
+- Verify job schedule: invites (2 AM), audit (3 AM), telegram (4 AM), tokens (5 AM)
+- Check BullMQ: `redis-cli KEYS "bull:cleanup:*"`
 
-API documentation is available in `openapi.yaml`.
-
-**Base URL:** `http://localhost:3000/api`
-
-**Health checks:**
-- `GET /health` - Liveness probe
-- `GET /ready` - Readiness probe
-- `GET /health/integrations` - External APIs health
-
-**API endpoints:**
-- `POST /api/auth/register` - User registration
-- `POST /api/auth/login` - User login
-- `GET /api/companies` - List companies (super_admin only)
-- `GET /api/condos` - List condos
-- `GET /api/units` - List units
-- `GET /api/users/me` - Current user info
-
-## Security Notes
+## Security Checklist
 
 ⚠️ **Before deploying to production:**
 
-1. ✅ Change `JWT_SECRET` to a strong random value (32+ chars)
-2. ✅ Use strong database passwords
-3. ✅ Set `ALLOWED_ORIGINS` to your actual domain(s)
-4. ✅ Never commit `.env` or `.env.production` to git
-5. ✅ Use HTTPS for all external communications
-6. ✅ Keep API keys in secure secret management (Vault, AWS Secrets Manager, etc.)
-7. ✅ Enable firewall rules to restrict database/Redis access
-8. ✅ Regularly update dependencies: `npm audit`
-9. ✅ Monitor logs for suspicious activity
-10. ✅ Set up automated backups
+- [ ] Change `JWT_SECRET` to strong random value (32+ chars)
+- [ ] Use strong database passwords
+- [ ] Set `ALLOWED_ORIGINS` to actual domain(s)
+- [ ] Never commit `.env` or `.env.production` to git
+- [ ] Use HTTPS for all external communications
+- [ ] Store API keys in secure secret management
+- [ ] Enable firewall rules to restrict database/Redis access
+- [ ] Regularly update dependencies: `npm audit`
+- [ ] Monitor logs for suspicious activity
+- [ ] Set up automated backups
+- [ ] Configure log rotation
+- [ ] Enable 2FA for admin accounts (when implemented)
+- [ ] Review and adjust password requirements
+- [ ] Set up rate limiting at nginx/LB level
+- [ ] Enable DDoS protection (Cloudflare, etc.)
+- [ ] Regular security audits
 
-## Performance Notes
+## Performance Tuning
 
-- **Auth caching**: User data cached in Redis for 5 minutes (reduces DB load)
-- **Rate limiting**: Distributed via Redis (works across multiple instances)
-- **Connection pooling**: PostgreSQL pool with leak detection
-- **Advisory locks**: Prevent concurrent migrations
-- **Slow query detection**: Queries >1s logged as warnings
+### Redis Caching
+
+- User data cached for 5 minutes (configurable)
+- Revoked tokens cached for 15 minutes (access token TTL)
+- Rate limit counters expire after window
+
+### Database
+
+- Connection pool with leak detection
+- Slow query logging (>1s)
+- Partial indexes on `deleted_at IS NULL`
+- Batch cleanup to avoid table locks
+
+### Rate Limiting
+
+- API: 100 requests/min per IP
+- Auth: 5 attempts/15min per IP
+- Refresh: 10 requests/min per user
+- All distributed via Redis
+
+### Cleanup Jobs
+
+- Run daily at night (low traffic)
+- Process in batches (1000 records)
+- Small delays between batches (100ms)
+- Soft delete only (can be restored)
 
 ## Architecture
 
@@ -283,29 +443,82 @@ API documentation is available in `openapi.yaml`.
 servAI/
 ├── backend/
 │   ├── src/
-│   │   ├── config/          # Configuration & constants
-│   │   ├── db/              # Database, migrations
-│   │   │   └── migrations/  # SQL migration files
-│   │   ├── middleware/      # Express middleware
-│   │   ├── routes/          # API routes
-│   │   ├── services/        # Business logic (planned)
-│   │   ├── utils/           # Utilities (logger, Redis)
-│   │   ├── server.ts        # Express server
-│   │   └── worker.ts        # Background worker (BullMQ)
-│   ├── logs/                # Application logs (Docker volume)
-│   ├── Dockerfile           # Development Dockerfile
-│   ├── Dockerfile.prod      # Production Dockerfile (multi-stage)
+│   │   ├── config/
+│   │   │   ├── index.ts          # Main config
+│   │   │   └── constants.ts      # Configurable constants
+│   │   ├── db/
+│   │   │   ├── index.ts          # Connection pool + helpers
+│   │   │   ├── migrate.ts        # Migration runner with advisory locks
+│   │   │   └── migrations/
+│   │   │       └── 001_init_complete_schema.sql  # Single migration
+│   │   ├── middleware/
+│   │   │   ├── auth.ts           # JWT + revocation check + caching
+│   │   │   ├── errorHandler.ts   # Error sanitization
+│   │   │   ├── rateLimiter.ts    # Redis-backed rate limiting
+│   │   │   └── requestLogger.ts
+│   │   ├── routes/
+│   │   │   ├── index.ts          # API router
+│   │   │   └── auth.ts           # Auth endpoints
+│   │   ├── services/
+│   │   │   └── auth.service.ts   # Token management + password validation
+│   │   ├── utils/
+│   │   │   ├── logger.ts         # Winston structured logging
+│   │   │   └── redis.ts          # Redis client wrapper
+│   │   ├── server.ts             # Express app + health checks
+│   │   └── worker.ts             # BullMQ worker + scheduled jobs
+│   ├── logs/                     # Application logs (Docker volume)
+│   ├── Dockerfile                # Development
+│   ├── Dockerfile.prod           # Production (multi-stage)
 │   ├── package.json
 │   └── tsconfig.json
-├── frontend/                # Vue 3 + Quasar (planned)
-├── docs/                    # Documentation
-│   ├── BRIEF V1.md         # MVP requirements
-│   └── tasks.md            # Task breakdown
-├── docker-compose.yml       # Development compose
-├── docker-compose.prod.yml  # Production compose
-├── .env.example             # Environment template
+├── frontend/                     # Vue 3 + Quasar (planned)
+├── docs/
+│   ├── BRIEF V1.md
+│   └── tasks.md
+├── docker-compose.yml            # Development
+├── docker-compose.prod.yml       # Production
+├── .env.example
 └── README.md
 ```
+
+## What's Implemented
+
+✅ Complete database schema (50+ tables)  
+✅ Soft delete on all tables  
+✅ Database views for active records  
+✅ Refresh token rotation  
+✅ Token revocation checking  
+✅ Password validation  
+✅ Redis caching for auth  
+✅ Distributed rate limiting  
+✅ Advisory locks for migrations  
+✅ Batch cleanup jobs  
+✅ Scheduled cron jobs  
+✅ Connection leak detection  
+✅ Health checks (3 endpoints)  
+✅ Docker development setup  
+✅ Docker production setup  
+✅ Graceful shutdown  
+✅ Structured logging  
+✅ Error sanitization  
+
+## What's TODO
+
+🔄 User registration endpoint  
+🔄 User login endpoint  
+🔄 CRUD for companies, condos, units  
+🔄 Telegram bot integration  
+🔄 Perplexity Sonar NLU  
+🔄 Excel import for units  
+🔄 Meter readings management  
+🔄 Tickets system  
+🔄 Notifications  
+🔄 Stripe billing  
+🔄 Frontend (Vue 3 + Quasar)  
+🔄 Automated tests  
+🔄 OpenAPI documentation  
+🔄 Prometheus metrics  
+🔄 Load testing  
 
 ## License
 
