@@ -1,381 +1,63 @@
 <template>
-  <q-layout view="lHh Lpr lFf">
-    <!-- Header -->
-    <q-header elevated class="bg-primary text-white">
+  <q-layout view="hHh lpR fFf">
+    <q-header elevated class="bg-white text-grey-9">
       <q-toolbar>
-        <q-btn
-          flat
-          dense
-          round
-          icon="menu"
-          aria-label="Menu"
-          @click="toggleDrawer"
-        />
-
-        <q-toolbar-title>
-          {{ $t('app.name') }}
-        </q-toolbar-title>
-
-        <!-- Language Selector -->
-        <q-btn-dropdown flat no-caps :label="currentLocale.toUpperCase()">
-          <q-list>
-            <q-item
-              v-for="locale in locales"
-              :key="locale.value"
-              clickable
-              v-close-popup
-              @click="changeLocale(locale.value)"
-            >
-              <q-item-section>
-                <q-item-label>{{ locale.label }}</q-item-label>
-              </q-item-section>
-            </q-item>
-          </q-list>
-        </q-btn-dropdown>
-
-        <!-- Notifications -->
-        <q-btn flat round dense icon="notifications">
-          <q-badge v-if="unreadCount > 0" color="red" floating>{{ unreadCount }}</q-badge>
-        </q-btn>
-
-        <!-- User Menu -->
-        <q-btn flat round dense icon="account_circle">
-          <q-menu>
-            <q-list style="min-width: 200px">
-              <q-item>
-                <q-item-section>
-                  <q-item-label>{{ user?.name || user?.email }}</q-item-label>
-                  <q-item-label caption>{{ $t(`roles.${user?.role}`) }}</q-item-label>
-                </q-item-section>
-              </q-item>
-              
-              <q-separator />
-              
-              <q-item clickable v-close-popup @click="$router.push('/profile')">
-                <q-item-section avatar>
-                  <q-icon name="person" />
-                </q-item-section>
-                <q-item-section>{{ $t('nav.profile') }}</q-item-section>
-              </q-item>
-              
-              <q-item clickable v-close-popup @click="$router.push('/settings')">
-                <q-item-section avatar>
-                  <q-icon name="settings" />
-                </q-item-section>
-                <q-item-section>{{ $t('nav.settings') }}</q-item-section>
-              </q-item>
-              
-              <q-separator />
-              
-              <q-item clickable v-close-popup @click="handleLogout">
-                <q-item-section avatar>
-                  <q-icon name="logout" color="negative" />
-                </q-item-section>
-                <q-item-section>{{ $t('auth.logout') }}</q-item-section>
-              </q-item>
-            </q-list>
-          </q-menu>
-        </q-btn>
+        <q-btn flat dense round icon="menu" @click="toggleLeftDrawer" />
+        <q-toolbar-title class="text-weight-bold">ServAI</q-toolbar-title>
+        <q-space />
+        <q-btn flat round dense icon="notifications" @click="showNotifications = true"><q-badge v-if="unreadCount > 0" color="red" floating>{{ unreadCount }}</q-badge></q-btn>
+        <q-btn flat round dense icon="account_circle"><q-menu><q-list style="min-width: 200px"><q-item clickable v-close-popup @click="$router.push('/profile')"><q-item-section avatar><q-icon name="person" /></q-item-section><q-item-section>{{ $t('nav.profile') }}</q-item-section></q-item><q-item clickable v-close-popup @click="$router.push('/settings')"><q-item-section avatar><q-icon name="settings" /></q-item-section><q-item-section>{{ $t('nav.settings') }}</q-item-section></q-item><q-separator /><q-item clickable v-close-popup @click="logout"><q-item-section avatar><q-icon name="logout" color="negative" /></q-item-section><q-item-section>{{ $t('auth.logout') }}</q-item-section></q-item></q-list></q-menu></q-btn>
       </q-toolbar>
     </q-header>
 
-    <!-- Left Drawer (Menu) -->
-    <q-drawer
-      v-model="drawerOpen"
-      show-if-above
-      bordered
-      :width="280"
-      :breakpoint="768"
-    >
-      <q-scroll-area class="fit">
-        <q-list padding>
-          <!-- Dashboard -->
-          <q-item
-            clickable
-            :active="$route.name === 'dashboard'"
-            @click="$router.push('/dashboard')"
-          >
-            <q-item-section avatar>
-              <q-icon name="dashboard" />
-            </q-item-section>
-            <q-item-section>
-              <q-item-label>{{ $t('nav.dashboard') }}</q-item-label>
-            </q-item-section>
-          </q-item>
-
-          <q-separator spaced />
-
-          <!-- Management Companies (Super Admin only) -->
-          <q-item
-            v-if="canViewManagementCompanies"
-            clickable
-            :active="$route.path.startsWith('/management-companies')"
-            @click="$router.push('/management-companies')"
-          >
-            <q-item-section avatar>
-              <q-icon name="business" />
-            </q-item-section>
-            <q-item-section>
-              <q-item-label>{{ $t('nav.managementCompanies') }}</q-item-label>
-            </q-item-section>
-          </q-item>
-
-          <!-- Complexes -->
-          <q-item
-            clickable
-            :active="$route.path.startsWith('/complexes')"
-            @click="$router.push('/complexes')"
-          >
-            <q-item-section avatar>
-              <q-icon name="apartment" />
-            </q-item-section>
-            <q-item-section>
-              <q-item-label>{{ $t('nav.complexes') }}</q-item-label>
-            </q-item-section>
-          </q-item>
-
-          <!-- Units -->
-          <q-item
-            clickable
-            :active="$route.path.startsWith('/units')"
-            @click="$router.push('/units')"
-          >
-            <q-item-section avatar>
-              <q-icon name="door_front" />
-            </q-item-section>
-            <q-item-section>
-              <q-item-label>{{ $t('nav.units') }}</q-item-label>
-            </q-item-section>
-          </q-item>
-
-          <q-separator spaced />
-
-          <!-- Residents -->
-          <q-item
-            v-if="!isWorker"
-            clickable
-            :active="$route.path.startsWith('/residents')"
-            @click="$router.push('/residents')"
-          >
-            <q-item-section avatar>
-              <q-icon name="people" />
-            </q-item-section>
-            <q-item-section>
-              <q-item-label>{{ $t('nav.residents') }}</q-item-label>
-            </q-item-section>
-          </q-item>
-
-          <!-- Workers -->
-          <q-item
-            v-if="!isWorker"
-            clickable
-            :active="$route.path.startsWith('/workers')"
-            @click="$router.push('/workers')"
-          >
-            <q-item-section avatar>
-              <q-icon name="engineering" />
-            </q-item-section>
-            <q-item-section>
-              <q-item-label>{{ $t('nav.workers') }}</q-item-label>
-            </q-item-section>
-          </q-item>
-
-          <q-separator spaced />
-
-          <!-- Tickets -->
-          <q-item
-            clickable
-            :active="$route.path.startsWith('/tickets')"
-            @click="$router.push('/tickets')"
-          >
-            <q-item-section avatar>
-              <q-icon name="confirmation_number" />
-            </q-item-section>
-            <q-item-section>
-              <q-item-label>{{ $t('nav.tickets') }}</q-item-label>
-            </q-item-section>
-          </q-item>
-
-          <!-- Meter Readings -->
-          <q-item
-            v-if="!isWorker"
-            clickable
-            :active="$route.path.startsWith('/meter-readings')"
-            @click="$router.push('/meter-readings')"
-          >
-            <q-item-section avatar>
-              <q-icon name="speed" />
-            </q-item-section>
-            <q-item-section>
-              <q-item-label>{{ $t('nav.meterReadings') }}</q-item-label>
-            </q-item-section>
-          </q-item>
-
-          <!-- Billing -->
-          <q-item
-            v-if="!isWorker"
-            clickable
-            :active="$route.path.startsWith('/billing')"
-            @click="$router.push('/billing')"
-          >
-            <q-item-section avatar>
-              <q-icon name="payments" />
-            </q-item-section>
-            <q-item-section>
-              <q-item-label>{{ $t('nav.billing') }}</q-item-label>
-            </q-item-section>
-          </q-item>
-
-          <q-separator spaced />
-
-          <!-- Polls -->
-          <q-item
-            v-if="!isWorker"
-            clickable
-            :active="$route.path.startsWith('/polls')"
-            @click="$router.push('/polls')"
-          >
-            <q-item-section avatar>
-              <q-icon name="poll" />
-            </q-item-section>
-            <q-item-section>
-              <q-item-label>{{ $t('nav.polls') }}</q-item-label>
-            </q-item-section>
-          </q-item>
-
-          <!-- Access Control -->
-          <q-item
-            v-if="!isWorker"
-            clickable
-            :active="$route.path.startsWith('/access-control')"
-            @click="$router.push('/access-control')"
-          >
-            <q-item-section avatar>
-              <q-icon name="security" />
-            </q-item-section>
-            <q-item-section>
-              <q-item-label>{{ $t('nav.accessControl') }}</q-item-label>
-            </q-item-section>
-          </q-item>
-
-          <q-separator spaced />
-
-          <!-- Reports -->
-          <q-item
-            v-if="!isWorker"
-            clickable
-            :active="$route.path.startsWith('/reports')"
-            @click="$router.push('/reports')"
-          >
-            <q-item-section avatar>
-              <q-icon name="assessment" />
-            </q-item-section>
-            <q-item-section>
-              <q-item-label>{{ $t('nav.reports') }}</q-item-label>
-            </q-item-section>
-          </q-item>
-        </q-list>
-      </q-scroll-area>
+    <q-drawer v-model="leftDrawerOpen" show-if-above bordered class="bg-grey-1">
+      <q-list>
+        <q-item-label header>{{ $t('app.name') }}</q-item-label>
+        <q-item clickable v-ripple :active="$route.path === '/'" @click="$router.push('/')" active-class="bg-primary text-white"><q-item-section avatar><q-icon name="dashboard" /></q-item-section><q-item-section>{{ $t('nav.dashboard') }}</q-item-section></q-item>
+        <q-separator />
+        <q-item clickable v-ripple :active="$route.path.includes('/management-companies')" @click="$router.push('/management-companies')" active-class="bg-primary text-white"><q-item-section avatar><q-icon name="business" /></q-item-section><q-item-section>{{ $t('nav.managementCompanies') }}</q-item-section></q-item>
+        <q-item clickable v-ripple :active="$route.path.includes('/complexes')" @click="$router.push('/complexes')" active-class="bg-primary text-white"><q-item-section avatar><q-icon name="apartment" /></q-item-section><q-item-section>{{ $t('nav.complexes') }}</q-item-section></q-item>
+        <q-item clickable v-ripple :active="$route.path.includes('/units')" @click="$router.push('/units')" active-class="bg-primary text-white"><q-item-section avatar><q-icon name="home" /></q-item-section><q-item-section>{{ $t('nav.units') }}</q-item-section></q-item>
+        <q-separator />
+        <q-item clickable v-ripple :active="$route.path.includes('/residents')" @click="$router.push('/residents')" active-class="bg-primary text-white"><q-item-section avatar><q-icon name="people" /></q-item-section><q-item-section>{{ $t('nav.residents') }}</q-item-section></q-item>
+        <q-item clickable v-ripple :active="$route.path.includes('/workers')" @click="$router.push('/workers')" active-class="bg-primary text-white"><q-item-section avatar><q-icon name="engineering" /></q-item-section><q-item-section>{{ $t('nav.workers') }}</q-item-section></q-item>
+        <q-separator />
+        <q-item clickable v-ripple :active="$route.path.includes('/tickets')" @click="$router.push('/tickets')" active-class="bg-primary text-white"><q-item-section avatar><q-icon name="confirmation_number" /></q-item-section><q-item-section>{{ $t('nav.tickets') }}</q-item-section></q-item>
+        <q-item clickable v-ripple :active="$route.path.includes('/meter-readings')" @click="$router.push('/meter-readings')" active-class="bg-primary text-white"><q-item-section avatar><q-icon name="speed" /></q-item-section><q-item-section>{{ $t('nav.meterReadings') }}</q-item-section></q-item>
+        <q-item clickable v-ripple :active="$route.path.includes('/billing')" @click="$router.push('/billing')" active-class="bg-primary text-white"><q-item-section avatar><q-icon name="receipt" /></q-item-section><q-item-section>{{ $t('nav.billing') }}</q-item-section></q-item>
+        <q-separator />
+        <q-item clickable v-ripple :active="$route.path.includes('/polls')" @click="$router.push('/polls')" active-class="bg-primary text-white"><q-item-section avatar><q-icon name="poll" /></q-item-section><q-item-section>{{ $t('nav.polls') }}</q-item-section></q-item>
+        <q-item clickable v-ripple :active="$route.path.includes('/access-control')" @click="$router.push('/access-control')" active-class="bg-primary text-white"><q-item-section avatar><q-icon name="vpn_key" /></q-item-section><q-item-section>{{ $t('nav.accessControl') }}</q-item-section></q-item>
+        <q-item clickable v-ripple :active="$route.path.includes('/reports')" @click="$router.push('/reports')" active-class="bg-primary text-white"><q-item-section avatar><q-icon name="assessment" /></q-item-section><q-item-section>{{ $t('nav.reports') }}</q-item-section></q-item>
+      </q-list>
     </q-drawer>
 
-    <!-- Page Content -->
-    <q-page-container>
-      <router-view />
-    </q-page-container>
+    <q-page-container><router-view /></q-page-container>
+
+    <q-dialog v-model="showNotifications" position="right" maximized><q-card style="width: 400px"><q-card-section class="row items-center q-pb-none"><div class="text-h6">Notifications</div><q-space /><q-btn icon="close" flat round dense v-close-popup /></q-card-section><q-separator /><q-card-section class="q-pt-none" style="max-height: calc(100vh - 100px); overflow-y: auto;"><q-list v-if="notifications.length > 0"><q-item v-for="notification in notifications" :key="notification.id" clickable @click="markAsRead(notification.id)" :class="{'bg-blue-1': !notification.read}"><q-item-section avatar><q-icon :name="notification.icon || 'notifications'" :color="notification.read ? 'grey' : 'primary'" /></q-item-section><q-item-section><q-item-label>{{ notification.title }}</q-item-label><q-item-label caption>{{ notification.message }}</q-item-label><q-item-label caption class="text-grey">{{ formatDate(notification.createdAt) }}</q-item-label></q-item-section></q-item></q-list><div v-else class="text-center text-grey-7 q-pa-lg">No notifications</div></q-card-section><q-separator /><q-card-actions align="center"><q-btn flat label="Mark all as read" color="primary" @click="markAllAsRead" v-if="unreadCount > 0" /></q-card-actions></q-card></q-dialog>
   </q-layout>
 </template>
 
 <script>
-import { defineComponent, ref, computed } from 'vue';
+import { ref } from 'vue';
 import { useRouter } from 'vue-router';
 import { useI18n } from 'vue-i18n';
-import { useQuasar } from 'quasar';
-import { useAuthStore, useAppStore } from '../stores';
+import { useAuthStore } from '../stores';
+import { useNotifications } from '../composables/useNotifications';
 
-export default defineComponent({
+export default {
   name: 'MainLayout',
-
   setup() {
     const router = useRouter();
-    const { t, locale } = useI18n();
-    const $q = useQuasar();
+    const { t } = useI18n();
     const authStore = useAuthStore();
-    const appStore = useAppStore();
-
-    const drawerOpen = ref(appStore.leftDrawerOpen);
-
-    const locales = [
-      { value: 'en', label: 'English' },
-      { value: 'ru', label: 'Русский' },
-      { value: 'bg', label: 'Български' }
-    ];
-
-    const user = computed(() => authStore.currentUser);
-    const currentLocale = computed(() => locale.value);
-    const unreadCount = computed(() => appStore.unreadNotifications);
-
-    // Role checks
-    const canViewManagementCompanies = computed(() => 
-      authStore.isSuperAdmin || authStore.isSuperAccountant
-    );
-    const isWorker = computed(() => authStore.isWorker);
-
-    const toggleDrawer = () => {
-      drawerOpen.value = !drawerOpen.value;
-      appStore.toggleDrawer();
-    };
-
-    const changeLocale = (newLocale) => {
-      locale.value = newLocale;
-      appStore.setLocale(newLocale);
-      $q.notify({
-        message: t('common.success'),
-        color: 'positive',
-        icon: 'check'
-      });
-    };
-
-    const handleLogout = async () => {
-      $q.dialog({
-        title: t('auth.logout'),
-        message: t('auth.logoutConfirm'),
-        cancel: true,
-        persistent: true
-      }).onOk(async () => {
-        await authStore.logout();
-        $q.notify({
-          message: t('auth.logoutSuccess'),
-          color: 'positive',
-          icon: 'check'
-        });
-        router.push('/login');
-      });
-    };
-
-    return {
-      drawerOpen,
-      locales,
-      user,
-      currentLocale,
-      unreadCount,
-      canViewManagementCompanies,
-      isWorker,
-      toggleDrawer,
-      changeLocale,
-      handleLogout
-    };
+    const { notifications, unreadCount, markAsRead, markAllAsRead } = useNotifications();
+    const leftDrawerOpen = ref(true);
+    const showNotifications = ref(false);
+    const toggleLeftDrawer = () => { leftDrawerOpen.value = !leftDrawerOpen.value; };
+    const logout = async () => { await authStore.logout(); router.push('/login'); };
+    const formatDate = (date) => new Date(date).toLocaleString();
+    return { leftDrawerOpen, showNotifications, notifications, unreadCount, toggleLeftDrawer, logout, markAsRead, markAllAsRead, formatDate };
   }
-});
+};
 </script>
-
-<style lang="scss" scoped>
-.q-item {
-  border-radius: 8px;
-  margin: 4px 8px;
-  
-  &.q-router-link--active {
-    background-color: rgba(25, 118, 210, 0.1);
-    color: $primary;
-  }
-}
-</style>
