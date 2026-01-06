@@ -3,10 +3,20 @@ import IORedis from 'ioredis';
 import { config } from './config';
 import { logger } from './utils/logger';
 import { db } from './db';
+import { CONSTANTS } from './config/constants';
 
 // Redis connection for BullMQ
 const connection = new IORedis(config.redis.url, {
   maxRetriesPerRequest: null,
+  enableReadyCheck: true,
+});
+
+connection.on('error', (err) => {
+  logger.error('Worker Redis connection error', { error: err });
+});
+
+connection.on('ready', () => {
+  logger.info('Worker Redis connection ready');
 });
 
 // Job processors
@@ -46,21 +56,46 @@ const processors = {
   // Cleanup jobs
   'cleanup:invites': async (job: Job) => {
     logger.info('Cleaning up expired invites', { jobId: job.id });
-    const result = await db.query(
-      'DELETE FROM invites WHERE expires_at < NOW() RETURNING id'
-    );
-    logger.info('Expired invites cleaned', { count: result.rowCount });
-    return { success: true, deleted: result.rowCount || 0 };
+    
+    // Use transaction with SELECT FOR UPDATE to prevent race conditions
+    const deleted = await db.transaction(async (client) => {
+      const result = await client.query(
+        `DELETE FROM invites 
+         WHERE id IN (
+           SELECT id FROM invites 
+           WHERE expires_at < NOW() AND is_active = true
+           FOR UPDATE SKIP LOCKED
+         )
+         RETURNING id`
+      );
+      return result.rowCount || 0;
+    });
+    
+    logger.info('Expired invites cleaned', { count: deleted });
+    return { success: true, deleted };
   },
 
   'cleanup:audit-logs': async (job: Job) => {
     logger.info('Cleaning up old audit logs', { jobId: job.id });
     const result = await db.query(
       `DELETE FROM audit_logs 
-       WHERE created_at < NOW() - INTERVAL '${config.retention.auditLogs} days' 
-       RETURNING id`
+       WHERE created_at < NOW() - INTERVAL '1 day' * $1
+       RETURNING id`,
+      [config.retention.auditLogs]
     );
     logger.info('Old audit logs cleaned', { count: result.rowCount });
+    return { success: true, deleted: result.rowCount || 0 };
+  },
+  
+  'cleanup:telegram-messages': async (job: Job) => {
+    logger.info('Cleaning up old telegram messages', { jobId: job.id });
+    const result = await db.query(
+      `DELETE FROM telegram_messages 
+       WHERE created_at < NOW() - INTERVAL '1 day' * $1
+       RETURNING id`,
+      [CONSTANTS.TELEGRAM_MESSAGES_RETENTION_DAYS]
+    );
+    logger.info('Old telegram messages cleaned', { count: result.rowCount });
     return { success: true, deleted: result.rowCount || 0 };
   },
 };
@@ -80,7 +115,7 @@ Object.entries(processors).forEach(([queueName, processor]) => {
       }
     },
     {
-      connection,
+      connection: connection.duplicate(), // Each worker gets its own connection
       concurrency: 5,
       limiter: {
         max: 10,

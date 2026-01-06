@@ -4,6 +4,7 @@ import cors from 'cors';
 import { config } from './config';
 import { logger } from './utils/logger';
 import { db } from './db';
+import { redis } from './utils/redis';
 import { runMigrations } from './db/migrate';
 import { errorHandler } from './middleware/errorHandler';
 import { requestLogger } from './middleware/requestLogger';
@@ -34,42 +35,40 @@ app.use(rateLimiter);
 // Then logging
 app.use(requestLogger);
 
-// Health check
+// Health check - simple liveness probe
 app.get('/health', async (req, res) => {
-  try {
-    const dbHealthy = await db.healthCheck();
-    res.status(dbHealthy ? 200 : 503).json({
-      status: dbHealthy ? 'healthy' : 'unhealthy',
-      timestamp: new Date().toISOString(),
-      database: dbHealthy ? 'connected' : 'disconnected',
-      version: '1.0.0',
-    });
-  } catch (error) {
-    res.status(503).json({
-      status: 'unhealthy',
-      timestamp: new Date().toISOString(),
-      error: 'Health check failed',
-    });
-  }
+  res.status(200).json({
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    version: '1.0.0',
+  });
 });
 
-// Readiness check (includes migrations)
+// Readiness check - comprehensive check of all dependencies
 app.get('/ready', async (req, res) => {
   try {
-    const dbHealthy = await db.healthCheck();
-    
-    // Check if migrations table exists
-    const migrationsExist = await db.query(
-      "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'migrations')"
-    );
-    
-    const isReady = dbHealthy && migrationsExist.rows[0]?.exists;
-    
-    res.status(isReady ? 200 : 503).json({
-      status: isReady ? 'ready' : 'not ready',
+    const checks = await Promise.all([
+      // Database
+      db.healthCheck().then(result => ({ name: 'database', healthy: result })),
+      
+      // Redis
+      redis.healthCheck().then(result => ({ name: 'redis', healthy: result })),
+      
+      // Migrations
+      db.query("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'migrations')")
+        .then(result => ({ name: 'migrations', healthy: result.rows[0]?.exists || false })),
+    ]);
+
+    const allHealthy = checks.every(check => check.healthy);
+    const checkResults = checks.reduce((acc, check) => {
+      acc[check.name] = check.healthy;
+      return acc;
+    }, {} as Record<string, boolean>);
+
+    res.status(allHealthy ? 200 : 503).json({
+      status: allHealthy ? 'ready' : 'not ready',
       timestamp: new Date().toISOString(),
-      database: dbHealthy,
-      migrations: migrationsExist.rows[0]?.exists,
+      checks: checkResults,
     });
   } catch (error) {
     res.status(503).json({
@@ -78,6 +77,72 @@ app.get('/ready', async (req, res) => {
       error: 'Readiness check failed',
     });
   }
+});
+
+// Integration health checks (for monitoring)
+app.get('/health/integrations', async (req, res) => {
+  const checks: Record<string, { healthy: boolean; message?: string }> = {};
+  
+  // Telegram Bot API (optional - only if token is configured)
+  if (config.telegram.botToken) {
+    try {
+      const axios = require('axios');
+      const response = await axios.get(
+        `https://api.telegram.org/bot${config.telegram.botToken}/getMe`,
+        { timeout: 5000 }
+      );
+      checks.telegram = { healthy: response.data.ok };
+    } catch (error) {
+      checks.telegram = { healthy: false, message: 'Connection failed' };
+    }
+  }
+  
+  // Perplexity API (optional - only if key is configured)
+  if (config.perplexity.apiKey) {
+    try {
+      const axios = require('axios');
+      await axios.post(
+        'https://api.perplexity.ai/chat/completions',
+        { model: config.perplexity.model, messages: [{ role: 'user', content: 'test' }] },
+        { 
+          headers: { 'Authorization': `Bearer ${config.perplexity.apiKey}` },
+          timeout: 5000 
+        }
+      );
+      checks.perplexity = { healthy: true };
+    } catch (error: any) {
+      // 401/403 means API key is invalid, but service is up
+      checks.perplexity = { 
+        healthy: error.response?.status === 401 || error.response?.status === 403,
+        message: error.response?.status ? `HTTP ${error.response.status}` : 'Connection failed'
+      };
+    }
+  }
+  
+  // Stripe API (optional - only if key is configured)
+  if (config.stripe.secretKey) {
+    try {
+      const axios = require('axios');
+      await axios.get('https://api.stripe.com/v1/balance', {
+        headers: { 'Authorization': `Bearer ${config.stripe.secretKey}` },
+        timeout: 5000
+      });
+      checks.stripe = { healthy: true };
+    } catch (error: any) {
+      checks.stripe = { 
+        healthy: error.response?.status === 401,
+        message: error.response?.status ? `HTTP ${error.response.status}` : 'Connection failed'
+      };
+    }
+  }
+  
+  const allHealthy = Object.values(checks).every(c => c.healthy);
+  
+  res.status(allHealthy ? 200 : 503).json({
+    status: allHealthy ? 'healthy' : 'degraded',
+    timestamp: new Date().toISOString(),
+    integrations: checks,
+  });
 });
 
 // API routes
@@ -98,6 +163,7 @@ app.use(errorHandler);
 const shutdown = async () => {
   logger.info('Received shutdown signal');
   try {
+    await redis.close();
     await db.end();
     logger.info('Server shut down gracefully');
     process.exit(0);
@@ -127,6 +193,7 @@ async function start() {
       logger.info(`Environment: ${config.env}`);
       logger.info(`Health check: http://localhost:${PORT}/health`);
       logger.info(`Ready check: http://localhost:${PORT}/ready`);
+      logger.info(`Integrations check: http://localhost:${PORT}/health/integrations`);
     });
   } catch (error) {
     logger.error('Failed to start server', { error });
