@@ -107,6 +107,18 @@ export class InviteService {
   }
 
   /**
+   * Get invite by ID
+   */
+  static async getInviteById(inviteId: string): Promise<Invite | null> {
+    const result = await db.query(
+      'SELECT * FROM invites WHERE id = $1 AND deleted_at IS NULL',
+      [inviteId]
+    );
+
+    return result.rows.length > 0 ? result.rows[0] : null;
+  }
+
+  /**
    * Get invite by token with full details
    */
   static async getInviteByToken(token: string): Promise<InviteDetails | null> {

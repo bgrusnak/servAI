@@ -162,13 +162,42 @@ invitesRouter.get('/unit/:unitId/stats', async (req: AuthRequest, res: Response,
   }
 });
 
+// Get invite by ID (for deactivate/delete access check)
+invitesRouter.get('/:id', async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const invite = await InviteService.getInviteById(req.params.id);
+
+    if (!invite) {
+      throw new AppError('Invite not found', 404);
+    }
+
+    const unit = await UnitService.getUnitById(invite.unit_id);
+    if (!unit) {
+      throw new AppError('Unit not found', 404);
+    }
+
+    // Check access
+    const hasAccess = await CondoService.checkUserAccess(
+      unit.condo_id,
+      req.user!.id,
+      ['company_admin', 'condo_admin']
+    );
+
+    if (!hasAccess) {
+      throw new AppError('Access denied', 403);
+    }
+
+    res.json(invite);
+  } catch (error) {
+    next(error);
+  }
+});
+
 // Deactivate invite
 invitesRouter.post('/:id/deactivate', async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     // Get invite to check access
-    const invite = await InviteService.getInviteByToken(
-      (await InviteService.listInvitesByUnit('dummy', true)).find(i => i.id === req.params.id)?.token || ''
-    );
+    const invite = await InviteService.getInviteById(req.params.id);
 
     if (!invite) {
       throw new AppError('Invite not found', 404);
@@ -200,7 +229,28 @@ invitesRouter.post('/:id/deactivate', async (req: AuthRequest, res: Response, ne
 // Delete invite
 invitesRouter.delete('/:id', async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
-    // Similar access check as deactivate
+    // Get invite to check access
+    const invite = await InviteService.getInviteById(req.params.id);
+
+    if (!invite) {
+      throw new AppError('Invite not found', 404);
+    }
+
+    const unit = await UnitService.getUnitById(invite.unit_id);
+    if (!unit) {
+      throw new AppError('Unit not found', 404);
+    }
+
+    const hasAccess = await CondoService.checkUserAccess(
+      unit.condo_id,
+      req.user!.id,
+      ['company_admin', 'condo_admin']
+    );
+
+    if (!hasAccess) {
+      throw new AppError('Insufficient permissions', 403);
+    }
+
     await InviteService.deleteInvite(req.params.id);
 
     res.json({ message: 'Invite deleted successfully' });
