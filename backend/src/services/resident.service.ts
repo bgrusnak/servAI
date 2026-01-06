@@ -1,415 +1,191 @@
-import { PoolClient } from 'pg';
-import { db } from '../db';
-import { AppError } from '../middleware/errorHandler';
+import { AppDataSource } from '../db/data-source';
+import { Resident, ResidentRole } from '../entities/Resident';
+import { User } from '../entities/User';
+import { Unit } from '../entities/Unit';
 import { logger } from '../utils/logger';
 
-interface Resident {
-  id: string;
-  user_id: string;
-  unit_id: string;
-  is_owner: boolean;
-  is_active: boolean;
-  moved_in_at?: Date;
-  moved_out_at?: Date;
-  created_at: Date;
-}
-
-interface ResidentWithDetails extends Resident {
-  user_email?: string;
-  user_first_name?: string;
-  user_last_name?: string;
-  user_phone?: string;
-  unit_number: string;
-  condo_name: string;
-}
-
-interface CreateResidentData {
-  user_id: string;
-  unit_id: string;
-  is_owner?: boolean;
-  moved_in_at?: Date;
-}
-
-interface UpdateResidentData {
-  is_owner?: boolean;
-  is_active?: boolean;
-  moved_in_at?: Date;
-  moved_out_at?: Date;
-}
+const residentRepository = AppDataSource.getRepository(Resident);
+const userRepository = AppDataSource.getRepository(User);
+const unitRepository = AppDataSource.getRepository(Unit);
 
 export class ResidentService {
   /**
-   * Create resident - PUBLIC API (wraps atomic version)
+   * Add resident to unit
    */
-  static async createResident(data: CreateResidentData): Promise<Resident> {
-    return await db.transaction(async (client) => {
-      return await this.createResidentAtomic(data, client);
-    });
-  }
-
-  /**
-   * Create resident atomically - INTERNAL (FIXES CRIT-002)
-   * Can be called within existing transaction
-   */
-  static async createResidentAtomic(
-    data: CreateResidentData,
-    client: PoolClient
-  ): Promise<Resident> {
-    // Verify user exists
-    const userCheck = await client.query(
-      'SELECT id FROM users WHERE id = $1 AND deleted_at IS NULL',
-      [data.user_id]
-    );
-
-    if (userCheck.rows.length === 0) {
-      throw new AppError('User not found', 404);
-    }
-
-    // Verify unit exists
-    const unitCheck = await client.query(
-      'SELECT id, condo_id FROM units WHERE id = $1 AND deleted_at IS NULL',
-      [data.unit_id]
-    );
-
-    if (unitCheck.rows.length === 0) {
-      throw new AppError('Unit not found', 404);
-    }
-
-    const condoId = unitCheck.rows[0].condo_id;
-
-    // Lock existing active residents for this user+unit combination
-    // This prevents race condition (CRIT-002)
-    const existingCheck = await client.query(
-      `SELECT id FROM residents 
-       WHERE user_id = $1 AND unit_id = $2 AND is_active = true AND deleted_at IS NULL
-       FOR UPDATE`,  // <-- Lock to prevent concurrent inserts
-      [data.user_id, data.unit_id]
-    );
-
-    if (existingCheck.rows.length > 0) {
-      throw new AppError('User is already an active resident of this unit', 409);
-    }
-
-    // Create resident record
-    let residentResult;
+  async addResident(data: {
+    userId: string;
+    unitId: string;
+    role: ResidentRole;
+  }): Promise<Resident> {
     try {
-      residentResult = await client.query(
-        `INSERT INTO residents (user_id, unit_id, is_owner, moved_in_at)
-         VALUES ($1, $2, $3, $4)
-         RETURNING *`,
-        [
-          data.user_id,
-          data.unit_id,
-          data.is_owner || false,
-          data.moved_in_at || new Date(),
-        ]
-      );
-    } catch (error: any) {
-      // Database constraint violation (if unique constraint exists)
-      if (error.code === '23505') {
-        throw new AppError('User is already an active resident of this unit', 409);
+      // Check if user exists
+      const user = await userRepository.findOne({
+        where: { id: data.userId },
+      });
+
+      if (!user) {
+        throw new Error('User not found');
       }
+
+      // Check if unit exists
+      const unit = await unitRepository.findOne({
+        where: { id: data.unitId },
+      });
+
+      if (!unit) {
+        throw new Error('Unit not found');
+      }
+
+      // Check if already resident
+      const existing = await residentRepository.findOne({
+        where: {
+          userId: data.userId,
+          unitId: data.unitId,
+        },
+      });
+
+      if (existing) {
+        throw new Error('User is already a resident of this unit');
+      }
+
+      const resident = residentRepository.create(data);
+      await residentRepository.save(resident);
+
+      logger.info('Resident added', {
+        residentId: resident.id,
+        userId: data.userId,
+        unitId: data.unitId,
+      });
+
+      return resident;
+    } catch (error) {
+      logger.error('Failed to add resident', { error });
       throw error;
     }
-
-    // Check if user already has resident role for this condo
-    const roleCheck = await client.query(
-      'SELECT id, is_active FROM user_roles WHERE user_id = $1 AND condo_id = $2 AND role = $3 AND deleted_at IS NULL',
-      [data.user_id, condoId, 'resident']
-    );
-
-    if (roleCheck.rows.length === 0) {
-      // Create resident role
-      try {
-        await client.query(
-          `INSERT INTO user_roles (user_id, role, condo_id)
-           VALUES ($1, 'resident', $2)`,
-          [data.user_id, condoId]
-        );
-      } catch (error: any) {
-        // Race condition - role created by another transaction
-        if (error.code === '23505') {
-          // Update existing role to active
-          await client.query(
-            'UPDATE user_roles SET is_active = true WHERE user_id = $1 AND condo_id = $2 AND role = $3',
-            [data.user_id, condoId, 'resident']
-          );
-        } else {
-          throw new AppError('Failed to assign resident role', 500, error);
-        }
-      }
-    } else if (!roleCheck.rows[0].is_active) {
-      // Reactivate role if exists but inactive
-      await client.query(
-        'UPDATE user_roles SET is_active = true WHERE id = $1',
-        [roleCheck.rows[0].id]
-      );
-    }
-
-    const resident = residentResult.rows[0];
-
-    logger.info('Resident created', {
-      residentId: resident.id,
-      unitId: data.unit_id,
-      condoId,
-    });
-
-    return resident;
   }
 
   /**
-   * Get resident by ID with details
+   * Get resident by ID
    */
-  static async getResidentById(residentId: string): Promise<ResidentWithDetails | null> {
-    const result = await db.query(
-      `SELECT 
-        r.*,
-        u.email as user_email,
-        u.first_name as user_first_name,
-        u.last_name as user_last_name,
-        u.phone as user_phone,
-        un.number as unit_number,
-        c.name as condo_name
-      FROM residents r
-      INNER JOIN users u ON u.id = r.user_id
-      INNER JOIN units un ON un.id = r.unit_id
-      INNER JOIN condos c ON c.id = un.condo_id
-      WHERE r.id = $1 AND r.deleted_at IS NULL`,
-      [residentId]
-    );
-
-    return result.rows.length > 0 ? result.rows[0] : null;
+  async getResidentById(residentId: string): Promise<Resident | null> {
+    try {
+      return await residentRepository.findOne({
+        where: { id: residentId },
+        relations: ['user', 'unit', 'unit.entrance', 'unit.entrance.building'],
+      });
+    } catch (error) {
+      logger.error('Failed to get resident', { error, residentId });
+      throw error;
+    }
   }
 
   /**
-   * List residents by unit (with pagination)
+   * Get residents by unit
    */
-  static async listResidentsByUnit(
-    unitId: string,
-    page: number = 1,
-    limit: number = 20,
-    includeInactive: boolean = false
-  ): Promise<{
-    data: ResidentWithDetails[];
-    total: number;
-    page: number;
-    limit: number;
-    totalPages: number;
-  }> {
-    // Validate pagination params
-    const validPage = Math.max(1, page);
-    const validLimit = Math.min(Math.max(1, limit), 100);
-    const offset = (validPage - 1) * validLimit;
-
-    // Count total
-    let countQuery = `
-      SELECT COUNT(*) as total
-      FROM residents r
-      WHERE r.unit_id = $1 AND r.deleted_at IS NULL
-    `;
-
-    if (!includeInactive) {
-      countQuery += ' AND r.is_active = true';
+  async getResidentsByUnit(unitId: string): Promise<Resident[]> {
+    try {
+      return await residentRepository.find({
+        where: { unitId, isActive: true },
+        relations: ['user'],
+        order: { createdAt: 'ASC' },
+      });
+    } catch (error) {
+      logger.error('Failed to get residents by unit', { error, unitId });
+      throw error;
     }
-
-    const countResult = await db.query(countQuery, [unitId]);
-    const total = parseInt(countResult.rows[0].total);
-
-    // Get paginated data
-    let query = `
-      SELECT 
-        r.*,
-        u.email as user_email,
-        u.first_name as user_first_name,
-        u.last_name as user_last_name,
-        u.phone as user_phone,
-        un.number as unit_number,
-        c.name as condo_name
-      FROM residents r
-      INNER JOIN users u ON u.id = r.user_id
-      INNER JOIN units un ON un.id = r.unit_id
-      INNER JOIN condos c ON c.id = un.condo_id
-      WHERE r.unit_id = $1 AND r.deleted_at IS NULL
-    `;
-
-    if (!includeInactive) {
-      query += ' AND r.is_active = true';
-    }
-
-    query += ' ORDER BY r.is_owner DESC, r.created_at ASC LIMIT $2 OFFSET $3';
-
-    const result = await db.query(query, [unitId, validLimit, offset]);
-
-    return {
-      data: result.rows,
-      total,
-      page: validPage,
-      limit: validLimit,
-      totalPages: Math.ceil(total / validLimit),
-    };
   }
 
   /**
-   * List units for a user (where they are resident)
+   * Get units by user
    */
-  static async listUnitsByUser(
-    userId: string,
-    includeInactive: boolean = false
-  ): Promise<any[]> {
-    let query = `
-      SELECT 
-        r.*,
-        un.id as unit_id,
-        un.number as unit_number,
-        un.floor,
-        un.area_total,
-        ut.name as unit_type,
-        c.id as condo_id,
-        c.name as condo_name,
-        c.address as condo_address
-      FROM residents r
-      INNER JOIN units un ON un.id = r.unit_id
-      INNER JOIN unit_types ut ON ut.id = un.unit_type_id
-      INNER JOIN condos c ON c.id = un.condo_id
-      WHERE r.user_id = $1 AND r.deleted_at IS NULL
-    `;
-
-    if (!includeInactive) {
-      query += ' AND r.is_active = true';
+  async getUnitsByUser(userId: string): Promise<Resident[]> {
+    try {
+      return await residentRepository.find({
+        where: { userId, isActive: true },
+        relations: [
+          'unit',
+          'unit.entrance',
+          'unit.entrance.building',
+          'unit.entrance.building.condo',
+        ],
+        order: { createdAt: 'ASC' },
+      });
+    } catch (error) {
+      logger.error('Failed to get units by user', { error, userId });
+      throw error;
     }
-
-    query += ' ORDER BY c.name, un.number';
-
-    const result = await db.query(query, [userId]);
-
-    return result.rows;
   }
 
   /**
-   * Update resident
+   * Update resident role
    */
-  static async updateResident(
+  async updateResidentRole(
     residentId: string,
-    data: UpdateResidentData
+    role: ResidentRole
   ): Promise<Resident> {
-    const updates: string[] = [];
-    const values: any[] = [];
-    let paramIndex = 1;
+    try {
+      const resident = await residentRepository.findOne({
+        where: { id: residentId },
+      });
 
-    if (data.is_owner !== undefined) {
-      updates.push(`is_owner = $${paramIndex++}`);
-      values.push(data.is_owner);
+      if (!resident) {
+        throw new Error('Resident not found');
+      }
+
+      resident.role = role;
+      await residentRepository.save(resident);
+
+      logger.info('Resident role updated', { residentId, role });
+      return resident;
+    } catch (error) {
+      logger.error('Failed to update resident role', { error, residentId });
+      throw error;
     }
-
-    if (data.is_active !== undefined) {
-      updates.push(`is_active = $${paramIndex++}`);
-      values.push(data.is_active);
-    }
-
-    if (data.moved_in_at !== undefined) {
-      updates.push(`moved_in_at = $${paramIndex++}`);
-      values.push(data.moved_in_at);
-    }
-
-    if (data.moved_out_at !== undefined) {
-      updates.push(`moved_out_at = $${paramIndex++}`);
-      values.push(data.moved_out_at);
-    }
-
-    if (updates.length === 0) {
-      throw new AppError('No fields to update', 400);
-    }
-
-    values.push(residentId);
-
-    const result = await db.query(
-      `UPDATE residents
-       SET ${updates.join(', ')}
-       WHERE id = $${paramIndex} AND deleted_at IS NULL
-       RETURNING *`,
-      values
-    );
-
-    if (result.rows.length === 0) {
-      throw new AppError('Resident not found', 404);
-    }
-
-    logger.info('Resident updated', { residentId });
-
-    return result.rows[0];
   }
 
   /**
-   * Move out resident (set inactive and moved_out_at)
+   * Remove resident from unit
    */
-  static async moveOutResident(residentId: string): Promise<void> {
-    await db.transaction(async (client) => {
-      const result = await client.query(
-        `UPDATE residents
-         SET is_active = false, moved_out_at = NOW()
-         WHERE id = $1 AND deleted_at IS NULL
-         RETURNING user_id, unit_id`,
-        [residentId]
-      );
+  async removeResident(residentId: string): Promise<void> {
+    try {
+      const resident = await residentRepository.findOne({
+        where: { id: residentId },
+      });
 
-      if (result.rows.length === 0) {
-        throw new AppError('Resident not found', 404);
+      if (!resident) {
+        throw new Error('Resident not found');
       }
 
-      const { user_id, unit_id } = result.rows[0];
+      resident.isActive = false;
+      await residentRepository.save(resident);
 
-      // Get condo_id for role management
-      const unitResult = await client.query(
-        'SELECT condo_id FROM units WHERE id = $1',
-        [unit_id]
-      );
-      const condoId = unitResult.rows[0].condo_id;
-
-      // Check if user has any other active residences in the same condo
-      const otherResidences = await client.query(
-        `SELECT r.id
-         FROM residents r
-         INNER JOIN units u ON u.id = r.unit_id
-         WHERE r.user_id = $1 
-           AND u.condo_id = $2 
-           AND r.is_active = true 
-           AND r.id != $3
-           AND r.deleted_at IS NULL`,
-        [user_id, condoId, residentId]
-      );
-
-      // If no other active residences, deactivate resident role
-      if (otherResidences.rows.length === 0) {
-        await client.query(
-          `UPDATE user_roles
-           SET is_active = false
-           WHERE user_id = $1 AND condo_id = $2 AND role = 'resident'`,
-          [user_id, condoId]
-        );
-
-        logger.info('Resident role deactivated (no active residences)', {
-          userId: user_id,
-          condoId,
-        });
-      }
-
-      logger.info('Resident moved out', { residentId });
-    });
+      logger.info('Resident removed', { residentId });
+    } catch (error) {
+      logger.error('Failed to remove resident', { error, residentId });
+      throw error;
+    }
   }
 
   /**
-   * Delete resident (soft delete)
+   * Check if user is owner of unit
    */
-  static async deleteResident(residentId: string): Promise<void> {
-    const result = await db.query(
-      'UPDATE residents SET deleted_at = NOW() WHERE id = $1 AND deleted_at IS NULL',
-      [residentId]
-    );
+  async isOwner(userId: string, unitId: string): Promise<boolean> {
+    try {
+      const resident = await residentRepository.findOne({
+        where: {
+          userId,
+          unitId,
+          role: ResidentRole.OWNER,
+          isActive: true,
+        },
+      });
 
-    if (result.rowCount === 0) {
-      throw new AppError('Resident not found', 404);
+      return !!resident;
+    } catch (error) {
+      logger.error('Failed to check if owner', { error, userId, unitId });
+      throw error;
     }
-
-    logger.info('Resident deleted', { residentId });
   }
 }
+
+export const residentService = new ResidentService();

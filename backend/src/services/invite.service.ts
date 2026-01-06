@@ -1,394 +1,226 @@
-import { randomBytes } from 'crypto';
-import { db } from '../db';
-import { AppError } from '../middleware/errorHandler';
+import crypto from 'crypto';
+import { AppDataSource } from '../db/data-source';
+import { Invite, InviteRole } from '../entities/Invite';
+import { Resident } from '../entities/Resident';
+import { Unit } from '../entities/Unit';
+import { User } from '../entities/User';
 import { logger } from '../utils/logger';
-import { CONSTANTS } from '../config/constants';
-import { ResidentService } from './resident.service';
+import { LessThan } from 'typeorm';
 
-interface Invite {
-  id: string;
-  unit_id: string;
-  token: string;
-  email?: string;
-  phone?: string;
-  expires_at: Date;
-  is_active: boolean;
-  max_uses?: number;
-  used_count: number;
-  created_by: string;
-  created_at: Date;
-}
-
-interface CreateInviteData {
-  unit_id: string;
-  email?: string;
-  phone?: string;
-  ttl_days?: number;
-  max_uses?: number;
-  created_by: string;
-}
-
-interface InviteDetails extends Invite {
-  unit_number: string;
-  unit_type: string;
-  condo_name: string;
-  condo_address: string;
-  company_name: string;
-}
-
-interface PaginatedInvites {
-  data: Invite[];
-  total: number;
-  page: number;
-  limit: number;
-  totalPages: number;
-}
+const inviteRepository = AppDataSource.getRepository(Invite);
+const residentRepository = AppDataSource.getRepository(Resident);
+const userRepository = AppDataSource.getRepository(User);
+const unitRepository = AppDataSource.getRepository(Unit);
 
 export class InviteService {
   /**
-   * Generate secure invite token
+   * Create invite
    */
-  private static generateToken(): string {
-    return randomBytes(32).toString('hex');
-  }
-
-  /**
-   * Create invite for a unit
-   * FIX NEW-005: Optimized token generation (no retry loop)
-   */
-  static async createInvite(data: CreateInviteData): Promise<Invite> {
-    // Verify unit exists
-    const unitCheck = await db.query(
-      'SELECT id, condo_id FROM units WHERE id = $1 AND deleted_at IS NULL',
-      [data.unit_id]
-    );
-
-    if (unitCheck.rows.length === 0) {
-      throw new AppError('Unit not found', 404);
-    }
-
-    // Calculate expiration
-    const ttlDays = data.ttl_days || CONSTANTS.INVITE_DEFAULT_TTL_DAYS;
-    const expiresAt = new Date();
-    expiresAt.setDate(expiresAt.getDate() + ttlDays);
-
-    // Generate token - collision is astronomically unlikely (2^256)
-    const token = this.generateToken();
-
+  async createInvite(data: {
+    unitId: string;
+    email: string;
+    role: InviteRole;
+    expiresInDays?: number;
+  }): Promise<Invite> {
     try {
-      // Try to insert
-      const result = await db.query(
-        `INSERT INTO invites (unit_id, token, email, phone, expires_at, max_uses, created_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
-         RETURNING *`,
-        [
-          data.unit_id,
-          token,
-          data.email,
-          data.phone,
-          expiresAt,
-          data.max_uses || CONSTANTS.INVITE_MAX_USES_DEFAULT,
-          data.created_by,
-        ]
-      );
-
-      logger.info('Invite created', {
-        inviteId: result.rows[0].id,
-        unitId: data.unit_id,
+      // Check if unit exists
+      const unit = await unitRepository.findOne({
+        where: { id: data.unitId },
       });
 
-      return result.rows[0];
-    } catch (error: any) {
-      // Handle the astronomically unlikely case of collision
-      if (error.code === '23505' && error.constraint === 'invites_token_key') {
-        logger.error('Token collision detected (extremely rare!)', { token });
-        // Retry once with new token
-        const newToken = this.generateToken();
-        const result = await db.query(
-          `INSERT INTO invites (unit_id, token, email, phone, expires_at, max_uses, created_by)
-           VALUES ($1, $2, $3, $4, $5, $6, $7)
-           RETURNING *`,
-          [data.unit_id, newToken, data.email, data.phone, expiresAt, data.max_uses, data.created_by]
-        );
-        return result.rows[0];
+      if (!unit) {
+        throw new Error('Unit not found');
       }
+
+      // Check if user already exists and is resident
+      const existingUser = await userRepository.findOne({
+        where: { email: data.email },
+      });
+
+      if (existingUser) {
+        const existingResident = await residentRepository.findOne({
+          where: {
+            userId: existingUser.id,
+            unitId: data.unitId,
+            isActive: true,
+          },
+        });
+
+        if (existingResident) {
+          throw new Error('User is already a resident of this unit');
+        }
+      }
+
+      // Check if invite already exists
+      const existingInvite = await inviteRepository.findOne({
+        where: {
+          unitId: data.unitId,
+          email: data.email,
+          acceptedAt: null,
+        },
+      });
+
+      if (existingInvite && existingInvite.expiresAt > new Date()) {
+        throw new Error('Active invite already exists for this email');
+      }
+
+      // Generate token
+      const token = crypto.randomBytes(32).toString('hex');
+
+      // Calculate expiration
+      const expiresAt = new Date();
+      expiresAt.setDate(expiresAt.getDate() + (data.expiresInDays || 7));
+
+      const invite = inviteRepository.create({
+        unitId: data.unitId,
+        email: data.email,
+        role: data.role,
+        token,
+        expiresAt,
+      });
+
+      await inviteRepository.save(invite);
+
+      logger.info('Invite created', {
+        inviteId: invite.id,
+        email: data.email,
+        unitId: data.unitId,
+      });
+
+      return invite;
+    } catch (error) {
+      logger.error('Failed to create invite', { error });
       throw error;
     }
   }
 
   /**
-   * Get invite by ID
+   * Get invite by token
    */
-  static async getInviteById(inviteId: string): Promise<Invite | null> {
-    const result = await db.query(
-      'SELECT * FROM invites WHERE id = $1 AND deleted_at IS NULL',
-      [inviteId]
-    );
-
-    return result.rows.length > 0 ? result.rows[0] : null;
+  async getInviteByToken(token: string): Promise<Invite | null> {
+    try {
+      return await inviteRepository.findOne({
+        where: { token },
+        relations: ['unit', 'unit.entrance', 'unit.entrance.building', 'unit.entrance.building.condo'],
+      });
+    } catch (error) {
+      logger.error('Failed to get invite by token', { error });
+      throw error;
+    }
   }
 
   /**
-   * Get invite by token with full details
+   * Accept invite
    */
-  static async getInviteByToken(token: string): Promise<InviteDetails | null> {
-    const result = await db.query(
-      `SELECT 
-        i.*,
-        u.number as unit_number,
-        ut.name as unit_type,
-        c.name as condo_name,
-        c.address as condo_address,
-        co.name as company_name
-      FROM invites i
-      INNER JOIN units u ON u.id = i.unit_id
-      INNER JOIN unit_types ut ON ut.id = u.unit_type_id
-      INNER JOIN condos c ON c.id = u.condo_id
-      INNER JOIN companies co ON co.id = c.company_id
-      WHERE i.token = $1 
-        AND i.deleted_at IS NULL
-        AND u.deleted_at IS NULL
-        AND c.deleted_at IS NULL
-        AND co.deleted_at IS NULL`,
-      [token]
-    );
+  async acceptInvite(token: string, userId: string): Promise<Resident> {
+    const queryRunner = AppDataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
 
-    return result.rows.length > 0 ? result.rows[0] : null;
-  }
+    try {
+      const invite = await inviteRepository.findOne({
+        where: { token },
+      });
 
-  /**
-   * List invites for a unit with pagination (FIX NEW-006)
-   */
-  static async listInvitesByUnit(
-    unitId: string,
-    page: number = 1,
-    limit: number = 20,
-    includeExpired: boolean = false
-  ): Promise<PaginatedInvites> {
-    // Validate pagination params
-    const validPage = Math.max(1, page);
-    const validLimit = Math.min(Math.max(1, limit), 100);
-    const offset = (validPage - 1) * validLimit;
-
-    // Count total
-    let countQuery = 'SELECT COUNT(*) as total FROM invites WHERE unit_id = $1 AND deleted_at IS NULL';
-    if (!includeExpired) {
-      countQuery += ' AND is_active = true AND expires_at > NOW()';
-    }
-
-    const countResult = await db.query(countQuery, [unitId]);
-    const total = parseInt(countResult.rows[0].total);
-
-    // Get paginated data
-    let query = 'SELECT * FROM invites WHERE unit_id = $1 AND deleted_at IS NULL';
-    if (!includeExpired) {
-      query += ' AND is_active = true AND expires_at > NOW()';
-    }
-    query += ' ORDER BY created_at DESC LIMIT $2 OFFSET $3';
-
-    const result = await db.query(query, [unitId, validLimit, offset]);
-
-    return {
-      data: result.rows,
-      total,
-      page: validPage,
-      limit: validLimit,
-      totalPages: Math.ceil(total / validLimit),
-    };
-  }
-
-  /**
-   * Validate invite token
-   */
-  static async validateInvite(token: string): Promise<{
-    valid: boolean;
-    reason?: string;
-    invite?: InviteDetails;
-  }> {
-    const invite = await this.getInviteByToken(token);
-
-    if (!invite) {
-      return { valid: false, reason: 'Invite not found' };
-    }
-
-    if (!invite.is_active) {
-      return { valid: false, reason: 'Invite is no longer active', invite };
-    }
-
-    if (new Date(invite.expires_at) < new Date()) {
-      return { valid: false, reason: 'Invite has expired', invite };
-    }
-
-    if (invite.max_uses !== null && invite.used_count >= invite.max_uses) {
-      return { valid: false, reason: 'Invite has reached maximum uses', invite };
-    }
-
-    return { valid: true, invite };
-  }
-
-  /**
-   * Accept invite - atomic operation (FIXES CRIT-001)
-   */
-  static async acceptInvite(token: string, userId: string): Promise<{
-    resident: any;
-    unit: any;
-  }> {
-    return await db.transaction(async (client) => {
-      // 1. Lock invite row with FOR UPDATE
-      const inviteResult = await client.query(
-        `SELECT 
-          i.*,
-          u.number as unit_number,
-          ut.name as unit_type,
-          c.name as condo_name,
-          c.address as condo_address,
-          co.name as company_name
-        FROM invites i
-        INNER JOIN units u ON u.id = i.unit_id
-        INNER JOIN unit_types ut ON ut.id = u.unit_type_id
-        INNER JOIN condos c ON c.id = u.condo_id
-        INNER JOIN companies co ON co.id = c.company_id
-        WHERE i.token = $1 
-          AND i.deleted_at IS NULL
-          AND u.deleted_at IS NULL
-          AND c.deleted_at IS NULL
-          AND co.deleted_at IS NULL
-        FOR UPDATE OF i`,
-        [token]
-      );
-
-      if (inviteResult.rows.length === 0) {
-        throw new AppError('Invite not found', 404);
+      if (!invite) {
+        throw new Error('Invite not found');
       }
 
-      const invite = inviteResult.rows[0];
-
-      // 2. Validate inside transaction (after lock acquired)
-      if (!invite.is_active) {
-        throw new AppError('Invite is no longer active', 400);
+      if (invite.acceptedAt) {
+        throw new Error('Invite already accepted');
       }
 
-      if (new Date(invite.expires_at) < new Date()) {
-        throw new AppError('Invite has expired', 400);
+      if (invite.expiresAt < new Date()) {
+        throw new Error('Invite expired');
       }
 
-      if (invite.max_uses !== null && invite.used_count >= invite.max_uses) {
-        throw new AppError('Invite has reached maximum uses', 400);
-      }
+      // Create resident
+      const resident = residentRepository.create({
+        userId,
+        unitId: invite.unitId,
+        role: invite.role as any,
+      });
 
-      // 3. Create resident (this also checks for duplicates with lock)
-      const resident = await ResidentService.createResidentAtomic(
-        {
-          user_id: userId,
-          unit_id: invite.unit_id,
-          is_owner: false,
-        },
-        client
-      );
+      await queryRunner.manager.save(resident);
 
-      // 4. Increment usage counter
-      const updateResult = await client.query(
-        `UPDATE invites
-         SET used_count = used_count + 1
-         WHERE id = $1
-         RETURNING used_count, max_uses`,
-        [invite.id]
-      );
+      // Mark invite as accepted
+      invite.acceptedAt = new Date();
+      await queryRunner.manager.save(invite);
 
-      const { used_count, max_uses } = updateResult.rows[0];
-
-      // 5. Auto-deactivate if reached max uses
-      if (max_uses !== null && used_count >= max_uses) {
-        await client.query(
-          'UPDATE invites SET is_active = false WHERE id = $1',
-          [invite.id]
-        );
-
-        logger.info('Invite auto-deactivated (max uses reached)', {
-          inviteId: invite.id,
-          usedCount: used_count,
-          maxUses: max_uses,
-        });
-      }
+      await queryRunner.commitTransaction();
 
       logger.info('Invite accepted', {
         inviteId: invite.id,
-        residentId: resident.id,
-        usedCount: used_count,
+        userId,
+        unitId: invite.unitId,
       });
 
-      return {
-        resident,
-        unit: {
-          number: invite.unit_number,
-          type: invite.unit_type,
-          condo: invite.condo_name,
-          address: invite.condo_address,
-        },
-      };
-    });
-  }
-
-  /**
-   * Deactivate invite
-   */
-  static async deactivateInvite(inviteId: string): Promise<void> {
-    const result = await db.query(
-      'UPDATE invites SET is_active = false WHERE id = $1 AND deleted_at IS NULL',
-      [inviteId]
-    );
-
-    if (result.rowCount === 0) {
-      throw new AppError('Invite not found', 404);
+      return resident;
+    } catch (error) {
+      await queryRunner.rollbackTransaction();
+      logger.error('Failed to accept invite', { error, token });
+      throw error;
+    } finally {
+      await queryRunner.release();
     }
-
-    logger.info('Invite deactivated', { inviteId });
   }
 
   /**
-   * Delete invite (soft delete)
+   * Get invites by unit
    */
-  static async deleteInvite(inviteId: string): Promise<void> {
-    const result = await db.query(
-      'UPDATE invites SET deleted_at = NOW() WHERE id = $1 AND deleted_at IS NULL',
-      [inviteId]
-    );
-
-    if (result.rowCount === 0) {
-      throw new AppError('Invite not found', 404);
+  async getInvitesByUnit(unitId: string): Promise<Invite[]> {
+    try {
+      return await inviteRepository.find({
+        where: { unitId },
+        order: { createdAt: 'DESC' },
+      });
+    } catch (error) {
+      logger.error('Failed to get invites by unit', { error, unitId });
+      throw error;
     }
-
-    logger.info('Invite deleted', { inviteId });
   }
 
   /**
-   * Get invite statistics for a unit
+   * Revoke invite
    */
-  static async getInviteStats(unitId: string): Promise<{
-    total: number;
-    active: number;
-    expired: number;
-    exhausted: number;
-    totalUses: number;
-  }> {
-    const result = await db.query(
-      `SELECT 
-        COUNT(*) as total,
-        COUNT(*) FILTER (WHERE is_active = true AND expires_at > NOW() AND (max_uses IS NULL OR used_count < max_uses)) as active,
-        COUNT(*) FILTER (WHERE expires_at <= NOW()) as expired,
-        COUNT(*) FILTER (WHERE max_uses IS NOT NULL AND used_count >= max_uses) as exhausted,
-        COALESCE(SUM(used_count), 0) as total_uses
-      FROM invites
-      WHERE unit_id = $1 AND deleted_at IS NULL`,
-      [unitId]
-    );
+  async revokeInvite(inviteId: string): Promise<void> {
+    try {
+      const invite = await inviteRepository.findOne({
+        where: { id: inviteId },
+      });
 
-    return {
-      total: parseInt(result.rows[0].total),
-      active: parseInt(result.rows[0].active),
-      expired: parseInt(result.rows[0].expired),
-      exhausted: parseInt(result.rows[0].exhausted),
-      totalUses: parseInt(result.rows[0].total_uses),
-    };
+      if (!invite) {
+        throw new Error('Invite not found');
+      }
+
+      // Set expiration to now
+      invite.expiresAt = new Date();
+      await inviteRepository.save(invite);
+
+      logger.info('Invite revoked', { inviteId });
+    } catch (error) {
+      logger.error('Failed to revoke invite', { error, inviteId });
+      throw error;
+    }
+  }
+
+  /**
+   * Clean up expired invites
+   */
+  async cleanupExpiredInvites(): Promise<number> {
+    try {
+      const result = await inviteRepository.delete({
+        expiresAt: LessThan(new Date()),
+        acceptedAt: null,
+      });
+
+      logger.info('Cleaned up expired invites', { count: result.affected });
+      return result.affected || 0;
+    } catch (error) {
+      logger.error('Failed to cleanup expired invites', { error });
+      throw error;
+    }
   }
 }
+
+export const inviteService = new InviteService();
