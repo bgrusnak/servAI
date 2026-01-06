@@ -1,50 +1,74 @@
 # ServAI Frontend
 
-> Modern admin panel for ServAI platform built with Vue 3 + Quasar Framework
+AI-powered Property Management Platform - Frontend Application
+
+## Tech Stack
+
+- **Vue 3** - Progressive JavaScript Framework
+- **Quasar** - Vue.js Framework for building responsive apps
+- **Pinia** - State Management
+- **Vue Router** - Official Router
+- **Vue I18n** - Internationalization (RU, EN, BG)
+- **Axios** - HTTP Client
+- **Chart.js** - Data Visualization
+- **QRCode** - QR Code Generation
 
 ## Features
 
-- 🚀 Vue 3 with Composition API
-- 🎨 Quasar Framework for beautiful UI
-- 🌍 Multi-language support (Russian, English, Bulgarian)
-- 🔐 JWT Authentication
-- 📱 Fully responsive design
-- 🎯 Role-based access control
-- 📊 Rich dashboards and analytics
-- 🔔 Real-time notifications
+### Core Modules
+- ✅ **Management Companies** - Full CRUD operations
+- ✅ **Complexes** - Property complex management
+- ✅ **Units** - Individual property units
+- ✅ **Residents** - Resident management
+- ✅ **Workers** - Staff management
+- ✅ **Tickets** - Support tickets with Kanban board
+- ✅ **Meter Readings** - Utility meter readings
+- ✅ **Billing** - Invoice generation and payments
+- ✅ **Polls** - Resident surveys and voting
+- ✅ **Access Control** - QR-based access management
+- ✅ **Reports** - Analytics and reporting
+- ✅ **Settings** - System configuration
+- ✅ **Profile** - User profile management
 
-## Install Dependencies
+### Components
+- FileUploader - Multi-file upload with preview
+- NotificationBell - Real-time notifications
+- QRCodeGenerator - QR code generation and download
+
+### Utilities
+- Formatters (date, currency, file size)
+- Validators (email, phone, etc)
+- Helpers (debounce, throttle, deepClone)
+
+## Installation
 
 ```bash
+cd frontend
 npm install
-# or
-yarn install
-```
-
-## Configure Environment
-
-Copy `.env.example` to `.env` and configure:
-
-```bash
-cp .env.example .env
 ```
 
 ## Development
 
 ```bash
 npm run dev
-# or
-yarn dev
 ```
 
-Open http://localhost:9000
+Open http://localhost:5173
 
 ## Build for Production
 
 ```bash
 npm run build
-# or
-yarn build
+```
+
+## Environment Variables
+
+Copy `.env.example` to `.env` and configure:
+
+```
+VITE_API_BASE_URL=http://localhost:3000/api
+VITE_APP_NAME=ServAI
+VITE_APP_VERSION=1.0.0
 ```
 
 ## Project Structure
@@ -52,48 +76,39 @@ yarn build
 ```
 frontend/
 ├── src/
-│   ├── assets/          # Static assets (images, fonts)
-│   ├── boot/            # Quasar boot files
-│   ├── components/      # Reusable Vue components
-│   ├── composables/     # Vue composables (reusable logic)
-│   ├── layouts/         # Layout components
-│   ├── pages/           # Page components
-│   ├── router/          # Vue Router configuration
-│   ├── stores/          # Pinia stores (state management)
-│   ├── i18n/            # Internationalization files
-│   ├── api/             # API service layer
-│   ├── utils/           # Utility functions
-│   ├── App.vue          # Root component
-│   └── main.js          # Application entry point
-├── public/              # Public static files
-└── quasar.config.js     # Quasar configuration
+│   ├── api/              # API services
+│   ├── assets/           # Static assets
+│   ├── components/       # Reusable components
+│   ├── composables/      # Vue composables
+│   ├── i18n/             # Translations
+│   ├── layouts/          # Layout components
+│   ├── pages/            # Page components
+│   ├── router/           # Vue Router config
+│   ├── stores/           # Pinia stores
+│   ├── styles/           # Global styles
+│   ├── utils/            # Utility functions
+│   ├── App.vue           # Root component
+│   └── main.js           # Application entry
+├── index.html
+├── package.json
+└── vite.config.js
 ```
 
-## Available Roles
+## Available Scripts
 
-- **Super Admin**: Platform-wide access
-- **Super Accountant**: Platform billing management
-- **UK Director**: Management company director
-- **UK Accountant**: Management company accountant
-- **Complex Admin**: Residential complex administrator
-- **Worker**: Service workers (plumbers, electricians, etc.)
+- `npm run dev` - Start development server
+- `npm run build` - Build for production
+- `npm run preview` - Preview production build
+- `npm run lint` - Run ESLint
+- `npm run format` - Format code with Prettier
 
-## Technology Stack
+## Browser Support
 
-- **Vue 3** - Progressive JavaScript framework
-- **Quasar** - Vue.js framework for building apps
-- **Pinia** - State management
-- **Vue Router** - Official router for Vue.js
-- **Vue I18n** - Internationalization plugin
-- **Axios** - HTTP client
-- **Vite** - Build tool
-
-## Code Style
-
-- ESLint + Prettier for code formatting
-- Run `npm run lint` to check code style
-- Run `npm run format` to auto-format code
+- Chrome (latest)
+- Firefox (latest)
+- Safari (latest)
+- Edge (latest)
 
 ## License
 
-Proprietary
+MIT

@@ -1,20 +1,15 @@
 import { createI18n } from 'vue-i18n';
-import messages from './locales';
+import ru from './locales/ru.json';
+import en from './locales/en.json';
+import bg from './locales/bg.json';
 
-// Detect browser language
-const getBrowserLocale = () => {
-  const locale = navigator.language || navigator.userLanguage;
-  if (locale.startsWith('ru')) return 'ru';
-  if (locale.startsWith('bg')) return 'bg';
-  return 'en';
-};
+const messages = { ru, en, bg };
 
 const i18n = createI18n({
   legacy: false,
-  locale: localStorage.getItem('locale') || getBrowserLocale(),
+  locale: localStorage.getItem('locale') || 'ru',
   fallbackLocale: 'en',
-  messages,
-  globalInjection: true
+  messages
 });
 
 export default i18n;
