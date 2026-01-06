@@ -1,141 +1,178 @@
-import { pool } from '../db';
+import { AppDataSource } from '../db/data-source';
+import { Poll, PollStatus } from '../entities/Poll';
+import { PollOption } from '../entities/PollOption';
+import { PollVote } from '../entities/PollVote';
 import { logger } from '../utils/logger';
 
-interface Poll {
-  id?: string;
-  condoId: string;
-  createdBy: string;
-  title: string;
-  description?: string;
-  pollType?: string;
-  startDate: string;
-  endDate: string;
-  requiresQuorum?: boolean;
-  quorumPercent?: number;
-  allowMultipleChoices?: boolean;
-  allowAbstain?: boolean;
-  isAnonymous?: boolean;
-}
-
-interface PollOption {
-  optionText: string;
-  displayOrder?: number;
-}
+const pollRepository = AppDataSource.getRepository(Poll);
+const pollOptionRepository = AppDataSource.getRepository(PollOption);
+const pollVoteRepository = AppDataSource.getRepository(PollVote);
 
 export class PollService {
   /**
    * Create poll with options
    */
-  async createPoll(poll: Poll, options: PollOption[]): Promise<any> {
-    const client = await pool.connect();
-    
+  async createPoll(
+    pollData: {
+      condoId: string;
+      createdBy: string;
+      title: string;
+      description?: string;
+      pollType?: string;
+      startDate: Date;
+      endDate: Date;
+      requiresQuorum?: boolean;
+      quorumPercent?: number;
+      allowMultipleChoices?: boolean;
+      allowAbstain?: boolean;
+      isAnonymous?: boolean;
+    },
+    options: Array<{ optionText: string }>
+  ): Promise<Poll> {
+    const queryRunner = AppDataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+
     try {
-      await client.query('BEGIN');
-      
       // Create poll
-      const pollResult = await client.query(
-        `INSERT INTO polls (
-          condo_id, created_by, title, description, poll_type,
-          start_date, end_date, requires_quorum, quorum_percent,
-          allow_multiple_choices, allow_abstain, is_anonymous
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-        RETURNING *`,
-        [
-          poll.condoId, poll.createdBy, poll.title, poll.description || null,
-          poll.pollType || 'simple', poll.startDate, poll.endDate,
-          poll.requiresQuorum || false, poll.quorumPercent || null,
-          poll.allowMultipleChoices || false, poll.allowAbstain || true,
-          poll.isAnonymous || false
-        ]
+      const poll = pollRepository.create({
+        ...pollData,
+        status: PollStatus.ACTIVE,
+      });
+
+      await queryRunner.manager.save(poll);
+
+      // Create options
+      const pollOptions = options.map((opt, index) =>
+        pollOptionRepository.create({
+          pollId: poll.id,
+          optionText: opt.optionText,
+          displayOrder: index + 1,
+        })
       );
-      
-      const pollId = pollResult.rows[0].id;
-      
-      // Add options
-      for (let i = 0; i < options.length; i++) {
-        await client.query(
-          `INSERT INTO poll_options (poll_id, option_text, display_order)
-           VALUES ($1, $2, $3)`,
-          [pollId, options[i].optionText, options[i].displayOrder || i]
-        );
-      }
-      
-      await client.query('COMMIT');
-      logger.info('Poll created', { pollId, title: poll.title });
-      
-      return pollResult.rows[0];
+
+      await queryRunner.manager.save(pollOptions);
+
+      await queryRunner.commitTransaction();
+
+      logger.info('Poll created', { pollId: poll.id, title: poll.title });
+
+      return await this.getPollById(poll.id) as Poll;
     } catch (error) {
-      await client.query('ROLLBACK');
-      logger.error('Failed to create poll', { error, poll });
+      await queryRunner.rollbackTransaction();
+      logger.error('Failed to create poll', { error });
       throw error;
     } finally {
-      client.release();
+      await queryRunner.release();
+    }
+  }
+
+  /**
+   * Get poll by ID with options and votes
+   */
+  async getPollById(pollId: string): Promise<Poll | null> {
+    try {
+      return await pollRepository.findOne({
+        where: { id: pollId },
+        relations: ['options', 'options.votes', 'creator'],
+      });
+    } catch (error) {
+      logger.error('Failed to get poll', { error, pollId });
+      throw error;
     }
   }
 
   /**
    * Vote on poll
    */
-  async vote(pollId: string, userId: string, unitId: string, optionId?: string, isAbstain?: boolean): Promise<void> {
+  async vote(
+    pollId: string,
+    userId: string,
+    unitId: string,
+    optionId?: string,
+    isAbstain: boolean = false
+  ): Promise<void> {
+    const queryRunner = AppDataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+
     try {
-      await pool.query(
-        `INSERT INTO poll_votes (poll_id, option_id, user_id, unit_id, is_abstain)
-         VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (poll_id, user_id, unit_id) DO UPDATE
-         SET option_id = EXCLUDED.option_id, is_abstain = EXCLUDED.is_abstain, voted_at = NOW()`,
-        [pollId, optionId || null, userId, unitId, isAbstain || false]
-      );
-      
-      // Update votes count
-      if (optionId) {
-        await pool.query(
-          `UPDATE poll_options 
-           SET votes_count = (SELECT COUNT(*) FROM poll_votes WHERE option_id = $1)
-           WHERE id = $1`,
-          [optionId]
+      const poll = await pollRepository.findOne({
+        where: { id: pollId },
+      });
+
+      if (!poll) {
+        throw new Error('Poll not found');
+      }
+
+      if (poll.status !== PollStatus.ACTIVE) {
+        throw new Error('Poll is not active');
+      }
+
+      // Check if already voted
+      const existingVote = await pollVoteRepository.findOne({
+        where: { pollId, userId },
+      });
+
+      if (existingVote) {
+        throw new Error('Already voted');
+      }
+
+      // Create vote
+      const vote = pollVoteRepository.create({
+        pollId,
+        userId,
+        unitId,
+        pollOptionId: optionId || null,
+        isAbstain,
+      });
+
+      await queryRunner.manager.save(vote);
+
+      // Update vote counts
+      poll.totalVotes += 1;
+      await queryRunner.manager.save(poll);
+
+      if (optionId && !isAbstain) {
+        await queryRunner.manager.increment(
+          PollOption,
+          { id: optionId },
+          'voteCount',
+          1
         );
       }
-      
+
+      await queryRunner.commitTransaction();
+
       logger.info('Vote recorded', { pollId, userId, optionId });
     } catch (error) {
-      logger.error('Failed to record vote', { error, pollId, userId });
+      await queryRunner.rollbackTransaction();
+      logger.error('Failed to vote', { error, pollId });
       throw error;
+    } finally {
+      await queryRunner.release();
     }
   }
 
   /**
-   * Get poll with results
+   * Close expired polls
    */
-  async getPollById(pollId: string): Promise<any> {
-    const pollResult = await pool.query(
-      `SELECT p.*, u.first_name, u.last_name
-       FROM polls p
-       LEFT JOIN users u ON p.created_by = u.id
-       WHERE p.id = $1 AND p.deleted_at IS NULL`,
-      [pollId]
-    );
-    
-    if (pollResult.rows.length === 0) {
-      return null;
+  async closeExpiredPolls(): Promise<number> {
+    try {
+      const result = await pollRepository
+        .createQueryBuilder()
+        .update(Poll)
+        .set({ status: PollStatus.CLOSED })
+        .where('end_date < :now', { now: new Date() })
+        .andWhere('status = :status', { status: PollStatus.ACTIVE })
+        .execute();
+
+      logger.info('Closed expired polls', { count: result.affected });
+      return result.affected || 0;
+    } catch (error) {
+      logger.error('Failed to close expired polls', { error });
+      throw error;
     }
-    
-    const poll = pollResult.rows[0];
-    
-    const optionsResult = await pool.query(
-      `SELECT * FROM poll_options WHERE poll_id = $1 ORDER BY display_order`,
-      [pollId]
-    );
-    
-    const votesResult = await pool.query(
-      `SELECT COUNT(*) as total FROM poll_votes WHERE poll_id = $1`,
-      [pollId]
-    );
-    
-    return {
-      ...poll,
-      options: optionsResult.rows,
-      totalVotes: parseInt(votesResult.rows[0].total)
-    };
   }
 }
 
