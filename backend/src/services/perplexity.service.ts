@@ -1,5 +1,36 @@
-import axios from 'axios';
+import axios, { AxiosError } from 'axios';
 import { logger } from '../utils/logger';
+import { Counter, Histogram } from 'prom-client';
+
+// Metrics
+const perplexityCallsTotal = new Counter({
+  name: 'perplexity_api_calls_total',
+  help: 'Total Perplexity API calls',
+  labelNames: ['type', 'status']
+});
+
+const perplexityCallDuration = new Histogram({
+  name: 'perplexity_api_duration_seconds',
+  help: 'Perplexity API call duration in seconds',
+  labelNames: ['type']
+});
+
+const perplexityCostsTotal = new Counter({
+  name: 'perplexity_costs_total',
+  help: 'Total estimated Perplexity API costs',
+  labelNames: ['model']
+});
+
+// Configuration
+const API_TIMEOUT_MS = parseInt(process.env.PERPLEXITY_TIMEOUT_MS || '10000'); // 10s default
+const MAX_RETRIES = 2;
+const RETRY_DELAY_MS = 1000;
+
+// Rate limiting
+let requestCount = 0;
+let windowStart = Date.now();
+const RATE_LIMIT_WINDOW_MS = 60000; // 1 minute
+const MAX_REQUESTS_PER_MINUTE = parseInt(process.env.PERPLEXITY_RATE_LIMIT || '60');
 
 interface ConversationMessage {
   role: 'user' | 'assistant' | 'system';
@@ -29,8 +60,41 @@ class PerplexityService {
   constructor() {
     this.apiKey = process.env.PERPLEXITY_API_KEY || '';
     if (!this.apiKey) {
-      logger.warn('PERPLEXITY_API_KEY not set, AI features will not work');
+      const message = 'PERPLEXITY_API_KEY not set - AI features disabled';
+      logger.error(message);
+      
+      if (process.env.NODE_ENV === 'production') {
+        throw new Error('PERPLEXITY_API_KEY is required in production');
+      }
+      
+      logger.warn('Perplexity service will not work without API key');
+    } else {
+      logger.info('Perplexity API configured: YES');
     }
+  }
+
+  /**
+   * Check rate limit
+   */
+  private async checkRateLimit(): Promise<void> {
+    const now = Date.now();
+    
+    // Reset window if needed
+    if (now - windowStart > RATE_LIMIT_WINDOW_MS) {
+      requestCount = 0;
+      windowStart = now;
+    }
+
+    // Check limit
+    if (requestCount >= MAX_REQUESTS_PER_MINUTE) {
+      const waitTime = RATE_LIMIT_WINDOW_MS - (now - windowStart);
+      logger.warn(`Perplexity rate limit reached, waiting ${waitTime}ms`);
+      await this.sleep(waitTime);
+      requestCount = 0;
+      windowStart = Date.now();
+    }
+
+    requestCount++;
   }
 
   /**
@@ -44,10 +108,14 @@ class PerplexityService {
     intents: any[],
     languageCode: string
   ): Promise<IntentResult> {
+    const timer = perplexityCallDuration.startTimer({ type: 'intent_recognition' });
+
     try {
+      await this.checkRateLimit();
+
       // Build intents list for prompt
       const intentsList = intents.map(intent => 
-        `- ${intent.code}: ${intent.description}\n  Examples: ${intent.examples.join(', ')}\n  Parameters: ${JSON.stringify(intent.parameters)}`
+        `- ${intent.code}: ${intent.description}\n  Примеры: ${intent.examples.join(', ')}\n  Параметры: ${JSON.stringify(intent.parameters)}`
       ).join('\n');
 
       // Build conversation history string
@@ -63,40 +131,51 @@ class PerplexityService {
         .replace('{USER_MESSAGE}', userMessage);
 
       // Add instruction for response language
-      const languageInstruction = `\n\nIMPORTANT: Respond in ${this.getLanguageName(languageCode)} language.`;
+      const languageInstruction = `\n\nВАЖНО: Отвечай на языке ${this.getLanguageName(languageCode)}.`;
 
-      // Call Perplexity API
-      const response = await axios.post(
-        this.apiUrl,
-        {
-          model: this.model,
-          messages: [
-            {
-              role: 'system',
-              content: finalSystemPrompt + languageInstruction
-            },
-            {
-              role: 'user',
-              content: userMessage
-            }
-          ],
-          temperature: 0.7,
-          max_tokens: 1000
-        },
-        {
-          headers: {
-            'Authorization': `Bearer ${this.apiKey}`,
-            'Content-Type': 'application/json'
+      // Call Perplexity API with retry
+      const response = await this.callWithRetry(async () => {
+        return await axios.post(
+          this.apiUrl,
+          {
+            model: this.model,
+            messages: [
+              {
+                role: 'system',
+                content: finalSystemPrompt + languageInstruction
+              },
+              {
+                role: 'user',
+                content: userMessage
+              }
+            ],
+            temperature: 0.7,
+            max_tokens: 1000
           },
-          timeout: 30000
-        }
-      );
+          {
+            headers: {
+              'Authorization': `Bearer ${this.apiKey}`,
+              'Content-Type': 'application/json'
+            },
+            timeout: API_TIMEOUT_MS
+          }
+        );
+      });
 
       const aiResponse = response.data.choices[0].message.content;
+      
+      // Log token usage for cost tracking
+      if (response.data.usage) {
+        const tokens = response.data.usage.total_tokens || 0;
+        const estimatedCost = tokens * 0.000001; // Approximate
+        perplexityCostsTotal.inc({ model: this.model }, estimatedCost);
+        logger.debug('Perplexity tokens used:', { tokens, estimatedCost });
+      }
 
       // Try to parse JSON response
       try {
         const parsed = JSON.parse(aiResponse);
+        perplexityCallsTotal.inc({ type: 'intent_recognition', status: 'success' });
         return {
           intent: parsed.intent || 'unknown',
           confidence: parsed.confidence || 0,
@@ -106,6 +185,7 @@ class PerplexityService {
         };
       } catch {
         // If not JSON, return as plain response
+        perplexityCallsTotal.inc({ type: 'intent_recognition', status: 'unparsed' });
         return {
           intent: 'unknown',
           confidence: 0.5,
@@ -116,7 +196,10 @@ class PerplexityService {
 
     } catch (error) {
       logger.error('Error calling Perplexity API:', error);
+      perplexityCallsTotal.inc({ type: 'intent_recognition', status: 'error' });
       throw error;
+    } finally {
+      timer();
     }
   }
 
@@ -124,67 +207,142 @@ class PerplexityService {
    * Recognize meter reading from photo
    */
   async recognizeMeterReading(photoUrl: string): Promise<OCRResult> {
-    try {
-      const prompt = `Analyze this image of a utility meter and extract the reading.
+    const timer = perplexityCallDuration.startTimer({ type: 'ocr' });
 
-Provide response in JSON format:
+    try {
+      await this.checkRateLimit();
+
+      const prompt = `Проанализируй это изображение счётчика и извлеки показания.
+
+Ответь в JSON формате:
 {
   "success": true,
   "value": 123.45,
-  "meter_type": "water" or "electricity" or "gas",
+  "meter_type": "water" или "electricity" или "gas",
   "confidence": 0.95
 }
 
-If you cannot read the meter clearly, return {"success": false}.
-Only return the JSON, no other text.`;
+Если не можешь чётко прочитать счётчик, верни {"success": false}.
+Верни только JSON, без другого текста.`;
 
-      const response = await axios.post(
-        this.apiUrl,
-        {
-          model: this.model,
-          messages: [
-            {
-              role: 'user',
-              content: [
-                {
-                  type: 'text',
-                  text: prompt
-                },
-                {
-                  type: 'image_url',
-                  image_url: {
-                    url: photoUrl
+      const response = await this.callWithRetry(async () => {
+        return await axios.post(
+          this.apiUrl,
+          {
+            model: this.model,
+            messages: [
+              {
+                role: 'user',
+                content: [
+                  {
+                    type: 'text',
+                    text: prompt
+                  },
+                  {
+                    type: 'image_url',
+                    image_url: {
+                      url: photoUrl
+                    }
                   }
-                }
-              ]
-            }
-          ],
-          temperature: 0.3,
-          max_tokens: 500
-        },
-        {
-          headers: {
-            'Authorization': `Bearer ${this.apiKey}`,
-            'Content-Type': 'application/json'
+                ]
+              }
+            ],
+            temperature: 0.3,
+            max_tokens: 500
           },
-          timeout: 30000
-        }
-      );
+          {
+            headers: {
+              'Authorization': `Bearer ${this.apiKey}`,
+              'Content-Type': 'application/json'
+            },
+            timeout: API_TIMEOUT_MS
+          }
+        );
+      });
 
       const aiResponse = response.data.choices[0].message.content;
       
       try {
         const parsed = JSON.parse(aiResponse);
+        perplexityCallsTotal.inc({ type: 'ocr', status: 'success' });
         return parsed;
       } catch {
         logger.error('Failed to parse OCR response:', aiResponse);
+        perplexityCallsTotal.inc({ type: 'ocr', status: 'parse_error' });
         return { success: false };
       }
 
     } catch (error) {
       logger.error('Error recognizing meter reading:', error);
+      perplexityCallsTotal.inc({ type: 'ocr', status: 'error' });
       return { success: false };
+    } finally {
+      timer();
     }
+  }
+
+  /**
+   * Call API with retry logic
+   */
+  private async callWithRetry<T>(fn: () => Promise<T>): Promise<T> {
+    for (let attempt = 1; attempt <= MAX_RETRIES + 1; attempt++) {
+      try {
+        return await fn();
+      } catch (error: any) {
+        const isLastAttempt = attempt > MAX_RETRIES;
+        
+        if (isLastAttempt) {
+          throw error;
+        }
+
+        // Check if error is retryable
+        const isRetryable = this.isRetryableError(error);
+        if (!isRetryable) {
+          throw error;
+        }
+
+        logger.warn(`Perplexity API attempt ${attempt} failed, retrying...`, {
+          error: error.message,
+          code: error.code
+        });
+
+        // Exponential backoff
+        await this.sleep(RETRY_DELAY_MS * attempt);
+      }
+    }
+
+    throw new Error('Should not reach here');
+  }
+
+  /**
+   * Check if error is retryable
+   */
+  private isRetryableError(error: any): boolean {
+    if (axios.isAxiosError(error)) {
+      const axiosError = error as AxiosError;
+      
+      // Network errors
+      if (!axiosError.response) {
+        return true;
+      }
+
+      // Server errors (5xx)
+      if (axiosError.response.status >= 500) {
+        return true;
+      }
+
+      // Rate limit (429)
+      if (axiosError.response.status === 429) {
+        return true;
+      }
+
+      // Timeout
+      if (axiosError.code === 'ECONNABORTED') {
+        return true;
+      }
+    }
+
+    return false;
   }
 
   /**
@@ -192,6 +350,8 @@ Only return the JSON, no other text.`;
    */
   async translate(text: string, targetLanguage: string): Promise<string> {
     try {
+      await this.checkRateLimit();
+
       const response = await axios.post(
         this.apiUrl,
         {
@@ -199,7 +359,7 @@ Only return the JSON, no other text.`;
           messages: [
             {
               role: 'system',
-              content: `Translate the following text to ${this.getLanguageName(targetLanguage)}. Return only the translation, no explanations.`
+              content: `Переведи следующий текст на ${this.getLanguageName(targetLanguage)}. Верни только перевод, без объяснений.`
             },
             {
               role: 'user',
@@ -214,7 +374,7 @@ Only return the JSON, no other text.`;
             'Authorization': `Bearer ${this.apiKey}`,
             'Content-Type': 'application/json'
           },
-          timeout: 15000
+          timeout: API_TIMEOUT_MS
         }
       );
 
@@ -226,22 +386,29 @@ Only return the JSON, no other text.`;
   }
 
   /**
+   * Sleep helper
+   */
+  private sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  /**
    * Get language name from code
    */
   private getLanguageName(code: string): string {
     const languages: Record<string, string> = {
-      'en': 'English',
-      'ru': 'Russian',
-      'bg': 'Bulgarian',
-      'pl': 'Polish',
-      'uk': 'Ukrainian',
-      'de': 'German',
-      'fr': 'French',
-      'es': 'Spanish',
-      'it': 'Italian'
+      'en': 'английский',
+      'ru': 'русский',
+      'bg': 'болгарский',
+      'pl': 'польский',
+      'uk': 'украинский',
+      'de': 'немецкий',
+      'fr': 'французский',
+      'es': 'испанский',
+      'it': 'итальянский'
     };
 
-    return languages[code] || 'English';
+    return languages[code] || 'английский';
   }
 }
 

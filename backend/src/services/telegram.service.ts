@@ -1,7 +1,32 @@
 import TelegramBot from 'node-telegram-bot-api';
+import { Pool, PoolClient } from 'pg';
 import { pool } from '../db';
 import { logger } from '../utils/logger';
 import { perplexityService } from './perplexity.service';
+import { Counter, Histogram } from 'prom-client';
+
+// Metrics
+const telegramMessagesTotal = new Counter({
+  name: 'telegram_messages_total',
+  help: 'Total Telegram messages processed',
+  labelNames: ['type', 'status']
+});
+
+const telegramIntentDuration = new Histogram({
+  name: 'telegram_intent_recognition_duration_seconds',
+  help: 'Duration of intent recognition'
+});
+
+const telegramActiveUsers = new Counter({
+  name: 'telegram_active_users_total',
+  help: 'Total active Telegram users'
+});
+
+// Configuration
+const CONVERSATION_HISTORY_LIMIT = parseInt(process.env.CONVERSATION_HISTORY_LIMIT || '20');
+const INTENT_CONFIDENCE_THRESHOLD = parseFloat(process.env.INTENT_CONFIDENCE_THRESHOLD || '0.7');
+const MAX_RETRIES = 3;
+const RETRY_DELAY_MS = 1000;
 
 interface TelegramUser {
   id: string;
@@ -33,7 +58,14 @@ class TelegramService {
   async initialize(): Promise<void> {
     const token = process.env.TELEGRAM_BOT_TOKEN;
     if (!token) {
-      logger.warn('TELEGRAM_BOT_TOKEN not set, bot will not start');
+      const message = 'TELEGRAM_BOT_TOKEN not set - bot features disabled';
+      logger.error(message);
+      
+      if (process.env.NODE_ENV === 'production') {
+        throw new Error('TELEGRAM_BOT_TOKEN is required in production');
+      }
+      
+      logger.warn('Bot will not start in development mode without token');
       return;
     }
 
@@ -48,7 +80,7 @@ class TelegramService {
 
       this.bot = new TelegramBot(token, { webHook: true });
       await this.bot.setWebHook(`${this.webhookUrl}/api/v1/telegram/webhook`);
-      logger.info('Telegram bot initialized in webhook mode');
+      logger.info('Telegram bot initialized in webhook mode', { url: this.webhookUrl });
     } else {
       // Polling mode (for development)
       this.bot = new TelegramBot(token, { polling: true });
@@ -96,44 +128,53 @@ class TelegramService {
       const telegramId = msg.from?.id;
       if (!telegramId) return;
 
+      telegramMessagesTotal.inc({ type: 'start', status: 'received' });
+
       // Check if user already exists
       const existingUser = await this.getTelegramUser(telegramId);
       
       if (existingUser) {
-        await this.sendMessage(telegramId, 
-          'Welcome back! How can I help you today?');
+        await this.sendMessageWithRetry(telegramId, 
+          'Добро пожаловать! Чем могу помочь?');
+        telegramMessagesTotal.inc({ type: 'start', status: 'existing_user' });
         return;
       }
 
       // New user - require invite token
       if (!inviteToken) {
-        await this.sendMessage(telegramId,
-          'Welcome to servAI! To get started, you need an invitation link.\n\n' +
-          'Please ask your building administrator for an invitation link.');
+        await this.sendMessageWithRetry(telegramId,
+          'Добро пожаловать в servAI! Для регистрации нужна ссылка-приглашение.\n\n' +
+          'Попросите администратора вашего дома выслать вам ссылку.');
+        telegramMessagesTotal.inc({ type: 'start', status: 'no_invite' });
         return;
       }
 
       // Validate invite and create user
       await this.handleInviteRegistration(msg, inviteToken);
+      telegramMessagesTotal.inc({ type: 'start', status: 'registered' });
     } catch (error) {
       logger.error('Error handling /start:', error);
-      await this.sendMessage(msg.from!.id, 
-        'Sorry, something went wrong. Please try again later.');
+      telegramMessagesTotal.inc({ type: 'start', status: 'error' });
+      await this.sendMessageWithRetry(msg.from!.id, 
+        'Извините, произошла ошибка. Попробуйте позже.');
     }
   }
 
   /**
-   * Handle invite registration
+   * Handle invite registration with transaction
    */
   private async handleInviteRegistration(
     msg: TelegramBot.Message, 
     inviteToken: string
   ): Promise<void> {
     const telegramId = msg.from!.id;
+    const client = await pool.connect();
 
     try {
-      // Validate invite token
-      const inviteResult = await pool.query(
+      await client.query('BEGIN');
+
+      // Lock and validate invite
+      const inviteResult = await client.query(
         `SELECT i.*, u.id as unit_id, u.number as unit_number,
                 c.name as condo_name, b.name as building_name
          FROM invites i
@@ -143,13 +184,15 @@ class TelegramService {
          WHERE i.token = $1 
            AND i.status = 'pending'
            AND i.expires_at > NOW()
-           AND i.deleted_at IS NULL`,
+           AND i.deleted_at IS NULL
+         FOR UPDATE`,
         [inviteToken]
       );
 
       if (inviteResult.rows.length === 0) {
-        await this.sendMessage(telegramId,
-          'Invalid or expired invitation link. Please contact your administrator.');
+        await client.query('ROLLBACK');
+        await this.sendMessageWithRetry(telegramId,
+          'Неверная или устаревшая ссылка-приглашение. Обратитесь к администратору.');
         return;
       }
 
@@ -160,71 +203,96 @@ class TelegramService {
 
       if (!userId) {
         // Create new user
-        const userResult = await pool.query(
+        const userResult = await client.query(
           `INSERT INTO users (email, email_verified, first_name, last_name)
            VALUES ($1, false, $2, $3)
            RETURNING id`,
           [
             `telegram_${telegramId}@servai.temp`,
-            msg.from!.first_name || 'User',
+            msg.from!.first_name || 'Пользователь',
             msg.from!.last_name || ''
           ]
         );
         userId = userResult.rows[0].id;
 
         // Update invite
-        await pool.query(
+        await client.query(
           `UPDATE invites SET user_id = $1, accepted_at = NOW(), status = 'accepted'
            WHERE id = $2`,
           [userId, invite.id]
         );
       }
 
+      // Check if telegram user already exists (shouldn't happen, but defensive)
+      const existingTgUser = await client.query(
+        'SELECT id FROM telegram_users WHERE telegram_id = $1 AND deleted_at IS NULL',
+        [telegramId]
+      );
+
+      if (existingTgUser.rows.length > 0) {
+        await client.query('ROLLBACK');
+        await this.sendMessageWithRetry(telegramId,
+          'Вы уже зарегистрированы!');
+        return;
+      }
+
       // Create telegram_user
-      await pool.query(
+      const tgUserResult = await client.query(
         `INSERT INTO telegram_users (user_id, telegram_id, telegram_username, first_name, last_name, language_code)
-         VALUES ($1, $2, $3, $4, $5, $6)`,
+         VALUES ($1, $2, $3, $4, $5, $6)
+         RETURNING id`,
         [
           userId,
           telegramId,
           msg.from!.username || null,
           msg.from!.first_name || null,
           msg.from!.last_name || null,
-          msg.from!.language_code || 'en'
+          msg.from!.language_code || 'ru'
         ]
       );
 
+      const tgUserId = tgUserResult.rows[0].id;
+
       // Create user context
-      await pool.query(
+      await client.query(
         `INSERT INTO user_context (telegram_user_id, current_unit_id)
-         SELECT id, $1 FROM telegram_users WHERE telegram_id = $2`,
-        [invite.unit_id, telegramId]
+         VALUES ($1, $2)`,
+        [tgUserId, invite.unit_id]
       );
 
       // Create resident link
-      await pool.query(
+      await client.query(
         `INSERT INTO residents (user_id, unit_id, role)
          VALUES ($1, $2, $3)`,
         [userId, invite.unit_id, invite.role]
       );
 
+      await client.query('COMMIT');
+
       // Send welcome message
-      const address = `${invite.condo_name}, ${invite.building_name}, Unit ${invite.unit_number}`;
-      await this.sendMessage(telegramId,
-        `Welcome to servAI! 🏠\n\n` +
-        `Your address: ${address}\n\n` +
-        `I can help you with:\n` +
-        `• Submit meter readings\n` +
-        `• Report issues\n` +
-        `• Check bills\n` +
-        `• Vote in polls\n` +
-        `• Manage car access\n\n` +
-        `How can I help you today?`);
+      const address = `${invite.condo_name}, ${invite.building_name}, Квартира ${invite.unit_number}`;
+      await this.sendMessageWithRetry(telegramId,
+        `Добро пожаловать в servAI! 🏠\n\n` +
+        `Ваш адрес: ${address}\n\n` +
+        `Я помогу вам:\n` +
+        `• Передать показания счётчиков\n` +
+        `• Сообщить о проблемах\n` +
+        `• Посмотреть счета\n` +
+        `• Участвовать в голосованиях\n` +
+        `• Управлять доступом автомобилей\n\n` +
+        `Чем могу помочь?`);
+
+      telegramActiveUsers.inc();
+      logger.info('User registered via Telegram', { telegramId, userId, unitId: invite.unit_id });
 
     } catch (error) {
+      await client.query('ROLLBACK');
       logger.error('Error in invite registration:', error);
-      await this.sendMessage(telegramId,
-        'Sorry, registration failed. Please contact support.');
+      await this.sendMessageWithRetry(telegramId,
+        'Извините, регистрация не удалась. Обратитесь в поддержку.');
+      throw error;
+    } finally {
+      client.release();
     }
   }
 
@@ -235,10 +303,12 @@ class TelegramService {
     if (!msg.text || !msg.from) return;
 
     try {
+      telegramMessagesTotal.inc({ type: 'text', status: 'received' });
+
       const telegramUser = await this.getTelegramUser(msg.from.id);
       if (!telegramUser) {
-        await this.sendMessage(msg.from.id,
-          'Please start the bot first with /start and your invitation link.');
+        await this.sendMessageWithRetry(msg.from.id,
+          'Пожалуйста, начните с команды /start и ссылки-приглашения.');
         return;
       }
 
@@ -249,15 +319,17 @@ class TelegramService {
       await this.bot?.sendChatAction(msg.from.id, 'typing');
 
       // Process with AI
+      const timer = telegramIntentDuration.startTimer();
       const intentResult = await this.processWithAI(telegramUser, msg.text);
+      timer();
 
       // Send AI response
-      await this.sendMessage(msg.from.id, intentResult.response);
+      await this.sendMessageWithRetry(msg.from.id, intentResult.response);
 
       // Save assistant message
       await this.saveMessage(
         telegramUser.id,
-        0, // No telegram message ID for bot responses yet
+        0,
         'assistant',
         intentResult.response,
         intentResult.intent,
@@ -270,14 +342,17 @@ class TelegramService {
       }
 
       // Execute intent handler
-      if (intentResult.intent && intentResult.confidence > 0.7) {
+      if (intentResult.intent && intentResult.confidence > INTENT_CONFIDENCE_THRESHOLD) {
         await this.executeIntent(telegramUser, intentResult);
       }
 
+      telegramMessagesTotal.inc({ type: 'text', status: 'success' });
+
     } catch (error) {
       logger.error('Error handling message:', error);
-      await this.sendMessage(msg.from.id,
-        'Sorry, I had trouble processing your message. Please try again.');
+      telegramMessagesTotal.inc({ type: 'text', status: 'error' });
+      await this.sendMessageWithRetry(msg.from.id,
+        'Извините, не смог обработать сообщение. Попробуйте ещё раз.');
     }
   }
 
@@ -288,9 +363,11 @@ class TelegramService {
     if (!msg.photo || !msg.from) return;
 
     try {
+      telegramMessagesTotal.inc({ type: 'photo', status: 'received' });
+
       const telegramUser = await this.getTelegramUser(msg.from.id);
       if (!telegramUser) {
-        await this.sendMessage(msg.from.id, 'Please start with /start first.');
+        await this.sendMessageWithRetry(msg.from.id, 'Пожалуйста, начните с /start.');
         return;
       }
 
@@ -299,20 +376,27 @@ class TelegramService {
       const fileLink = await this.bot?.getFileLink(photo.file_id);
 
       if (!fileLink) {
-        await this.sendMessage(msg.from.id, 'Could not process photo.');
+        await this.sendMessageWithRetry(msg.from.id, 'Не удалось обработать фото.');
         return;
       }
 
-      await this.sendMessage(msg.from.id, 
-        'Processing your photo... This may take a moment.');
+      // Validate photo URL is from Telegram
+      if (!fileLink.startsWith('https://api.telegram.org/')) {
+        logger.error('Invalid file link (not from Telegram):', fileLink);
+        await this.sendMessageWithRetry(msg.from.id, 'Неверный источник фото.');
+        return;
+      }
+
+      await this.sendMessageWithRetry(msg.from.id, 
+        'Обрабатываю фото... Это может занять несколько секунд.');
 
       // Process photo with Perplexity (OCR for meter reading)
       const ocrResult = await perplexityService.recognizeMeterReading(fileLink);
 
       if (ocrResult.success && ocrResult.value) {
-        await this.sendMessage(msg.from.id,
-          `I detected: ${ocrResult.meter_type || 'meter'} reading = ${ocrResult.value}\n\n` +
-          `Is this correct? Reply 'yes' to confirm or send the correct value.`);
+        await this.sendMessageWithRetry(msg.from.id,
+          `Распознал: ${ocrResult.meter_type || 'счётчик'} = ${ocrResult.value}\n\n` +
+          `Это верно? Ответьте 'да' для подтверждения или отправьте правильное значение.`);
         
         // Save pending reading in context
         await pool.query(
@@ -322,16 +406,21 @@ class TelegramService {
            WHERE telegram_user_id = (SELECT id FROM telegram_users WHERE telegram_id = $2)`,
           [JSON.stringify(ocrResult), msg.from.id]
         );
+
+        telegramMessagesTotal.inc({ type: 'photo', status: 'ocr_success' });
       } else {
-        await this.sendMessage(msg.from.id,
-          'Sorry, I could not read the meter from this photo. ' +
-          'Please try taking a clearer photo or type the reading manually.');
+        await this.sendMessageWithRetry(msg.from.id,
+          'К сожалению, не смог прочитать показания с фото. ' +
+          'Попробуйте сделать фото более чётким или введите показания вручную.');
+        
+        telegramMessagesTotal.inc({ type: 'photo', status: 'ocr_failed' });
       }
 
     } catch (error) {
       logger.error('Error handling photo:', error);
-      await this.sendMessage(msg.from.id,
-        'Sorry, I had trouble processing your photo.');
+      telegramMessagesTotal.inc({ type: 'photo', status: 'error' });
+      await this.sendMessageWithRetry(msg.from.id,
+        'Извините, не смог обработать фото.');
     }
   }
 
@@ -364,7 +453,7 @@ class TelegramService {
   ): Promise<IntentResult> {
     try {
       // Get conversation history
-      const history = await this.getConversationHistory(telegramUser.id, 20);
+      const history = await this.getConversationHistory(telegramUser.id, CONVERSATION_HISTORY_LIMIT);
       
       // Get current context
       const context = await this.getContext(telegramUser.id);
@@ -392,7 +481,7 @@ class TelegramService {
         intent: 'unknown',
         confidence: 0,
         parameters: {},
-        response: 'I\'m sorry, I didn\'t understand that. Could you please rephrase?'
+        response: 'Извините, не понял. Не могли бы вы перефразировать?'
       };
     }
   }
@@ -406,7 +495,9 @@ class TelegramService {
   ): Promise<void> {
     // This will route to appropriate service based on intent.handler
     // Will be implemented as we build each module (meters, tickets, etc.)
-    logger.info(`Executing intent: ${intentResult.intent}`, { 
+    logger.info('Executing intent', { 
+      intent: intentResult.intent,
+      confidence: intentResult.confidence,
       parameters: intentResult.parameters 
     });
   }
@@ -507,11 +598,13 @@ class TelegramService {
     );
 
     if (result.rows.length === 0) {
-      // Fallback to English
+      // Fallback to English or Russian
+      const fallbackLang = languageCode === 'ru' ? 'en' : 'ru';
       const fallback = await pool.query(
         `SELECT content FROM system_prompts
-         WHERE is_active = true AND language_code = 'en'
-         ORDER BY version DESC LIMIT 1`
+         WHERE is_active = true AND language_code = $1
+         ORDER BY version DESC LIMIT 1`,
+        [fallbackLang]
       );
       return fallback.rows[0]?.content || '';
     }
@@ -534,16 +627,45 @@ class TelegramService {
   }
 
   /**
-   * Send message to user
+   * Send message with retry logic
    */
-  async sendMessage(telegramId: number, text: string, options?: any): Promise<void> {
+  async sendMessageWithRetry(
+    telegramId: number, 
+    text: string, 
+    options?: any
+  ): Promise<void> {
     if (!this.bot) return;
     
-    try {
-      await this.bot.sendMessage(telegramId, text, options);
-    } catch (error) {
-      logger.error('Error sending message:', error);
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        await this.bot.sendMessage(telegramId, text, options);
+        return;
+      } catch (error: any) {
+        logger.warn(`Telegram send message attempt ${attempt} failed:`, error.message);
+        
+        if (attempt === MAX_RETRIES) {
+          logger.error('Failed to send message after max retries:', error);
+          throw error;
+        }
+        
+        // Exponential backoff
+        await this.sleep(RETRY_DELAY_MS * attempt);
+      }
     }
+  }
+
+  /**
+   * Send message (legacy, for compatibility)
+   */
+  async sendMessage(telegramId: number, text: string, options?: any): Promise<void> {
+    await this.sendMessageWithRetry(telegramId, text, options);
+  }
+
+  /**
+   * Sleep helper
+   */
+  private sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
   }
 
   /**
@@ -564,7 +686,12 @@ class TelegramService {
    */
   async shutdown(): Promise<void> {
     if (this.bot) {
-      await this.bot.stopPolling();
+      try {
+        await this.bot.stopPolling();
+        logger.info('Telegram bot polling stopped');
+      } catch (error) {
+        logger.warn('Error stopping bot polling:', error);
+      }
       this.bot = null;
     }
   }
