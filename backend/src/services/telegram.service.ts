@@ -1,9 +1,10 @@
 import TelegramBot from 'node-telegram-bot-api';
 import { Pool, PoolClient } from 'pg';
+import Queue from 'bull';
 import { pool } from '../db';
 import { logger } from '../utils/logger';
 import { perplexityService } from './perplexity.service';
-import { Counter, Histogram } from 'prom-client';
+import { Counter, Histogram, Gauge } from 'prom-client';
 
 // Metrics
 const telegramMessagesTotal = new Counter({
@@ -22,11 +23,23 @@ const telegramActiveUsers = new Counter({
   help: 'Total active Telegram users'
 });
 
+const telegramQueueSize = new Gauge({
+  name: 'telegram_queue_size',
+  help: 'Current size of Telegram message queue'
+});
+
+const telegramQueueDelayed = new Gauge({
+  name: 'telegram_queue_delayed',
+  help: 'Number of delayed jobs in Telegram queue'
+});
+
 // Configuration
 const CONVERSATION_HISTORY_LIMIT = parseInt(process.env.CONVERSATION_HISTORY_LIMIT || '20');
 const INTENT_CONFIDENCE_THRESHOLD = parseFloat(process.env.INTENT_CONFIDENCE_THRESHOLD || '0.7');
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 1000;
+const TELEGRAM_RATE_LIMIT_PER_SECOND = parseInt(process.env.TELEGRAM_RATE_LIMIT_PER_SECOND || '25');
+const MESSAGE_INTERVAL_MS = 1000 / TELEGRAM_RATE_LIMIT_PER_SECOND; // ~40ms for 25 msg/sec
 
 interface TelegramUser {
   id: string;
@@ -48,9 +61,18 @@ interface IntentResult {
   summary_update?: string;
 }
 
+interface QueuedMessage {
+  telegramId: number;
+  text: string;
+  options?: any;
+  priority?: number;
+}
+
 class TelegramService {
   private bot: TelegramBot | null = null;
   private webhookUrl: string = '';
+  private messageQueue: Queue.Queue<QueuedMessage> | null = null;
+  private lastMessageTime = 0;
 
   /**
    * Initialize Telegram bot
@@ -88,6 +110,151 @@ class TelegramService {
     }
 
     this.setupHandlers();
+    await this.initializeMessageQueue();
+  }
+
+  /**
+   * Initialize Bull message queue for rate-limited outgoing messages
+   */
+  private async initializeMessageQueue(): Promise<void> {
+    try {
+      const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
+      
+      this.messageQueue = new Queue<QueuedMessage>('telegram-outgoing-messages', redisUrl, {
+        defaultJobOptions: {
+          attempts: MAX_RETRIES,
+          backoff: {
+            type: 'exponential',
+            delay: RETRY_DELAY_MS
+          },
+          removeOnComplete: 100, // Keep last 100 completed
+          removeOnFail: 500 // Keep last 500 failed
+        },
+        limiter: {
+          max: TELEGRAM_RATE_LIMIT_PER_SECOND,
+          duration: 1000 // Per second
+        }
+      });
+
+      // Process queue jobs
+      this.messageQueue.process(async (job) => {
+        const { telegramId, text, options } = job.data;
+        
+        try {
+          // Ensure minimum interval between messages
+          const now = Date.now();
+          const timeSinceLastMessage = now - this.lastMessageTime;
+          if (timeSinceLastMessage < MESSAGE_INTERVAL_MS) {
+            await this.sleep(MESSAGE_INTERVAL_MS - timeSinceLastMessage);
+          }
+
+          if (!this.bot) {
+            throw new Error('Bot not initialized');
+          }
+
+          await this.bot.sendMessage(telegramId, text, options);
+          this.lastMessageTime = Date.now();
+          
+          telegramMessagesTotal.inc({ type: 'outgoing', status: 'sent' });
+          logger.debug('Message sent from queue', { 
+            telegramId, 
+            jobId: job.id,
+            queueSize: await this.messageQueue?.count()
+          });
+        } catch (error: any) {
+          // Handle Telegram rate limit (429)
+          if (error.response?.statusCode === 429) {
+            const retryAfter = error.response?.parameters?.retry_after || 1;
+            logger.warn('Telegram rate limit hit, delaying job', {
+              telegramId,
+              jobId: job.id,
+              retryAfter
+            });
+            
+            telegramMessagesTotal.inc({ type: 'outgoing', status: 'rate_limited' });
+            
+            // Delay this job
+            const delayMs = retryAfter * 1000;
+            throw new Error(`RATE_LIMIT:${delayMs}`);
+          }
+          
+          // Handle FloodWait (too many messages to same chat)
+          if (error.message?.includes('FLOOD_WAIT')) {
+            const match = error.message.match(/FLOOD_WAIT_(\d+)/);
+            const waitSeconds = match ? parseInt(match[1]) : 60;
+            logger.warn('Telegram flood wait', {
+              telegramId,
+              jobId: job.id,
+              waitSeconds
+            });
+            
+            telegramMessagesTotal.inc({ type: 'outgoing', status: 'flood_wait' });
+            throw new Error(`FLOOD_WAIT:${waitSeconds * 1000}`);
+          }
+          
+          logger.error('Failed to send message from queue', {
+            telegramId,
+            jobId: job.id,
+            error: error.message
+          });
+          
+          telegramMessagesTotal.inc({ type: 'outgoing', status: 'error' });
+          throw error;
+        }
+      });
+
+      // Queue event handlers
+      this.messageQueue.on('completed', (job) => {
+        logger.debug('Job completed', { jobId: job.id });
+      });
+
+      this.messageQueue.on('failed', (job, err) => {
+        // Check if it's a rate limit or flood wait error
+        if (err.message.startsWith('RATE_LIMIT:') || err.message.startsWith('FLOOD_WAIT:')) {
+          const delayMs = parseInt(err.message.split(':')[1]);
+          logger.info('Retrying job after delay', {
+            jobId: job.id,
+            delayMs
+          });
+          
+          // Re-add to queue with delay
+          this.messageQueue?.add(job.data, {
+            delay: delayMs,
+            priority: job.opts.priority
+          });
+        } else {
+          logger.error('Job failed permanently', {
+            jobId: job.id,
+            error: err.message,
+            attempts: job.attemptsMade
+          });
+        }
+      });
+
+      this.messageQueue.on('stalled', (job) => {
+        logger.warn('Job stalled', { jobId: job.id });
+      });
+
+      // Update metrics every 5 seconds
+      setInterval(async () => {
+        if (this.messageQueue) {
+          const waiting = await this.messageQueue.getWaitingCount();
+          const active = await this.messageQueue.getActiveCount();
+          const delayed = await this.messageQueue.getDelayedCount();
+          
+          telegramQueueSize.set(waiting + active);
+          telegramQueueDelayed.set(delayed);
+        }
+      }, 5000);
+
+      logger.info('Telegram message queue initialized', {
+        rateLimit: TELEGRAM_RATE_LIMIT_PER_SECOND,
+        intervalMs: MESSAGE_INTERVAL_MS
+      });
+    } catch (error) {
+      logger.error('Failed to initialize message queue', error);
+      throw error;
+    }
   }
 
   /**
@@ -134,7 +301,7 @@ class TelegramService {
       const existingUser = await this.getTelegramUser(telegramId);
       
       if (existingUser) {
-        await this.sendMessageWithRetry(telegramId, 
+        await this.sendMessage(telegramId, 
           'Добро пожаловать! Чем могу помочь?');
         telegramMessagesTotal.inc({ type: 'start', status: 'existing_user' });
         return;
@@ -142,7 +309,7 @@ class TelegramService {
 
       // New user - require invite token
       if (!inviteToken) {
-        await this.sendMessageWithRetry(telegramId,
+        await this.sendMessage(telegramId,
           'Добро пожаловать в servAI! Для регистрации нужна ссылка-приглашение.\n\n' +
           'Попросите администратора вашего дома выслать вам ссылку.');
         telegramMessagesTotal.inc({ type: 'start', status: 'no_invite' });
@@ -155,7 +322,7 @@ class TelegramService {
     } catch (error) {
       logger.error('Error handling /start:', error);
       telegramMessagesTotal.inc({ type: 'start', status: 'error' });
-      await this.sendMessageWithRetry(msg.from!.id, 
+      await this.sendMessage(msg.from!.id, 
         'Извините, произошла ошибка. Попробуйте позже.');
     }
   }
@@ -191,7 +358,7 @@ class TelegramService {
 
       if (inviteResult.rows.length === 0) {
         await client.query('ROLLBACK');
-        await this.sendMessageWithRetry(telegramId,
+        await this.sendMessage(telegramId,
           'Неверная или устаревшая ссылка-приглашение. Обратитесь к администратору.');
         return;
       }
@@ -231,7 +398,7 @@ class TelegramService {
 
       if (existingTgUser.rows.length > 0) {
         await client.query('ROLLBACK');
-        await this.sendMessageWithRetry(telegramId,
+        await this.sendMessage(telegramId,
           'Вы уже зарегистрированы!');
         return;
       }
@@ -271,7 +438,7 @@ class TelegramService {
 
       // Send welcome message
       const address = `${invite.condo_name}, ${invite.building_name}, Квартира ${invite.unit_number}`;
-      await this.sendMessageWithRetry(telegramId,
+      await this.sendMessage(telegramId,
         `Добро пожаловать в servAI! 🏠\n\n` +
         `Ваш адрес: ${address}\n\n` +
         `Я помогу вам:\n` +
@@ -288,7 +455,7 @@ class TelegramService {
     } catch (error) {
       await client.query('ROLLBACK');
       logger.error('Error in invite registration:', error);
-      await this.sendMessageWithRetry(telegramId,
+      await this.sendMessage(telegramId,
         'Извините, регистрация не удалась. Обратитесь в поддержку.');
       throw error;
     } finally {
@@ -307,7 +474,7 @@ class TelegramService {
 
       const telegramUser = await this.getTelegramUser(msg.from.id);
       if (!telegramUser) {
-        await this.sendMessageWithRetry(msg.from.id,
+        await this.sendMessage(msg.from.id,
           'Пожалуйста, начните с команды /start и ссылки-приглашения.');
         return;
       }
@@ -323,8 +490,8 @@ class TelegramService {
       const intentResult = await this.processWithAI(telegramUser, msg.text);
       timer();
 
-      // Send AI response
-      await this.sendMessageWithRetry(msg.from.id, intentResult.response);
+      // Send AI response via queue
+      await this.sendMessage(msg.from.id, intentResult.response);
 
       // Save assistant message
       await this.saveMessage(
@@ -351,7 +518,7 @@ class TelegramService {
     } catch (error) {
       logger.error('Error handling message:', error);
       telegramMessagesTotal.inc({ type: 'text', status: 'error' });
-      await this.sendMessageWithRetry(msg.from.id,
+      await this.sendMessage(msg.from.id,
         'Извините, не смог обработать сообщение. Попробуйте ещё раз.');
     }
   }
@@ -367,7 +534,7 @@ class TelegramService {
 
       const telegramUser = await this.getTelegramUser(msg.from.id);
       if (!telegramUser) {
-        await this.sendMessageWithRetry(msg.from.id, 'Пожалуйста, начните с /start.');
+        await this.sendMessage(msg.from.id, 'Пожалуйста, начните с /start.');
         return;
       }
 
@@ -376,25 +543,25 @@ class TelegramService {
       const fileLink = await this.bot?.getFileLink(photo.file_id);
 
       if (!fileLink) {
-        await this.sendMessageWithRetry(msg.from.id, 'Не удалось обработать фото.');
+        await this.sendMessage(msg.from.id, 'Не удалось обработать фото.');
         return;
       }
 
       // Validate photo URL is from Telegram
       if (!fileLink.startsWith('https://api.telegram.org/')) {
         logger.error('Invalid file link (not from Telegram):', fileLink);
-        await this.sendMessageWithRetry(msg.from.id, 'Неверный источник фото.');
+        await this.sendMessage(msg.from.id, 'Неверный источник фото.');
         return;
       }
 
-      await this.sendMessageWithRetry(msg.from.id, 
+      await this.sendMessage(msg.from.id, 
         'Обрабатываю фото... Это может занять несколько секунд.');
 
       // Process photo with Perplexity (OCR for meter reading)
       const ocrResult = await perplexityService.recognizeMeterReading(fileLink);
 
       if (ocrResult.success && ocrResult.value) {
-        await this.sendMessageWithRetry(msg.from.id,
+        await this.sendMessage(msg.from.id,
           `Распознал: ${ocrResult.meter_type || 'счётчик'} = ${ocrResult.value}\n\n` +
           `Это верно? Ответьте 'да' для подтверждения или отправьте правильное значение.`);
         
@@ -409,7 +576,7 @@ class TelegramService {
 
         telegramMessagesTotal.inc({ type: 'photo', status: 'ocr_success' });
       } else {
-        await this.sendMessageWithRetry(msg.from.id,
+        await this.sendMessage(msg.from.id,
           'К сожалению, не смог прочитать показания с фото. ' +
           'Попробуйте сделать фото более чётким или введите показания вручную.');
         
@@ -419,7 +586,7 @@ class TelegramService {
     } catch (error) {
       logger.error('Error handling photo:', error);
       telegramMessagesTotal.inc({ type: 'photo', status: 'error' });
-      await this.sendMessageWithRetry(msg.from.id,
+      await this.sendMessage(msg.from.id,
         'Извините, не смог обработать фото.');
     }
   }
@@ -627,38 +794,88 @@ class TelegramService {
   }
 
   /**
-   * Send message with retry logic
+   * Send message via queue (non-blocking, rate-limited)
    */
-  async sendMessageWithRetry(
+  async sendMessage(
     telegramId: number, 
     text: string, 
+    options?: any,
+    priority: number = 0
+  ): Promise<void> {
+    if (!this.messageQueue) {
+      logger.warn('Message queue not initialized, using fallback direct send');
+      return this.sendMessageDirect(telegramId, text, options);
+    }
+
+    try {
+      await this.messageQueue.add({
+        telegramId,
+        text,
+        options,
+        priority
+      }, {
+        priority // Higher priority messages processed first
+      });
+
+      logger.debug('Message queued', { 
+        telegramId, 
+        textLength: text.length,
+        queueSize: await this.messageQueue.count()
+      });
+
+      telegramMessagesTotal.inc({ type: 'outgoing', status: 'queued' });
+    } catch (error) {
+      logger.error('Failed to queue message', error);
+      // Fallback to direct send
+      await this.sendMessageDirect(telegramId, text, options);
+    }
+  }
+
+  /**
+   * Send message directly (fallback, bypassing queue)
+   */
+  private async sendMessageDirect(
+    telegramId: number,
+    text: string,
     options?: any
   ): Promise<void> {
     if (!this.bot) return;
-    
+
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
       try {
         await this.bot.sendMessage(telegramId, text, options);
+        telegramMessagesTotal.inc({ type: 'outgoing', status: 'sent_direct' });
         return;
       } catch (error: any) {
-        logger.warn(`Telegram send message attempt ${attempt} failed:`, error.message);
+        // Handle 429
+        if (error.response?.statusCode === 429) {
+          const retryAfter = error.response?.parameters?.retry_after || 1;
+          logger.warn(`Telegram rate limit (direct), waiting ${retryAfter}s`);
+          await this.sleep(retryAfter * 1000);
+          continue;
+        }
+
+        logger.warn(`Direct send attempt ${attempt} failed:`, error.message);
         
         if (attempt === MAX_RETRIES) {
           logger.error('Failed to send message after max retries:', error);
           throw error;
         }
         
-        // Exponential backoff
         await this.sleep(RETRY_DELAY_MS * attempt);
       }
     }
   }
 
   /**
-   * Send message (legacy, for compatibility)
+   * Legacy method for backward compatibility
    */
-  async sendMessage(telegramId: number, text: string, options?: any): Promise<void> {
-    await this.sendMessageWithRetry(telegramId, text, options);
+  async sendMessageWithRetry(
+    telegramId: number,
+    text: string,
+    options?: any
+  ): Promise<void> {
+    await this.sendMessage(telegramId, text, options);
   }
 
   /**
@@ -682,9 +899,18 @@ class TelegramService {
   }
 
   /**
-   * Shutdown bot
+   * Shutdown bot and queue
    */
   async shutdown(): Promise<void> {
+    if (this.messageQueue) {
+      try {
+        await this.messageQueue.close();
+        logger.info('Telegram message queue closed');
+      } catch (error) {
+        logger.warn('Error closing message queue:', error);
+      }
+    }
+
     if (this.bot) {
       try {
         await this.bot.stopPolling();
