@@ -3,6 +3,7 @@ import { db } from '../db';
 import { AppError } from '../middleware/errorHandler';
 import { logger } from '../utils/logger';
 import { CONSTANTS } from '../config/constants';
+import { ResidentService } from './resident.service';
 
 interface Invite {
   id: string;
@@ -36,18 +37,11 @@ interface InviteDetails extends Invite {
 }
 
 export class InviteService {
-  /**
-   * Generate secure invite token
-   */
   private static generateToken(): string {
     return randomBytes(32).toString('hex');
   }
 
-  /**
-   * Create invite for a unit
-   */
   static async createInvite(data: CreateInviteData): Promise<Invite> {
-    // Verify unit exists
     const unitCheck = await db.query(
       'SELECT id, condo_id FROM units WHERE id = $1 AND deleted_at IS NULL',
       [data.unit_id]
@@ -57,7 +51,6 @@ export class InviteService {
       throw new AppError('Unit not found', 404);
     }
 
-    // Generate unique token
     let token: string;
     let isUnique = false;
     let attempts = 0;
@@ -76,12 +69,10 @@ export class InviteService {
       throw new AppError('Failed to generate unique token', 500);
     }
 
-    // Calculate expiration
     const ttlDays = data.ttl_days || CONSTANTS.INVITE_DEFAULT_TTL_DAYS;
     const expiresAt = new Date();
     expiresAt.setDate(expiresAt.getDate() + ttlDays);
 
-    // Create invite
     const result = await db.query(
       `INSERT INTO invites (unit_id, token, email, phone, expires_at, max_uses, created_by)
        VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -106,9 +97,6 @@ export class InviteService {
     return result.rows[0];
   }
 
-  /**
-   * Get invite by ID
-   */
   static async getInviteById(inviteId: string): Promise<Invite | null> {
     const result = await db.query(
       'SELECT * FROM invites WHERE id = $1 AND deleted_at IS NULL',
@@ -118,9 +106,6 @@ export class InviteService {
     return result.rows.length > 0 ? result.rows[0] : null;
   }
 
-  /**
-   * Get invite by token with full details
-   */
   static async getInviteByToken(token: string): Promise<InviteDetails | null> {
     const result = await db.query(
       `SELECT 
@@ -146,9 +131,6 @@ export class InviteService {
     return result.rows.length > 0 ? result.rows[0] : null;
   }
 
-  /**
-   * List invites for a unit
-   */
   static async listInvitesByUnit(
     unitId: string,
     includeExpired: boolean = false
@@ -170,9 +152,6 @@ export class InviteService {
     return result.rows;
   }
 
-  /**
-   * Validate invite token
-   */
   static async validateInvite(token: string): Promise<{
     valid: boolean;
     reason?: string;
@@ -200,47 +179,96 @@ export class InviteService {
   }
 
   /**
-   * Use invite (increment usage counter)
+   * Accept invite with transaction to prevent race conditions (fixes CRIT-001)
    */
-  static async useInvite(token: string): Promise<void> {
-    const result = await db.query(
-      `UPDATE invites
-       SET used_count = used_count + 1
-       WHERE token = $1 
-         AND deleted_at IS NULL
-         AND is_active = true
-         AND expires_at > NOW()
-         AND (max_uses IS NULL OR used_count < max_uses)
-       RETURNING id, used_count, max_uses`,
-      [token]
-    );
+  static async acceptInvite(token: string, userId: string): Promise<any> {
+    return await db.transaction(async (client) => {
+      // Lock invite row for update
+      const inviteResult = await client.query(
+        `SELECT i.*, u.number as unit_number, ut.name as unit_type,
+                c.name as condo_name, c.address as condo_address
+         FROM invites i
+         INNER JOIN units u ON u.id = i.unit_id
+         INNER JOIN unit_types ut ON ut.id = u.unit_type_id
+         INNER JOIN condos c ON c.id = u.condo_id
+         WHERE i.token = $1 AND i.deleted_at IS NULL
+         FOR UPDATE`,  // Row lock!
+        [token]
+      );
 
-    if (result.rows.length === 0) {
-      throw new AppError('Invite is not valid or has been exhausted', 400);
-    }
+      if (inviteResult.rows.length === 0) {
+        throw new AppError('Invite not found', 404);
+      }
 
-    const invite = result.rows[0];
+      const invite = inviteResult.rows[0];
 
-    // Auto-deactivate if reached max uses
-    if (invite.max_uses !== null && invite.used_count >= invite.max_uses) {
-      await db.query(
-        'UPDATE invites SET is_active = false WHERE id = $1',
+      // Validate inside transaction
+      if (!invite.is_active) {
+        throw new AppError('Invite is no longer active', 400);
+      }
+
+      if (new Date(invite.expires_at) < new Date()) {
+        throw new AppError('Invite has expired', 400);
+      }
+
+      if (invite.max_uses !== null && invite.used_count >= invite.max_uses) {
+        throw new AppError('Invite has reached maximum uses', 400);
+      }
+
+      // Create resident (with its own checks)
+      const resident = await ResidentService.createResidentInTransaction(
+        {
+          user_id: userId,
+          unit_id: invite.unit_id,
+          is_owner: false,
+        },
+        client
+      );
+
+      // Increment usage counter
+      const updateResult = await client.query(
+        `UPDATE invites
+         SET used_count = used_count + 1
+         WHERE id = $1
+         RETURNING used_count, max_uses`,
         [invite.id]
       );
 
-      logger.info('Invite auto-deactivated (max uses reached)', {
-        inviteId: invite.id,
-        usedCount: invite.used_count,
-        maxUses: invite.max_uses,
-      });
-    }
+      const { used_count, max_uses } = updateResult.rows[0];
 
-    logger.info('Invite used', { inviteId: invite.id, usedCount: invite.used_count });
+      // Auto-deactivate if reached max uses
+      if (max_uses !== null && used_count >= max_uses) {
+        await client.query(
+          'UPDATE invites SET is_active = false WHERE id = $1',
+          [invite.id]
+        );
+
+        logger.info('Invite auto-deactivated (max uses reached)', {
+          inviteId: invite.id,
+          usedCount: used_count,
+          maxUses: max_uses,
+        });
+      }
+
+      logger.info('Invite accepted', {
+        inviteId: invite.id,
+        userId,
+        usedCount: used_count,
+      });
+
+      return {
+        message: 'Invite accepted successfully',
+        resident,
+        unit: {
+          number: invite.unit_number,
+          type: invite.unit_type,
+          condo: invite.condo_name,
+          address: invite.condo_address,
+        },
+      };
+    });
   }
 
-  /**
-   * Deactivate invite
-   */
   static async deactivateInvite(inviteId: string): Promise<void> {
     const result = await db.query(
       'UPDATE invites SET is_active = false WHERE id = $1 AND deleted_at IS NULL',
@@ -254,9 +282,6 @@ export class InviteService {
     logger.info('Invite deactivated', { inviteId });
   }
 
-  /**
-   * Delete invite (soft delete)
-   */
   static async deleteInvite(inviteId: string): Promise<void> {
     const result = await db.query(
       'UPDATE invites SET deleted_at = NOW() WHERE id = $1 AND deleted_at IS NULL',
@@ -270,9 +295,6 @@ export class InviteService {
     logger.info('Invite deleted', { inviteId });
   }
 
-  /**
-   * Get invite statistics for a unit
-   */
   static async getInviteStats(unitId: string): Promise<{
     total: number;
     active: number;
