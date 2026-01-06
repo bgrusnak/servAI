@@ -1,0 +1,39 @@
+{
+  "name": "servai-frontend",
+  "version": "1.0.0",
+  "description": "ServAI Admin Panel - Vue3 + Quasar",
+  "productName": "ServAI",
+  "author": "ServAI Team",
+  "private": true,
+  "scripts": {
+    "dev": "quasar dev",
+    "build": "quasar build",
+    "lint": "eslint --ext .js,.vue src",
+    "format": "prettier --write \"**/*.{js,vue,scss,html,md,json}\" --ignore-path .gitignore",
+    "test": "echo \"No test specified\" && exit 0"
+  },
+  "dependencies": {
+    "@quasar/extras": "^1.16.9",
+    "axios": "^1.6.5",
+    "pinia": "^2.1.7",
+    "quasar": "^2.14.2",
+    "vue": "^3.4.15",
+    "vue-i18n": "^9.9.0",
+    "vue-router": "^4.2.5"
+  },
+  "devDependencies": {
+    "@intlify/unplugin-vue-i18n": "^2.0.0",
+    "@quasar/app-vite": "^1.7.3",
+    "@vue/eslint-config-prettier": "^9.0.0",
+    "autoprefixer": "^10.4.16",
+    "eslint": "^8.56.0",
+    "eslint-plugin-vue": "^9.19.2",
+    "prettier": "^3.2.4",
+    "vite": "^5.0.11"
+  },
+  "engines": {
+    "node": "^20 || ^18",
+    "npm": ">= 8.0.0",
+    "yarn": ">= 1.21.1"
+  }
+}
