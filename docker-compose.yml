@@ -1,38 +1,43 @@
 version: '3.8'
 
 services:
+  # PostgreSQL Database
   postgres:
-    image: postgres:15-alpine
+    image: postgres:16-alpine
     container_name: servai-postgres
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-servai}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-servai_dev_pass}
       POSTGRES_DB: ${POSTGRES_DB:-servai}
-    ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      POSTGRES_USER: ${POSTGRES_USER:-servai}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-servai_password}
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - servai-network
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-servai}"]
       interval: 10s
       timeout: 5s
       retries: 5
-    restart: unless-stopped
 
+  # Redis for caching and sessions
   redis:
     image: redis:7-alpine
     container_name: servai-redis
     ports:
-      - "${REDIS_PORT:-6379}:6379"
+      - "6379:6379"
     volumes:
       - redis_data:/data
+    networks:
+      - servai-network
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
-    restart: unless-stopped
 
+  # Backend API
   backend:
     build:
       context: ./backend
@@ -40,66 +45,70 @@ services:
     container_name: servai-backend
     environment:
       NODE_ENV: ${NODE_ENV:-development}
-      PORT: ${BACKEND_PORT:-3000}
-      DATABASE_URL: postgresql://${POSTGRES_USER:-servai}:${POSTGRES_PASSWORD:-servai_dev_pass}@postgres:5432/${POSTGRES_DB:-servai}
-      REDIS_URL: redis://redis:6379
-      JWT_SECRET: ${JWT_SECRET:-dev_jwt_secret_change_in_production}
-      JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-7d}
+      PORT: 3000
+      DATABASE_URL: postgresql://${POSTGRES_USER:-servai}:${POSTGRES_PASSWORD:-servai_password}@postgres:5432/${POSTGRES_DB:-servai}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      JWT_SECRET: ${JWT_SECRET:-your_jwt_secret_key_change_in_production}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      PERPLEXITY_API_KEY: ${PERPLEXITY_API_KEY}
       STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY}
       STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET}
-      PERPLEXITY_API_KEY: ${PERPLEXITY_API_KEY}
-      SONAR_MODEL: ${SONAR_MODEL:-llama-3.1-sonar-small-128k-online}
-      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
+    volumes:
+      - ./backend:/app
+      - /app/node_modules
+      - uploads:/app/uploads
     ports:
-      - "${BACKEND_PORT:-3000}:3000"
+      - "3000:3000"
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
-    volumes:
-      - ./backend:/app
-      - /app/node_modules
-      - backend_logs:/app/logs
-    healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
-    restart: unless-stopped
+    networks:
+      - servai-network
     command: npm run dev
 
-  worker:
+  # Frontend
+  frontend:
     build:
-      context: ./backend
+      context: ./frontend
       dockerfile: Dockerfile
-    container_name: servai-worker
+      target: build-stage
+    container_name: servai-frontend
     environment:
-      NODE_ENV: ${NODE_ENV:-development}
-      DATABASE_URL: postgresql://${POSTGRES_USER:-servai}:${POSTGRES_PASSWORD:-servai_dev_pass}@postgres:5432/${POSTGRES_DB:-servai}
-      REDIS_URL: redis://redis:6379
-      PERPLEXITY_API_KEY: ${PERPLEXITY_API_KEY}
-      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
-      SONAR_MODEL: ${SONAR_MODEL:-llama-3.1-sonar-small-128k-online}
-      JWT_SECRET: ${JWT_SECRET:-dev_jwt_secret_change_in_production}
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      backend:
-        condition: service_healthy
+      VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:3000/api/v1}
     volumes:
-      - ./backend:/app
+      - ./frontend:/app
       - /app/node_modules
-      - worker_logs:/app/logs
-    restart: unless-stopped
-    command: npm run worker
+      - /app/.quasar
+    ports:
+      - "9000:9000"
+    networks:
+      - servai-network
+    command: npm run dev
+
+  # Nginx Reverse Proxy (Production)
+  nginx:
+    image: nginx:alpine
+    container_name: servai-nginx
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - backend
+      - frontend
+    networks:
+      - servai-network
+    profiles:
+      - production
 
 volumes:
   postgres_data:
   redis_data:
-  backend_logs:
-  worker_logs:
+  uploads:
+
+networks:
+  servai-network:
+    driver: bridge
