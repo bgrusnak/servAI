@@ -15,8 +15,13 @@ if (missingEnvVars.length > 0 && process.env.NODE_ENV === 'production') {
   throw new Error(`Missing required environment variables: ${missingEnvVars.join(', ')}`);
 }
 
-if (process.env.JWT_SECRET === 'dev_jwt_secret' && process.env.NODE_ENV === 'production') {
-  throw new Error('JWT_SECRET must be changed from default value in production!');
+// FIX NEW-004: Require strong JWT secret even in dev
+if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
+  throw new Error('JWT_SECRET must be at least 32 characters long! Generate with: openssl rand -base64 32');
+}
+
+if (process.env.JWT_SECRET === 'dev_jwt_secret_CHANGE_THIS') {
+  throw new Error('JWT_SECRET must be changed from default value!');
 }
 
 export const config = {
@@ -38,7 +43,7 @@ export const config = {
   },
   
   jwt: {
-    secret: process.env.JWT_SECRET || 'dev_jwt_secret_CHANGE_THIS',
+    secret: process.env.JWT_SECRET!,  // Validated above
     expiresIn: process.env.JWT_EXPIRES_IN || '7d',
   },
   

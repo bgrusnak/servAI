@@ -14,23 +14,23 @@ import { apiRouter } from './routes';
 
 const app: Application = express();
 
-// Request ID middleware (MED-003 FIX)
+// Request ID middleware
 app.use((req: any, res, next) => {
   req.id = req.headers['x-request-id'] || uuidv4();
   res.setHeader('x-request-id', req.id);
   next();
 });
 
-// CORS - proper configuration (MED-002 FIX)
+// CORS - proper configuration
 const corsOptions = {
   origin: config.env === 'production'
     ? (process.env.ALLOWED_ORIGINS || '').split(',').filter(Boolean)
-    : ['http://localhost:3000', 'http://localhost:5173', 'http://127.0.0.1:3000'],  // Whitelist for dev
+    : ['http://localhost:3000', 'http://localhost:5173', 'http://127.0.0.1:3000'],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Request-ID', 'X-Context'],
   exposedHeaders: ['X-Request-ID', 'X-RateLimit-Limit', 'X-RateLimit-Remaining'],
-  maxAge: 86400, // 24 hours
+  maxAge: 86400,
 };
 
 // Security headers
@@ -52,37 +52,32 @@ app.use(helmet({
 
 app.use(cors(corsOptions));
 
-// Body parsing
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+// Body parsing - FIX NEW-009: Reduced from 10MB to 1MB for API requests
+app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 
-// Rate limiter BEFORE logger (don't log spam)
+// Rate limiter BEFORE logger
 app.use(rateLimiter);
 
 // Then logging
 app.use(requestLogger);
 
-// Health check - simple liveness probe
+// Health check
 app.get('/health', async (req, res) => {
   res.status(200).json({
     status: 'healthy',
     timestamp: new Date().toISOString(),
-    version: '0.3.0',
+    version: '0.3.1',
     environment: config.env,
   });
 });
 
-// Readiness check - comprehensive check of all dependencies
+// Readiness check
 app.get('/ready', async (req, res) => {
   try {
     const checks = await Promise.all([
-      // Database
       db.healthCheck().then(result => ({ name: 'database', healthy: result })),
-      
-      // Redis
       redis.healthCheck().then(result => ({ name: 'redis', healthy: result })),
-      
-      // Migrations
       db.query("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'migrations')")
         .then(result => ({ name: 'migrations', healthy: result.rows[0]?.exists || false })),
     ]);
@@ -107,86 +102,19 @@ app.get('/ready', async (req, res) => {
   }
 });
 
-// Integration health checks (for monitoring)
-app.get('/health/integrations', async (req, res) => {
-  const checks: Record<string, { healthy: boolean; message?: string }> = {};
-  
-  // Telegram Bot API (optional - only if token is configured)
-  if (config.telegram.botToken) {
-    try {
-      const axios = require('axios');
-      const response = await axios.get(
-        `https://api.telegram.org/bot${config.telegram.botToken}/getMe`,
-        { timeout: 5000 }
-      );
-      checks.telegram = { healthy: response.data.ok };
-    } catch (error) {
-      checks.telegram = { healthy: false, message: 'Connection failed' };
-    }
-  }
-  
-  // Perplexity API (optional - only if key is configured)
-  if (config.perplexity.apiKey) {
-    try {
-      const axios = require('axios');
-      await axios.post(
-        'https://api.perplexity.ai/chat/completions',
-        { model: config.perplexity.model, messages: [{ role: 'user', content: 'test' }] },
-        { 
-          headers: { 'Authorization': `Bearer ${config.perplexity.apiKey}` },
-          timeout: 5000 
-        }
-      );
-      checks.perplexity = { healthy: true };
-    } catch (error: any) {
-      // 401/403 means API key is invalid, but service is up
-      checks.perplexity = { 
-        healthy: error.response?.status === 401 || error.response?.status === 403,
-        message: error.response?.status ? `HTTP ${error.response.status}` : 'Connection failed'
-      };
-    }
-  }
-  
-  // Stripe API (optional - only if key is configured)
-  if (config.stripe.secretKey) {
-    try {
-      const axios = require('axios');
-      await axios.get('https://api.stripe.com/v1/balance', {
-        headers: { 'Authorization': `Bearer ${config.stripe.secretKey}` },
-        timeout: 5000
-      });
-      checks.stripe = { healthy: true };
-    } catch (error: any) {
-      checks.stripe = { 
-        healthy: error.response?.status === 401,
-        message: error.response?.status ? `HTTP ${error.response.status}` : 'Connection failed'
-      };
-    }
-  }
-  
-  const allHealthy = Object.values(checks).every(c => c.healthy);
-  
-  res.status(allHealthy ? 200 : 503).json({
-    status: allHealthy ? 'healthy' : 'degraded',
-    timestamp: new Date().toISOString(),
-    integrations: checks,
-  });
-});
-
-// API routes with versioning (MED-001 FIX)
+// API routes with versioning
 app.use('/api/v1', apiRouter);
 
-// Redirect /api to /api/v1 for backward compatibility
+// Redirect /api to /api/v1
 app.use('/api', (req, res, next) => {
   if (req.path === '/' || req.path === '') {
     return res.status(200).json({
       message: 'servAI API',
-      version: '0.3.0',
+      version: '0.3.1',
       availableVersions: ['v1'],
       documentation: '/api/v1/docs',
     });
   }
-  // Redirect other /api/* to /api/v1/*
   req.url = `/v1${req.url}`;
   apiRouter(req, res, next);
 });
@@ -200,7 +128,7 @@ app.use((req, res) => {
   });
 });
 
-// Error handler (must be last)
+// Error handler
 app.use(errorHandler);
 
 // Graceful shutdown
@@ -220,10 +148,8 @@ const shutdown = async () => {
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
-// Unhandled rejection handler
 process.on('unhandledRejection', (reason: any) => {
   logger.error('Unhandled Promise Rejection', { reason });
-  // Don't exit in production, but log for monitoring
   if (config.env === 'development') {
     process.exit(1);
   }
@@ -231,35 +157,27 @@ process.on('unhandledRejection', (reason: any) => {
 
 process.on('uncaughtException', (error: Error) => {
   logger.error('Uncaught Exception', { error });
-  // Always exit on uncaught exception
   process.exit(1);
 });
 
-// Initialize and start
 async function start() {
   try {
     logger.info('Starting servAI backend...');
     
-    // Run migrations automatically
     logger.info('Running database migrations...');
     await runMigrations();
     logger.info('Database migrations completed');
     
-    // Start server
     const PORT = config.port;
     app.listen(PORT, () => {
-      logger.info(`servAI backend v0.3.0 started on port ${PORT}`);
+      logger.info(`servAI backend v0.3.1 started on port ${PORT}`);
       logger.info(`Environment: ${config.env}`);
-      logger.info(`Health check: http://localhost:${PORT}/health`);
-      logger.info(`Ready check: http://localhost:${PORT}/ready`);
       logger.info(`API v1: http://localhost:${PORT}/api/v1`);
-      logger.info(`Integrations check: http://localhost:${PORT}/health/integrations`);
       
       if (config.env === 'production') {
         logger.info('🚀 Production mode enabled');
-        logger.info('⚠️  Ensure ALLOWED_ORIGINS is configured');
       } else {
-        logger.warn('⚠️  Development mode - CORS allows localhost origins only');
+        logger.warn('⚠️  Development mode');
       }
     });
   } catch (error) {

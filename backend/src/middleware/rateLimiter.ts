@@ -10,11 +10,65 @@ interface RateLimitOptions {
   blockDuration?: number; // How long to block after limit (seconds)
 }
 
+// In-memory fallback for when Redis is down
+const fallbackStore = new Map<string, { count: number; resetAt: number }>();
+
+function cleanupFallbackStore() {
+  const now = Date.now();
+  for (const [key, value] of fallbackStore.entries()) {
+    if (value.resetAt < now) {
+      fallbackStore.delete(key);
+    }
+  }
+}
+
+// Cleanup every minute
+setInterval(cleanupFallbackStore, 60000);
+
+function fallbackRateLimit(
+  identifier: string,
+  points: number,
+  duration: number
+): { allowed: boolean; remaining: number; resetAt: number } {
+  const now = Date.now();
+  const key = identifier;
+  const entry = fallbackStore.get(key);
+
+  if (!entry || entry.resetAt < now) {
+    // Create new entry
+    fallbackStore.set(key, {
+      count: 1,
+      resetAt: now + duration * 1000,
+    });
+    return {
+      allowed: true,
+      remaining: points - 1,
+      resetAt: now + duration * 1000,
+    };
+  }
+
+  // Increment existing entry
+  if (entry.count >= points) {
+    return {
+      allowed: false,
+      remaining: 0,
+      resetAt: entry.resetAt,
+    };
+  }
+
+  entry.count++;
+  return {
+    allowed: true,
+    remaining: points - entry.count,
+    resetAt: entry.resetAt,
+  };
+}
+
 /**
- * Rate limiter middleware using Redis
- * Can be applied globally or per-route
+ * Rate limiter middleware using Redis with in-memory fallback
+ * FIX NEW-001: Now fails safe instead of failing open
  */
-export function rateLimiter(options: RateLimitOptions) {
+export function rateLimit(options: RateLimitOptions) {
   const {
     points,
     duration,
@@ -23,12 +77,11 @@ export function rateLimiter(options: RateLimitOptions) {
   } = options;
 
   return async (req: Request, res: Response, next: NextFunction) => {
-    try {
-      // Use IP as identifier (could also use user ID if authenticated)
-      const identifier = req.ip || req.socket.remoteAddress || 'unknown';
-      const key = `${keyPrefix}:${identifier}`;
+    const identifier = req.ip || req.socket.remoteAddress || 'unknown';
+    const key = `${keyPrefix}:${identifier}`;
 
-      // Get current count
+    try {
+      // Try Redis first
       const current = await redis.get(key);
       const count = current ? parseInt(current) : 0;
 
@@ -49,7 +102,6 @@ export function rateLimiter(options: RateLimitOptions) {
 
       // Check if limit exceeded
       if (count >= points) {
-        // Set block
         await redis.set(blockKey, '1', blockDuration);
         
         logger.warn('Rate limit exceeded', {
@@ -81,12 +133,32 @@ export function rateLimiter(options: RateLimitOptions) {
       next();
     } catch (error) {
       if (error instanceof AppError) {
-        next(error);
-      } else {
-        logger.error('Rate limiter error', { error });
-        // If Redis fails, allow request through (fail open)
-        next();
+        return next(error);
       }
+
+      // Redis error - use in-memory fallback (FIX NEW-001)
+      logger.error('Rate limiter Redis error - using fallback', { error, identifier });
+      
+      const result = fallbackRateLimit(identifier, points, duration);
+      
+      if (!result.allowed) {
+        res.set('X-RateLimit-Limit', String(points));
+        res.set('X-RateLimit-Remaining', '0');
+        res.set('X-RateLimit-Reset', String(result.resetAt));
+        
+        return next(
+          new AppError(
+            `Rate limit exceeded (fallback mode). Maximum ${points} requests per ${duration} seconds.`,
+            429
+          )
+        );
+      }
+
+      res.set('X-RateLimit-Limit', String(points));
+      res.set('X-RateLimit-Remaining', String(result.remaining));
+      res.set('X-RateLimit-Reset', String(result.resetAt));
+      
+      next();
     }
   };
 }
@@ -94,7 +166,7 @@ export function rateLimiter(options: RateLimitOptions) {
 /**
  * Global rate limiter (all API endpoints)
  */
-export const globalRateLimiter = rateLimiter({
+export const globalRateLimiter = rateLimit({
   points: 100,    // 100 requests
   duration: 60,   // per minute
   keyPrefix: 'global',
@@ -103,7 +175,7 @@ export const globalRateLimiter = rateLimiter({
 /**
  * Auth rate limiter (login, register, etc.)
  */
-export const authRateLimiter = rateLimiter({
+export const authRateLimiter = rateLimit({
   points: 5,      // 5 attempts
   duration: 900,  // per 15 minutes
   blockDuration: 3600, // Block for 1 hour

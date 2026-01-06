@@ -36,6 +36,14 @@ interface InviteDetails extends Invite {
   company_name: string;
 }
 
+interface PaginatedInvites {
+  data: Invite[];
+  total: number;
+  page: number;
+  limit: number;
+  totalPages: number;
+}
+
 export class InviteService {
   /**
    * Generate secure invite token
@@ -46,6 +54,7 @@ export class InviteService {
 
   /**
    * Create invite for a unit
+   * FIX NEW-005: Optimized token generation (no retry loop)
    */
   static async createInvite(data: CreateInviteData): Promise<Invite> {
     // Verify unit exists
@@ -58,53 +67,53 @@ export class InviteService {
       throw new AppError('Unit not found', 404);
     }
 
-    // Generate unique token
-    let token: string;
-    let isUnique = false;
-    let attempts = 0;
-
-    while (!isUnique && attempts < 10) {
-      token = this.generateToken();
-      const existing = await db.query(
-        'SELECT id FROM invites WHERE token = $1 AND deleted_at IS NULL',
-        [token]
-      );
-      isUnique = existing.rows.length === 0;
-      attempts++;
-    }
-
-    if (!isUnique) {
-      throw new AppError('Failed to generate unique token', 500);
-    }
-
     // Calculate expiration
     const ttlDays = data.ttl_days || CONSTANTS.INVITE_DEFAULT_TTL_DAYS;
     const expiresAt = new Date();
     expiresAt.setDate(expiresAt.getDate() + ttlDays);
 
-    // Create invite
-    const result = await db.query(
-      `INSERT INTO invites (unit_id, token, email, phone, expires_at, max_uses, created_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-       RETURNING *`,
-      [
-        data.unit_id,
-        token!,
-        data.email,
-        data.phone,
-        expiresAt,
-        data.max_uses || CONSTANTS.INVITE_MAX_USES_DEFAULT,
-        data.created_by,
-      ]
-    );
+    // Generate token - collision is astronomically unlikely (2^256)
+    const token = this.generateToken();
 
-    logger.info('Invite created', {
-      inviteId: result.rows[0].id,
-      unitId: data.unit_id,
-      createdBy: data.created_by,
-    });
+    try {
+      // Try to insert
+      const result = await db.query(
+        `INSERT INTO invites (unit_id, token, email, phone, expires_at, max_uses, created_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         RETURNING *`,
+        [
+          data.unit_id,
+          token,
+          data.email,
+          data.phone,
+          expiresAt,
+          data.max_uses || CONSTANTS.INVITE_MAX_USES_DEFAULT,
+          data.created_by,
+        ]
+      );
 
-    return result.rows[0];
+      logger.info('Invite created', {
+        inviteId: result.rows[0].id,
+        unitId: data.unit_id,
+      });
+
+      return result.rows[0];
+    } catch (error: any) {
+      // Handle the astronomically unlikely case of collision
+      if (error.code === '23505' && error.constraint === 'invites_token_key') {
+        logger.error('Token collision detected (extremely rare!)', { token });
+        // Retry once with new token
+        const newToken = this.generateToken();
+        const result = await db.query(
+          `INSERT INTO invites (unit_id, token, email, phone, expires_at, max_uses, created_by)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)
+           RETURNING *`,
+          [data.unit_id, newToken, data.email, data.phone, expiresAt, data.max_uses, data.created_by]
+        );
+        return result.rows[0];
+      }
+      throw error;
+    }
   }
 
   /**
@@ -148,27 +157,44 @@ export class InviteService {
   }
 
   /**
-   * List invites for a unit
+   * List invites for a unit with pagination (FIX NEW-006)
    */
   static async listInvitesByUnit(
     unitId: string,
+    page: number = 1,
+    limit: number = 20,
     includeExpired: boolean = false
-  ): Promise<Invite[]> {
-    let query = `
-      SELECT *
-      FROM invites
-      WHERE unit_id = $1 AND deleted_at IS NULL
-    `;
+  ): Promise<PaginatedInvites> {
+    // Validate pagination params
+    const validPage = Math.max(1, page);
+    const validLimit = Math.min(Math.max(1, limit), 100);
+    const offset = (validPage - 1) * validLimit;
 
+    // Count total
+    let countQuery = 'SELECT COUNT(*) as total FROM invites WHERE unit_id = $1 AND deleted_at IS NULL';
+    if (!includeExpired) {
+      countQuery += ' AND is_active = true AND expires_at > NOW()';
+    }
+
+    const countResult = await db.query(countQuery, [unitId]);
+    const total = parseInt(countResult.rows[0].total);
+
+    // Get paginated data
+    let query = 'SELECT * FROM invites WHERE unit_id = $1 AND deleted_at IS NULL';
     if (!includeExpired) {
       query += ' AND is_active = true AND expires_at > NOW()';
     }
+    query += ' ORDER BY created_at DESC LIMIT $2 OFFSET $3';
 
-    query += ' ORDER BY created_at DESC';
+    const result = await db.query(query, [unitId, validLimit, offset]);
 
-    const result = await db.query(query, [unitId]);
-
-    return result.rows;
+    return {
+      data: result.rows,
+      total,
+      page: validPage,
+      limit: validLimit,
+      totalPages: Math.ceil(total / validLimit),
+    };
   }
 
   /**
@@ -227,7 +253,7 @@ export class InviteService {
           AND u.deleted_at IS NULL
           AND c.deleted_at IS NULL
           AND co.deleted_at IS NULL
-        FOR UPDATE OF i`,  // <-- Row-level lock on invite
+        FOR UPDATE OF i`,
         [token]
       );
 
@@ -287,7 +313,6 @@ export class InviteService {
 
       logger.info('Invite accepted', {
         inviteId: invite.id,
-        userId,
         residentId: resident.id,
         usedCount: used_count,
       });
