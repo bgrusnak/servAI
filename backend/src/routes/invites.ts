@@ -5,24 +5,24 @@ import { ResidentService } from '../services/resident.service';
 import { CondoService } from '../services/condo.service';
 import { UnitService } from '../services/unit.service';
 import { AppError } from '../middleware/errorHandler';
-import { rateLimiter } from '../middleware/rateLimiter';
+import { rateLimit } from '../middleware/rateLimiter';
 import { z } from 'zod';
 
 const invitesRouter = Router();
 
 // Validation schemas
 const CreateInviteSchema = z.object({
-  unit_id: z.string().uuid(),
-  email: z.string().email().optional(),
-  phone: z.string().regex(/^\+?[1-9]\d{1,14}$/).optional(),
+  unit_id: z.string().uuid('Invalid unit_id format'),
+  email: z.string().email('Invalid email format').optional(),
+  phone: z.string().regex(/^\+?[1-9]\d{1,14}$/, 'Invalid phone format').optional(),
   ttl_days: z.number().int().min(1).max(365).optional(),
   max_uses: z.number().int().min(1).optional(),
 });
 
-// Public: Validate invite token (rate limited)
+// Public: Validate invite token (with rate limiting)
 invitesRouter.get(
   '/validate/:token',
-  rateLimiter({ points: 10, duration: 60 }), // 10 req/min per IP
+  rateLimit({ points: 10, duration: 60 }), // 10 requests per minute per IP
   async (req, res: Response, next: NextFunction) => {
     try {
       const validation = await InviteService.validateInvite(req.params.token);
@@ -33,10 +33,10 @@ invitesRouter.get(
   }
 );
 
-// Public: Accept invite (rate limited + auth required)
+// Public: Accept invite (with rate limiting and transaction)
 invitesRouter.post(
   '/accept/:token',
-  rateLimiter({ points: 5, duration: 300 }), // 5 accepts per 5 min per IP
+  rateLimit({ points: 5, duration: 300 }), // 5 accepts per 5 minutes per IP
   authenticate,
   async (req: AuthRequest, res: Response, next: NextFunction) => {
     try {
@@ -44,10 +44,14 @@ invitesRouter.post(
         throw new AppError('Authentication required', 401);
       }
 
-      // Accept invite with transaction (fixes CRIT-001)
+      // Accept invite atomically (fixes CRIT-001)
       const result = await InviteService.acceptInvite(req.params.token, req.user.id);
 
-      res.status(201).json(result);
+      res.status(201).json({
+        message: 'Invite accepted successfully',
+        resident: result.resident,
+        unit: result.unit,
+      });
     } catch (error) {
       next(error);
     }
@@ -65,6 +69,7 @@ invitesRouter.post('/', async (req: AuthRequest, res: Response, next: NextFuncti
 
     // Get unit to check access
     const unit = await UnitService.getUnitById(data.unit_id);
+
     if (!unit) {
       throw new AppError('Unit not found', 404);
     }
@@ -81,14 +86,18 @@ invitesRouter.post('/', async (req: AuthRequest, res: Response, next: NextFuncti
     }
 
     const invite = await InviteService.createInvite({
-      ...data,
+      unit_id: data.unit_id,
+      email: data.email,
+      phone: data.phone,
+      ttl_days: data.ttl_days,
+      max_uses: data.max_uses,
       created_by: req.user!.id,
     });
 
     res.status(201).json(invite);
   } catch (error) {
     if (error instanceof z.ZodError) {
-      return next(new AppError(`Validation error: ${error.errors.map(e => e.message).join(', ')}`, 400));
+      return next(new AppError(error.errors[0].message, 400));
     }
     next(error);
   }
@@ -98,10 +107,12 @@ invitesRouter.post('/', async (req: AuthRequest, res: Response, next: NextFuncti
 invitesRouter.get('/unit/:unitId', async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     const unit = await UnitService.getUnitById(req.params.unitId);
+
     if (!unit) {
       throw new AppError('Unit not found', 404);
     }
 
+    // Check access
     const hasAccess = await CondoService.checkUserAccess(
       unit.condo_id,
       req.user!.id,
@@ -125,10 +136,12 @@ invitesRouter.get('/unit/:unitId', async (req: AuthRequest, res: Response, next:
 invitesRouter.get('/unit/:unitId/stats', async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     const unit = await UnitService.getUnitById(req.params.unitId);
+
     if (!unit) {
       throw new AppError('Unit not found', 404);
     }
 
+    // Check access
     const hasAccess = await CondoService.checkUserAccess(
       unit.condo_id,
       req.user!.id,
@@ -140,6 +153,7 @@ invitesRouter.get('/unit/:unitId/stats', async (req: AuthRequest, res: Response,
     }
 
     const stats = await InviteService.getInviteStats(req.params.unitId);
+
     res.json(stats);
   } catch (error) {
     next(error);
@@ -150,6 +164,7 @@ invitesRouter.get('/unit/:unitId/stats', async (req: AuthRequest, res: Response,
 invitesRouter.get('/:id', async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     const invite = await InviteService.getInviteById(req.params.id);
+
     if (!invite) {
       throw new AppError('Invite not found', 404);
     }
@@ -159,6 +174,7 @@ invitesRouter.get('/:id', async (req: AuthRequest, res: Response, next: NextFunc
       throw new AppError('Unit not found', 404);
     }
 
+    // Check access
     const hasAccess = await CondoService.checkUserAccess(
       unit.condo_id,
       req.user!.id,
@@ -179,6 +195,7 @@ invitesRouter.get('/:id', async (req: AuthRequest, res: Response, next: NextFunc
 invitesRouter.post('/:id/deactivate', async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     const invite = await InviteService.getInviteById(req.params.id);
+
     if (!invite) {
       throw new AppError('Invite not found', 404);
     }
@@ -199,6 +216,7 @@ invitesRouter.post('/:id/deactivate', async (req: AuthRequest, res: Response, ne
     }
 
     await InviteService.deactivateInvite(req.params.id);
+
     res.json({ message: 'Invite deactivated successfully' });
   } catch (error) {
     next(error);
@@ -209,6 +227,7 @@ invitesRouter.post('/:id/deactivate', async (req: AuthRequest, res: Response, ne
 invitesRouter.delete('/:id', async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     const invite = await InviteService.getInviteById(req.params.id);
+
     if (!invite) {
       throw new AppError('Invite not found', 404);
     }
@@ -229,6 +248,7 @@ invitesRouter.delete('/:id', async (req: AuthRequest, res: Response, next: NextF
     }
 
     await InviteService.deleteInvite(req.params.id);
+
     res.json({ message: 'Invite deleted successfully' });
   } catch (error) {
     next(error);
