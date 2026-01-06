@@ -1,0 +1,12 @@
+<template>
+  <q-page padding>
+    <div class="q-pa-md">
+      <h5 class="q-my-none q-mb-md">{{ $t('nav.units') }}</h5>
+      <q-card><q-card-section><p class="text-grey-7">Units list</p></q-card-section></q-card>
+    </div>
+  </q-page>
+</template>
+<script>
+import { defineComponent } from 'vue';
+export default defineComponent({ name: 'UnitsListPage' });
+</script>
