@@ -1,44 +1,48 @@
-import { S3Client, PutObjectCommand, DeleteObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
-import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
-import { config } from '../config';
-import { logger } from '../utils/logger';
-import crypto from 'crypto';
+import fs from 'fs/promises';
 import path from 'path';
-
-const s3Client = new S3Client({
-  region: config.s3.region,
-  credentials: {
-    accessKeyId: config.s3.accessKeyId,
-    secretAccessKey: config.s3.secretAccessKey,
-  },
-  endpoint: config.s3.endpoint, // For MinIO compatibility
-  forcePathStyle: true, // Required for MinIO
-});
+import crypto from 'crypto';
+import { logger } from '../utils/logger';
+import { AppDataSource } from '../db/data-source';
+import { Document } from '../entities/Document';
 
 export class UploadService {
+  private uploadDir: string;
+
+  constructor() {
+    this.uploadDir = process.env.UPLOAD_DIR || path.join(process.cwd(), 'uploads');
+    this.ensureUploadDir();
+  }
+
+  private async ensureUploadDir(): Promise<void> {
+    try {
+      await fs.mkdir(this.uploadDir, { recursive: true });
+      await fs.mkdir(path.join(this.uploadDir, 'documents'), { recursive: true });
+      await fs.mkdir(path.join(this.uploadDir, 'meter-photos'), { recursive: true });
+      await fs.mkdir(path.join(this.uploadDir, 'temp'), { recursive: true });
+    } catch (error) {
+      logger.error('Failed to create upload directories', { error });
+    }
+  }
+
   /**
-   * Upload file to S3/MinIO
+   * Upload file to local storage
    */
-  async uploadFile(file: Buffer, originalName: string, mimeType: string, folder: string = 'uploads'): Promise<{ url: string; key: string }> {
+  async uploadFile(
+    file: Buffer,
+    originalName: string,
+    folder: string = 'temp'
+  ): Promise<{ url: string; filepath: string }> {
     try {
       const fileExt = path.extname(originalName);
       const fileName = `${crypto.randomUUID()}${fileExt}`;
-      const key = `${folder}/${fileName}`;
+      const filepath = path.join(this.uploadDir, folder, fileName);
 
-      const command = new PutObjectCommand({
-        Bucket: config.s3.bucket,
-        Key: key,
-        Body: file,
-        ContentType: mimeType,
-        ACL: 'private',
-      });
+      await fs.writeFile(filepath, file);
 
-      await s3Client.send(command);
+      const url = `/uploads/${folder}/${fileName}`;
 
-      const url = `${config.s3.endpoint}/${config.s3.bucket}/${key}`;
-      
-      logger.info('File uploaded', { key, size: file.length });
-      return { url, key };
+      logger.info('File uploaded', { filepath, size: file.length });
+      return { url, filepath };
     } catch (error) {
       logger.error('Failed to upload file', { error, originalName });
       throw error;
@@ -46,82 +50,88 @@ export class UploadService {
   }
 
   /**
-   * Delete file from S3/MinIO
+   * Delete file from local storage
    */
-  async deleteFile(key: string): Promise<void> {
+  async deleteFile(filepath: string): Promise<void> {
     try {
-      const command = new DeleteObjectCommand({
-        Bucket: config.s3.bucket,
-        Key: key,
-      });
-
-      await s3Client.send(command);
-      logger.info('File deleted', { key });
+      await fs.unlink(filepath);
+      logger.info('File deleted', { filepath });
     } catch (error) {
-      logger.error('Failed to delete file', { error, key });
+      logger.error('Failed to delete file', { error, filepath });
       throw error;
     }
   }
 
   /**
-   * Get signed URL for temporary access
+   * Upload document with metadata
    */
-  async getSignedUrl(key: string, expiresIn: number = 3600): Promise<string> {
-    try {
-      const command = new GetObjectCommand({
-        Bucket: config.s3.bucket,
-        Key: key,
-      });
-
-      const signedUrl = await getSignedUrl(s3Client, command, { expiresIn });
-      return signedUrl;
-    } catch (error) {
-      logger.error('Failed to generate signed URL', { error, key });
-      throw error;
+  async uploadDocument(
+    file: Buffer,
+    originalName: string,
+    mimeType: string,
+    condoId: string,
+    uploadedBy: string,
+    documentData: {
+      title: string;
+      description?: string;
+      documentType: string;
+      isPublic?: boolean;
     }
-  }
-
-  /**
-   * Upload document
-   */
-  async uploadDocument(file: Buffer, originalName: string, mimeType: string, condoId: string, uploadedBy: string, documentData: any): Promise<any> {
+  ): Promise<Document> {
     try {
-      const { url, key } = await this.uploadFile(file, originalName, mimeType, `documents/${condoId}`);
-
-      const result = await pool.query(
-        `INSERT INTO documents (
-          condo_id, uploaded_by, title, description, document_type,
-          file_name, file_size, file_url, mime_type, is_public
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-        RETURNING *`,
-        [
-          condoId,
-          uploadedBy,
-          documentData.title,
-          documentData.description || null,
-          documentData.documentType,
-          originalName,
-          file.length,
-          url,
-          mimeType,
-          documentData.isPublic || false
-        ]
+      const { url, filepath } = await this.uploadFile(
+        file,
+        originalName,
+        `documents/${condoId}`
       );
 
-      logger.info('Document uploaded', { 
-        documentId: result.rows[0].id, 
-        condoId 
+      const documentRepo = AppDataSource.getRepository(Document);
+      const document = documentRepo.create({
+        condoId,
+        uploadedBy,
+        title: documentData.title,
+        description: documentData.description,
+        documentType: documentData.documentType,
+        fileName: originalName,
+        fileSize: file.length,
+        fileUrl: url,
+        filePath: filepath,
+        mimeType,
+        isPublic: documentData.isPublic || false,
       });
 
-      return result.rows[0];
+      await documentRepo.save(document);
+
+      logger.info('Document uploaded', {
+        documentId: document.id,
+        condoId,
+      });
+
+      return document;
     } catch (error) {
       logger.error('Failed to upload document', { error, condoId });
       throw error;
     }
   }
+
+  /**
+   * Upload meter photo
+   */
+  async uploadMeterPhoto(
+    file: Buffer,
+    originalName: string,
+    mimeType: string
+  ): Promise<{ url: string; filepath: string }> {
+    return this.uploadFile(file, originalName, 'meter-photos');
+  }
+
+  /**
+   * Get file path from URL
+   */
+  getFilePathFromUrl(url: string): string {
+    const relativePath = url.replace('/uploads/', '');
+    return path.join(this.uploadDir, relativePath);
+  }
 }
 
 export const uploadService = new UploadService();
-
-// Import pool
-import { pool } from '../db';
