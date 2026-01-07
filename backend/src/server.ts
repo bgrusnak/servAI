@@ -6,14 +6,17 @@ import helmet from 'helmet';
 import cookieParser from 'cookie-parser';
 import csrf from 'csurf';
 import path from 'path';
+import slowDown from 'express-slow-down';
 import { config } from './config';
 import { logger } from './utils/logger';
 import { errorHandler } from './middleware/errorHandler';
 import { requestLogger } from './middleware/requestLogger';
 import { metricsMiddleware } from './middleware/metricsMiddleware';
+import { authenticateToken } from './middleware/auth.middleware';
 import { telegramService } from './services/telegram.service';
 import { websocketService } from './services/websocket.service';
 import { AppDataSource } from './db/data-source';
+import { uploadService } from './services/upload.service';
 
 // Import routes
 import authRoutes from './routes/auth';
@@ -41,7 +44,17 @@ const app = express();
 const httpServer = createServer(app);
 
 // Security middleware
-app.use(helmet());
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      imgSrc: ["'self'", "data:", "https:"],
+    },
+  },
+}));
+
 app.use(
   cors({
     origin: config.cors.allowedOrigins,
@@ -52,40 +65,101 @@ app.use(
 // Cookie parser - MUST be before CSRF
 app.use(cookieParser());
 
-// Static files for uploads
-const uploadsDir = process.env.UPLOAD_DIR || path.join(process.cwd(), 'uploads');
-app.use('/uploads', express.static(uploadsDir));
+// Rate limiting for large bodies (DoS prevention)
+const bodyRateLimiter = slowDown({
+  windowMs: 60 * 1000, // 1 minute
+  delayAfter: 10, // Allow 10 requests per minute at full speed
+  delayMs: 500, // Add 500ms delay per request after that
+  maxDelayMs: 5000, // Max 5 second delay
+  skipSuccessfulRequests: false,
+  keyGenerator: (req) => req.ip || 'unknown',
+});
 
-// Request parsing
+// CRITICAL: Raw body for Stripe webhooks BEFORE json parser!
+app.use('/api/v1/stripe/webhook', express.raw({ type: 'application/json' }));
+
+// Request parsing with rate limiting for large bodies
+app.use((req, res, next) => {
+  const contentLength = parseInt(req.headers['content-length'] || '0', 10);
+  
+  // If body > 1MB, apply rate limiting
+  if (contentLength > 1024 * 1024) {
+    return bodyRateLimiter(req, res, next);
+  }
+  
+  next();
+});
+
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// Raw body for Stripe webhooks (before CSRF)
-app.use('/api/v1/stripe/webhook', express.raw({ type: 'application/json' }));
+// CRITICAL: Protect uploads directory with authentication
+const uploadsDir = process.env.UPLOAD_DIR || path.join(process.cwd(), 'uploads');
 
-// CSRF protection (skip for stripe webhook and monitoring)
+app.use('/uploads', authenticateToken, async (req: any, res, next) => {
+  try {
+    // Extract file key from URL
+    const fileKey = req.path.substring(1); // Remove leading '/'
+    
+    if (!fileKey) {
+      return res.status(400).json({ error: 'Invalid file path' });
+    }
+    
+    // Verify user has access to this file
+    const hasAccess = await uploadService.verifyDocumentAccess(
+      fileKey,
+      req.user.id,
+      req.user.roles
+    );
+    
+    if (!hasAccess) {
+      logger.warn('Unauthorized file access attempt', {
+        userId: req.user.id,
+        fileKey,
+        ip: req.ip
+      });
+      return res.status(403).json({ error: 'Access denied' });
+    }
+    
+    // User has access, serve the file
+    next();
+  } catch (error) {
+    logger.error('Error checking file access', { error });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+}, express.static(uploadsDir));
+
+// CSRF protection
+// NOTE: Using Double Submit Cookie pattern (httpOnly=false)
+// This is vulnerable to XSS attacks, but necessary for SPA.
+// Mitigation: Strict CSP, XSS prevention in frontend
+// Alternative: Use session-based CSRF with httpOnly=true
 const csrfProtection = csrf({ 
   cookie: { 
-    httpOnly: false, // Frontend needs to read it
+    httpOnly: false, // Must be false for Double Submit Cookie pattern
     sameSite: 'strict',
-    secure: config.env === 'production'
+    secure: config.env === 'production' || config.env === 'staging'
   } 
 });
 
 // Apply CSRF to all routes except public ones
 app.use((req, res, next) => {
-  // Skip CSRF for:
-  // - Stripe webhooks (they have signature verification)
-  // - Monitoring endpoints
-  // - Login/Register (need to get CSRF token first)
+  // Skip CSRF ONLY for:
+  // - Stripe webhooks (signature verification)
+  // - Monitoring endpoints (public)
+  // - CSRF token endpoint (must be accessible)
   const skipPaths = [
     '/api/v1/stripe/webhook',
     '/health',
     '/metrics',
-    '/api/v1/auth/login',
-    '/api/v1/auth/register',
     '/api/v1/auth/csrf-token'
   ];
+  
+  // CRITICAL: Login and Register now REQUIRE CSRF token!
+  // Clients must:
+  // 1. GET /api/v1/auth/csrf-token
+  // 2. Include token in X-CSRF-Token header
+  // 3. POST to /api/v1/auth/login or /api/v1/auth/register
   
   if (skipPaths.some(path => req.path.startsWith(path))) {
     return next();
@@ -191,7 +265,7 @@ async function shutdown() {
     process.exit(0);
   });
   
-  // Force shutdown after 30 seconds (increased from 10)
+  // Force shutdown after 30 seconds
   setTimeout(() => {
     logger.warn('Forcing shutdown');
     process.exit(1);
@@ -210,7 +284,8 @@ if (require.main === module) {
     logger.info(`Metrics: http://localhost:${config.port}/metrics`);
     logger.info(`Health: http://localhost:${config.port}/health`);
     logger.info(`WebSocket: ws://localhost:${config.port}/ws`);
-    logger.info(`Uploads: ${uploadsDir}`);
+    logger.info(`Uploads: ${uploadsDir} (protected)`);
+    logger.info(`CSRF: Enabled (Double Submit Cookie pattern)`);
     
     // Initialize services after server starts
     await initializeServices();
