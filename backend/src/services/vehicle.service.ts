@@ -1,315 +1,304 @@
 import { AppDataSource } from '../db/data-source';
 import { Vehicle } from '../entities/Vehicle';
 import { Unit } from '../entities/Unit';
-import { Condo } from '../entities/Condo';
+import { VehicleAccessLog } from '../entities/VehicleAccessLog';
+import { temporaryPassService } from './temporary-pass.service';
 import { logger } from '../utils/logger';
-import { LessThan, MoreThan, In } from 'typeorm';
+import {
+  NotFoundError,
+  ConflictError,
+  BadRequestError,
+} from '../utils/errors';
+import { Between } from 'typeorm';
 
 const vehicleRepository = AppDataSource.getRepository(Vehicle);
 const unitRepository = AppDataSource.getRepository(Unit);
-const condoRepository = AppDataSource.getRepository(Condo);
+const accessLogRepository = AppDataSource.getRepository(VehicleAccessLog);
 
-export interface VehicleAccessLog {
-  id: string;
-  vehicleId?: string;
+interface CreateVehicleDto {
+  unitId: string;
   licensePlate: string;
-  unitId?: string;
-  unitNumber?: string;
-  accessType: 'permanent' | 'temporary' | 'unknown';
-  timestamp: Date;
-  grantedBy?: string;
+  make?: string;
+  model?: string;
+  color?: string;
+  parkingSpot?: string;
+  createdBy: string;
 }
 
-const accessLogs: VehicleAccessLog[] = [];
+interface CreateTemporaryPassDto {
+  unitId: string;
+  licensePlate: string;
+  createdBy: string;
+}
 
-export class VehicleService {
+interface AccessHistoryFilter {
+  unitId?: string;
+  licensePlate?: string;
+  from?: Date;
+  to?: Date;
+  limit?: number;
+  offset?: number;
+}
+
+class VehicleService {
   /**
-   * Create permanent vehicle for a unit
+   * Normalize license plate: uppercase, remove spaces
    */
-  async createPermanentVehicle(data: {
-    unitId: string;
-    licensePlate: string;
-    make?: string;
-    model?: string;
-    color?: string;
-    parkingSpot?: string;
-  }): Promise<Vehicle> {
-    try {
-      // Check if unit exists and get condo settings
-      const unit = await unitRepository.findOne({
-        where: { id: data.unitId },
-        relations: ['condo'],
-      });
-
-      if (!unit) {
-        throw new Error('Unit not found');
-      }
-
-      // Get condo settings for vehicle limit
-      const maxVehicles = unit.condo?.maxVehiclesPerUnit || 2;
-
-      // Normalize license plate (uppercase, no spaces)
-      const normalizedPlate = data.licensePlate.toUpperCase().replace(/\s+/g, '');
-
-      // Check if license plate already exists
-      const existing = await vehicleRepository.findOne({
-        where: { licensePlate: normalizedPlate },
-      });
-
-      if (existing) {
-        throw new Error('License plate already registered');
-      }
-
-      // Check unit vehicle limit (from condo settings)
-      const unitVehicles = await vehicleRepository.count({
-        where: { unitId: data.unitId, isActive: true },
-      });
-
-      if (unitVehicles >= maxVehicles) {
-        throw new Error(
-          `Unit has reached maximum permanent vehicles limit (${maxVehicles} per unit)`
-        );
-      }
-
-      // Create vehicle
-      const vehicle = vehicleRepository.create({
-        unitId: data.unitId,
-        licensePlate: normalizedPlate,
-        make: data.make,
-        model: data.model,
-        color: data.color,
-        parkingSpot: data.parkingSpot,
-        isActive: true,
-      });
-
-      await vehicleRepository.save(vehicle);
-
-      logger.info('Permanent vehicle created', {
-        vehicleId: vehicle.id,
-        licensePlate: vehicle.licensePlate,
-        unitId: data.unitId,
-        maxVehicles,
-      });
-
-      return vehicle;
-    } catch (error) {
-      logger.error('Failed to create permanent vehicle', { error, data });
-      throw error;
-    }
+  private normalizeLicensePlate(plate: string): string {
+    return plate.toUpperCase().replace(/\s+/g, '');
   }
 
   /**
-   * Create temporary vehicle pass (duration from condo settings)
-   * Note: In-memory storage for simplicity. In production, use database table.
+   * Create permanent vehicle
    */
-  private temporaryPasses: Map<string, { unitId: string; expiresAt: Date; createdBy: string }> =
-    new Map();
+  async createPermanentVehicle(data: CreateVehicleDto): Promise<Vehicle> {
+    const normalizedPlate = this.normalizeLicensePlate(data.licensePlate);
 
-  async createTemporaryPass(data: {
-    unitId: string;
-    licensePlate: string;
-    createdBy: string;
-  }): Promise<{ licensePlate: string; expiresAt: Date }> {
-    try {
-      // Check if unit exists and get condo settings
-      const unit = await unitRepository.findOne({
-        where: { id: data.unitId },
-        relations: ['condo'],
-      });
-
-      if (!unit) {
-        throw new Error('Unit not found');
-      }
-
-      // Get condo settings for pass duration
-      const durationHours = unit.condo?.temporaryPassDurationHours || 24;
-
-      // Normalize license plate
-      const normalizedPlate = data.licensePlate.toUpperCase().replace(/\s+/g, '');
-
-      // Create expiration (from condo settings)
-      const expiresAt = new Date();
-      expiresAt.setHours(expiresAt.getHours() + durationHours);
-
-      // Store temporary pass
-      this.temporaryPasses.set(normalizedPlate, {
-        unitId: data.unitId,
-        expiresAt,
-        createdBy: data.createdBy,
-      });
-
-      logger.info('Temporary pass created', {
-        licensePlate: normalizedPlate,
-        unitId: data.unitId,
-        expiresAt,
-        durationHours,
-      });
-
-      return {
-        licensePlate: normalizedPlate,
-        expiresAt,
-      };
-    } catch (error) {
-      logger.error('Failed to create temporary pass', { error, data });
-      throw error;
-    }
-  }
-
-  /**
-   * Check vehicle access (for security guard)
-   */
-  async checkVehicleAccess(licensePlate: string): Promise<{
-    allowed: boolean;
-    type: 'permanent' | 'temporary' | 'unknown';
-    unitId?: string;
-    unitNumber?: string;
-    buildingNumber?: string;
-    entranceNumber?: string;
-    expiresAt?: Date;
-    vehicle?: Vehicle;
-  }> {
-    try {
-      const normalizedPlate = licensePlate.toUpperCase().replace(/\s+/g, '');
-
-      // Check permanent vehicle
-      const vehicle = await vehicleRepository.findOne({
-        where: { licensePlate: normalizedPlate, isActive: true },
-        relations: ['unit', 'unit.entrance', 'unit.entrance.building'],
-      });
-
-      if (vehicle) {
-        // Log access
-        this.logAccess({
-          id: `log-${Date.now()}`,
-          vehicleId: vehicle.id,
-          licensePlate: normalizedPlate,
-          unitId: vehicle.unitId,
-          unitNumber: vehicle.unit?.unitNumber,
-          accessType: 'permanent',
-          timestamp: new Date(),
-        });
-
-        return {
-          allowed: true,
-          type: 'permanent',
-          unitId: vehicle.unitId,
-          unitNumber: vehicle.unit?.unitNumber,
-          buildingNumber: vehicle.unit?.entrance?.building?.buildingNumber,
-          entranceNumber: vehicle.unit?.entrance?.entranceNumber,
-          vehicle,
-        };
-      }
-
-      // Check temporary pass
-      const tempPass = this.temporaryPasses.get(normalizedPlate);
-      if (tempPass) {
-        const now = new Date();
-        if (tempPass.expiresAt > now) {
-          // Get unit info
-          const unit = await unitRepository.findOne({
-            where: { id: tempPass.unitId },
-            relations: ['entrance', 'entrance.building'],
-          });
-
-          // Log access
-          this.logAccess({
-            id: `log-${Date.now()}`,
-            licensePlate: normalizedPlate,
-            unitId: tempPass.unitId,
-            unitNumber: unit?.unitNumber,
-            accessType: 'temporary',
-            timestamp: new Date(),
-          });
-
-          return {
-            allowed: true,
-            type: 'temporary',
-            unitId: tempPass.unitId,
-            unitNumber: unit?.unitNumber,
-            buildingNumber: unit?.entrance?.building?.buildingNumber,
-            entranceNumber: unit?.entrance?.entranceNumber,
-            expiresAt: tempPass.expiresAt,
-          };
-        } else {
-          // Expired, remove
-          this.temporaryPasses.delete(normalizedPlate);
-        }
-      }
-
-      // Log denied access
-      this.logAccess({
-        id: `log-${Date.now()}`,
-        licensePlate: normalizedPlate,
-        accessType: 'unknown',
-        timestamp: new Date(),
-      });
-
-      return {
-        allowed: false,
-        type: 'unknown',
-      };
-    } catch (error) {
-      logger.error('Failed to check vehicle access', { error, licensePlate });
-      throw error;
-    }
-  }
-
-  /**
-   * Get vehicles for a unit
-   */
-  async getUnitVehicles(unitId: string): Promise<Vehicle[]> {
-    try {
-      return await vehicleRepository.find({
-        where: { unitId, isActive: true },
-        order: { createdAt: 'DESC' },
-      });
-    } catch (error) {
-      logger.error('Failed to get unit vehicles', { error, unitId });
-      throw error;
-    }
-  }
-
-  /**
-   * Get temporary passes for a unit
-   */
-  async getUnitTemporaryPasses(unitId: string): Promise<Array<{ licensePlate: string; expiresAt: Date }>> {
-    const passes: Array<{ licensePlate: string; expiresAt: Date }> = [];
-    const now = new Date();
-
-    this.temporaryPasses.forEach((pass, plate) => {
-      if (pass.unitId === unitId && pass.expiresAt > now) {
-        passes.push({
-          licensePlate: plate,
-          expiresAt: pass.expiresAt,
-        });
-      }
+    // Check if license plate already exists
+    const existing = await vehicleRepository.findOne({
+      where: { licensePlate: normalizedPlate },
     });
 
-    return passes;
+    if (existing) {
+      throw new ConflictError('License plate already registered');
+    }
+
+    // Get unit with condo settings
+    const unit = await unitRepository.findOne({
+      where: { id: data.unitId },
+      relations: ['condo'],
+    });
+
+    if (!unit) {
+      throw new NotFoundError('Unit');
+    }
+
+    // Check vehicle limit
+    const maxVehicles = unit.condo?.maxVehiclesPerUnit || 2;
+    const currentCount = await vehicleRepository.count({
+      where: { unitId: data.unitId, isActive: true },
+    });
+
+    if (currentCount >= maxVehicles) {
+      throw new BadRequestError(
+        `Unit has reached maximum vehicles limit (${maxVehicles})`
+      );
+    }
+
+    // Create vehicle
+    const vehicle = vehicleRepository.create({
+      unitId: data.unitId,
+      licensePlate: normalizedPlate,
+      make: data.make,
+      model: data.model,
+      color: data.color,
+      parkingSpot: data.parkingSpot,
+      isActive: true,
+    });
+
+    await vehicleRepository.save(vehicle);
+
+    logger.info('Permanent vehicle created', {
+      vehicleId: vehicle.id,
+      licensePlate: normalizedPlate,
+      unitId: data.unitId,
+    });
+
+    return vehicle;
+  }
+
+  /**
+   * Create temporary pass (duration from condo settings)
+   */
+  async createTemporaryPass(data: CreateTemporaryPassDto) {
+    const normalizedPlate = this.normalizeLicensePlate(data.licensePlate);
+
+    // Get unit with condo settings
+    const unit = await unitRepository.findOne({
+      where: { id: data.unitId },
+      relations: ['condo'],
+    });
+
+    if (!unit) {
+      throw new NotFoundError('Unit');
+    }
+
+    // Get duration from condo settings
+    const durationHours = unit.condo?.temporaryPassDurationHours || 24;
+
+    // Create pass in Redis
+    const pass = await temporaryPassService.createTemporaryPass(
+      normalizedPlate,
+      data.unitId,
+      durationHours
+    );
+
+    return pass;
+  }
+
+  /**
+   * Check vehicle access (called by security guard)
+   */
+  async checkVehicleAccess(licensePlate: string, checkedBy: string) {
+    const normalizedPlate = this.normalizeLicensePlate(licensePlate);
+
+    // Check permanent vehicle
+    const permanent = await vehicleRepository.findOne({
+      where: { licensePlate: normalizedPlate, isActive: true },
+      relations: ['unit', 'unit.building', 'unit.entrance'],
+    });
+
+    if (permanent) {
+      // Log access
+      await this.logAccess({
+        vehicleId: permanent.id,
+        licensePlate: normalizedPlate,
+        unitId: permanent.unitId,
+        unitNumber: permanent.unit.unitNumber,
+        buildingNumber: permanent.unit.building?.buildingNumber,
+        entranceNumber: permanent.unit.entrance?.entranceNumber,
+        accessType: 'permanent',
+        allowed: true,
+        expiresAt: null,
+      });
+
+      return {
+        allowed: true,
+        type: 'permanent',
+        unitId: permanent.unitId,
+        unitNumber: permanent.unit.unitNumber,
+        buildingNumber: permanent.unit.building?.buildingNumber,
+        entranceNumber: permanent.unit.entrance?.entranceNumber,
+      };
+    }
+
+    // Check temporary pass
+    const tempPass = await temporaryPassService.getTemporaryPass(normalizedPlate);
+
+    if (tempPass && new Date() < tempPass.expiresAt) {
+      // Get unit details
+      const unit = await unitRepository.findOne({
+        where: { id: tempPass.unitId },
+        relations: ['building', 'entrance'],
+      });
+
+      // Log access
+      await this.logAccess({
+        vehicleId: null,
+        licensePlate: normalizedPlate,
+        unitId: tempPass.unitId,
+        unitNumber: unit?.unitNumber,
+        buildingNumber: unit?.building?.buildingNumber,
+        entranceNumber: unit?.entrance?.entranceNumber,
+        accessType: 'temporary',
+        allowed: true,
+        expiresAt: tempPass.expiresAt,
+      });
+
+      return {
+        allowed: true,
+        type: 'temporary',
+        unitId: tempPass.unitId,
+        unitNumber: unit?.unitNumber,
+        buildingNumber: unit?.building?.buildingNumber,
+        entranceNumber: unit?.entrance?.entranceNumber,
+        expiresAt: tempPass.expiresAt,
+      };
+    }
+
+    // Access denied
+    await this.logAccess({
+      vehicleId: null,
+      licensePlate: normalizedPlate,
+      unitId: null,
+      unitNumber: null,
+      buildingNumber: null,
+      entranceNumber: null,
+      accessType: 'unknown',
+      allowed: false,
+      expiresAt: null,
+    });
+
+    return {
+      allowed: false,
+      type: 'unknown',
+    };
+  }
+
+  /**
+   * Log vehicle access
+   */
+  private async logAccess(data: Partial<VehicleAccessLog>): Promise<void> {
+    try {
+      const log = accessLogRepository.create(data);
+      await accessLogRepository.save(log);
+    } catch (error) {
+      logger.error('Failed to log vehicle access', { error, data });
+    }
+  }
+
+  /**
+   * Get unit permanent vehicles
+   */
+  async getUnitVehicles(unitId: string): Promise<Vehicle[]> {
+    return vehicleRepository.find({
+      where: { unitId, isActive: true },
+      order: { createdAt: 'DESC' },
+    });
+  }
+
+  /**
+   * Get unit temporary passes
+   */
+  async getUnitTemporaryPasses(unitId: string) {
+    return temporaryPassService.getUnitTemporaryPasses(unitId);
+  }
+
+  /**
+   * Get access history
+   */
+  async getAccessHistory(filter: AccessHistoryFilter) {
+    const where: any = {};
+
+    if (filter.unitId) {
+      where.unitId = filter.unitId;
+    }
+
+    if (filter.licensePlate) {
+      where.licensePlate = this.normalizeLicensePlate(filter.licensePlate);
+    }
+
+    if (filter.from && filter.to) {
+      where.timestamp = Between(filter.from, filter.to);
+    }
+
+    const logs = await accessLogRepository.find({
+      where,
+      order: { timestamp: 'DESC' },
+      take: filter.limit || 100,
+      skip: filter.offset || 0,
+    });
+
+    return logs;
   }
 
   /**
    * Get condo vehicle settings
    */
-  async getCondoVehicleSettings(condoId: string): Promise<{
-    maxVehiclesPerUnit: number;
-    temporaryPassDurationHours: number;
-  }> {
-    try {
-      const condo = await condoRepository.findOne({ where: { id: condoId } });
+  async getCondoVehicleSettings(condoId: string) {
+    const unit = await unitRepository.findOne({
+      where: { condoId },
+      relations: ['condo'],
+    });
 
-      if (!condo) {
-        throw new Error('Condo not found');
-      }
-
-      return {
-        maxVehiclesPerUnit: condo.maxVehiclesPerUnit || 2,
-        temporaryPassDurationHours: condo.temporaryPassDurationHours || 24,
-      };
-    } catch (error) {
-      logger.error('Failed to get condo vehicle settings', { error, condoId });
-      throw error;
+    if (!unit || !unit.condo) {
+      throw new NotFoundError('Condo');
     }
+
+    return {
+      maxVehiclesPerUnit: unit.condo.maxVehiclesPerUnit || 2,
+      temporaryPassDurationHours: unit.condo.temporaryPassDurationHours || 24,
+    };
   }
 
   /**
@@ -317,147 +306,64 @@ export class VehicleService {
    */
   async updateCondoVehicleSettings(
     condoId: string,
-    settings: {
-      maxVehiclesPerUnit?: number;
-      temporaryPassDurationHours?: number;
+    settings: { maxVehiclesPerUnit?: number; temporaryPassDurationHours?: number }
+  ) {
+    const unit = await unitRepository.findOne({
+      where: { condoId },
+      relations: ['condo'],
+    });
+
+    if (!unit || !unit.condo) {
+      throw new NotFoundError('Condo');
     }
-  ): Promise<void> {
-    try {
-      const condo = await condoRepository.findOne({ where: { id: condoId } });
 
-      if (!condo) {
-        throw new Error('Condo not found');
+    if (settings.maxVehiclesPerUnit !== undefined) {
+      if (settings.maxVehiclesPerUnit < 1 || settings.maxVehiclesPerUnit > 10) {
+        throw new BadRequestError('maxVehiclesPerUnit must be between 1 and 10');
       }
-
-      if (settings.maxVehiclesPerUnit !== undefined) {
-        if (settings.maxVehiclesPerUnit < 1 || settings.maxVehiclesPerUnit > 10) {
-          throw new Error('maxVehiclesPerUnit must be between 1 and 10');
-        }
-        condo.maxVehiclesPerUnit = settings.maxVehiclesPerUnit;
-      }
-
-      if (settings.temporaryPassDurationHours !== undefined) {
-        if (
-          settings.temporaryPassDurationHours < 1 ||
-          settings.temporaryPassDurationHours > 168
-        ) {
-          throw new Error('temporaryPassDurationHours must be between 1 and 168 (1 week)');
-        }
-        condo.temporaryPassDurationHours = settings.temporaryPassDurationHours;
-      }
-
-      await condoRepository.save(condo);
-
-      logger.info('Condo vehicle settings updated', { condoId, settings });
-    } catch (error) {
-      logger.error('Failed to update condo vehicle settings', { error, condoId, settings });
-      throw error;
+      unit.condo.maxVehiclesPerUnit = settings.maxVehiclesPerUnit;
     }
+
+    if (settings.temporaryPassDurationHours !== undefined) {
+      if (
+        settings.temporaryPassDurationHours < 1 ||
+        settings.temporaryPassDurationHours > 168
+      ) {
+        throw new BadRequestError(
+          'temporaryPassDurationHours must be between 1 and 168'
+        );
+      }
+      unit.condo.temporaryPassDurationHours = settings.temporaryPassDurationHours;
+    }
+
+    await unitRepository.manager.save(unit.condo);
   }
 
   /**
    * Delete vehicle
    */
   async deleteVehicle(vehicleId: string, unitId: string): Promise<void> {
-    try {
-      const vehicle = await vehicleRepository.findOne({
-        where: { id: vehicleId, unitId },
-      });
+    const vehicle = await vehicleRepository.findOne({
+      where: { id: vehicleId, unitId },
+    });
 
-      if (!vehicle) {
-        throw new Error('Vehicle not found');
-      }
-
-      await vehicleRepository.remove(vehicle);
-
-      logger.info('Vehicle deleted', { vehicleId, unitId });
-    } catch (error) {
-      logger.error('Failed to delete vehicle', { error, vehicleId });
-      throw error;
+    if (!vehicle) {
+      throw new NotFoundError('Vehicle');
     }
+
+    await vehicleRepository.remove(vehicle);
+
+    logger.info('Vehicle deleted', { vehicleId, unitId });
   }
 
   /**
    * Delete temporary pass
    */
   async deleteTemporaryPass(licensePlate: string, unitId: string): Promise<void> {
-    try {
-      const normalizedPlate = licensePlate.toUpperCase().replace(/\s+/g, '');
-      const pass = this.temporaryPasses.get(normalizedPlate);
+    const normalizedPlate = this.normalizeLicensePlate(licensePlate);
+    await temporaryPassService.deleteTemporaryPass(normalizedPlate, unitId);
 
-      if (!pass || pass.unitId !== unitId) {
-        throw new Error('Temporary pass not found');
-      }
-
-      this.temporaryPasses.delete(normalizedPlate);
-
-      logger.info('Temporary pass deleted', { licensePlate: normalizedPlate, unitId });
-    } catch (error) {
-      logger.error('Failed to delete temporary pass', { error, licensePlate });
-      throw error;
-    }
-  }
-
-  /**
-   * Get access history (last 100 entries)
-   */
-  async getAccessHistory(filter?: {
-    unitId?: string;
-    licensePlate?: string;
-    from?: Date;
-    to?: Date;
-  }): Promise<VehicleAccessLog[]> {
-    let logs = [...accessLogs];
-
-    if (filter) {
-      if (filter.unitId) {
-        logs = logs.filter((log) => log.unitId === filter.unitId);
-      }
-      if (filter.licensePlate) {
-        const normalized = filter.licensePlate.toUpperCase().replace(/\s+/g, '');
-        logs = logs.filter((log) => log.licensePlate === normalized);
-      }
-      if (filter.from) {
-        logs = logs.filter((log) => log.timestamp >= filter.from!);
-      }
-      if (filter.to) {
-        logs = logs.filter((log) => log.timestamp <= filter.to!);
-      }
-    }
-
-    return logs.slice(-100).reverse();
-  }
-
-  /**
-   * Log access attempt
-   */
-  private logAccess(log: VehicleAccessLog): void {
-    accessLogs.push(log);
-    // Keep only last 1000 logs in memory
-    if (accessLogs.length > 1000) {
-      accessLogs.shift();
-    }
-  }
-
-  /**
-   * Cleanup expired temporary passes (called by worker)
-   */
-  async cleanupExpiredPasses(): Promise<number> {
-    const now = new Date();
-    let count = 0;
-
-    this.temporaryPasses.forEach((pass, plate) => {
-      if (pass.expiresAt <= now) {
-        this.temporaryPasses.delete(plate);
-        count++;
-      }
-    });
-
-    if (count > 0) {
-      logger.info('Expired temporary passes cleaned up', { count });
-    }
-
-    return count;
+    logger.info('Temporary pass deleted', { licensePlate: normalizedPlate, unitId });
   }
 }
 
