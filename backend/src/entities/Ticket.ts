@@ -7,6 +7,7 @@ import {
   ManyToOne,
   OneToMany,
   JoinColumn,
+  Index,
 } from 'typeorm';
 import { Unit } from './Unit';
 import { Condo } from './Condo';
@@ -29,6 +30,16 @@ export enum TicketPriority {
 }
 
 @Entity('tickets')
+@Index('idx_tickets_unit_id', ['unitId'])
+@Index('idx_tickets_condo_id', ['condoId'])
+@Index('idx_tickets_created_by', ['createdBy'])
+@Index('idx_tickets_assigned_to', ['assignedTo'])
+@Index('idx_tickets_status', ['status'])
+@Index('idx_tickets_priority', ['priority'])
+@Index('idx_tickets_category_id', ['categoryId'])
+@Index('idx_tickets_status_priority', ['status', 'priority'])
+@Index('idx_tickets_condo_status', ['condoId', 'status'])
+@Index('idx_tickets_created_at', ['createdAt'])
 export class Ticket {
   @PrimaryGeneratedColumn('uuid')
   id: string;
