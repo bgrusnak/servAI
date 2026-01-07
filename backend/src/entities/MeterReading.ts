@@ -6,6 +6,7 @@ import {
   UpdateDateColumn,
   ManyToOne,
   JoinColumn,
+  Index,
 } from 'typeorm';
 import { Meter } from './Meter';
 import { User } from './User';
@@ -17,6 +18,11 @@ export enum ReadingSource {
 }
 
 @Entity('meter_readings')
+@Index('idx_meter_readings_meter_id', ['meterId'])
+@Index('idx_meter_readings_user_id', ['userId'])
+@Index('idx_meter_readings_reading_date', ['readingDate'])
+@Index('idx_meter_readings_meter_date', ['meterId', 'readingDate'])
+@Index('idx_meter_readings_is_verified', ['isVerified'])
 export class MeterReading {
   @PrimaryGeneratedColumn('uuid')
   id: string;
