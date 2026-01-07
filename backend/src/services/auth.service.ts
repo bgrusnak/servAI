@@ -3,16 +3,15 @@ import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { AppDataSource } from '../db/data-source';
 import { User } from '../entities/User';
+import { UserRole } from '../entities/UserRole';
 import { RefreshToken } from '../entities/RefreshToken';
 import { config } from '../config';
 import { logger } from '../utils/logger';
-import { db } from '../db';
+import { tokenBlacklistService } from './token-blacklist.service';
 
 const userRepository = AppDataSource.getRepository(User);
+const userRoleRepository = AppDataSource.getRepository(UserRole);
 const refreshTokenRepository = AppDataSource.getRepository(RefreshToken);
-
-// In-memory token blacklist (use Redis in production)
-const revokedTokens = new Set<string>();
 
 export class AuthService {
   /**
@@ -49,16 +48,19 @@ export class AuthService {
 
       await userRepository.save(user);
 
-      // Assign role via SQL (user_roles table)
+      // Assign role via TypeORM entity (safer than raw SQL)
       if (data.role) {
-        await db.query(
-          `INSERT INTO user_roles (user_id, role, company_id, condo_id, is_active)
-           VALUES ($1, $2, $3, $4, true)`,
-          [user.id, data.role, data.companyId || null, data.condoId || null]
-        );
+        const userRole = userRoleRepository.create({
+          userId: user.id,
+          role: data.role,
+          companyId: data.companyId || undefined,
+          condoId: data.condoId || undefined,
+          isActive: true,
+        });
+        await userRoleRepository.save(userRole);
       }
 
-      logger.info('User registered', { userId: user.id });
+      logger.info('User registered', { userId: user.id, email: data.email });
       
       // Generate tokens
       const accessToken = this.generateAccessToken(user);
@@ -66,7 +68,7 @@ export class AuthService {
 
       return { user, accessToken, refreshToken };
     } catch (error) {
-      logger.error('Registration failed', { error });
+      logger.error('Registration failed', { error, email: data.email });
       throw error;
     }
   }
@@ -102,11 +104,11 @@ export class AuthService {
       const accessToken = this.generateAccessToken(user);
       const refreshToken = await this.generateRefreshToken(user.id);
 
-      logger.info('User logged in', { userId: user.id });
+      logger.info('User logged in', { userId: user.id, email });
 
       return { user, accessToken, refreshToken };
     } catch (error) {
-      logger.error('Login failed');
+      logger.error('Login failed', { error, email });
       throw error;
     }
   }
@@ -140,18 +142,21 @@ export class AuthService {
       const accessToken = this.generateAccessToken(refreshToken.user);
       const newRefreshToken = await this.generateRefreshToken(refreshToken.userId);
 
+      logger.info('Access token refreshed', { userId: refreshToken.userId });
+
       return { accessToken, refreshToken: newRefreshToken };
     } catch (error) {
-      logger.error('Token refresh failed');
+      logger.error('Token refresh failed', { error });
       throw error;
     }
   }
 
   /**
-   * Logout user by revoking refresh token
+   * Logout user by revoking refresh token and blacklisting access token
    */
-  async logout(token: string): Promise<void> {
+  async logout(token: string, accessTokenId?: string): Promise<void> {
     try {
+      // Revoke refresh token
       const refreshToken = await refreshTokenRepository.findOne({
         where: { token },
       });
@@ -160,8 +165,16 @@ export class AuthService {
         refreshToken.revokedAt = new Date();
         await refreshTokenRepository.save(refreshToken);
       }
+
+      // Blacklist access token if provided
+      if (accessTokenId) {
+        // Access tokens expire in 15 minutes
+        await tokenBlacklistService.revokeToken(accessTokenId, 15 * 60);
+      }
+
+      logger.info('User logged out');
     } catch (error) {
-      logger.error('Logout failed');
+      logger.error('Logout failed', { error });
       throw error;
     }
   }
@@ -215,18 +228,17 @@ export class AuthService {
   }
 
   /**
-   * Check if token is revoked
+   * Check if token is revoked (using Redis)
    */
   async isTokenRevoked(tokenId: string): Promise<boolean> {
-    return revokedTokens.has(tokenId);
+    return await tokenBlacklistService.isTokenRevoked(tokenId);
   }
 
   /**
-   * Revoke access token
+   * Revoke access token (using Redis)
    */
   async revokeAccessToken(tokenId: string): Promise<void> {
-    revokedTokens.add(tokenId);
-    // TODO: In production, use Redis with TTL
+    await tokenBlacklistService.revokeToken(tokenId, 15 * 60); // 15 min TTL
   }
 }
 
