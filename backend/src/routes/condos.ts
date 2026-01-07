@@ -1,57 +1,64 @@
-import { Router } from 'express';
-import { authenticateToken } from '../middleware/auth.middleware';
+import { Router, Response, NextFunction } from 'express';
+import { authenticate, AuthRequest } from '../middleware/auth';
 import { canAccessCompany, canAccessCondo, authorize } from '../middleware/authorize.middleware';
-import { asyncHandler } from '../utils/asyncHandler';
 import { CondoService } from '../services/condo.service';
+import { CompanyService } from '../services/company.service';
+import { AppError } from '../middleware/errorHandler';
+import { CONSTANTS } from '../config/constants';
 
-const router = Router();
+const condosRouter = Router();
 
-// ✅ GET /condos - Список ЖК (только доступные)
-router.get(
-  '/',
-  authenticateToken,
-  asyncHandler(async (req, res) => {
+// All routes require authentication
+condosRouter.use(authenticate);
+
+// ✅ List condos (optionally filtered by company)
+condosRouter.get('/', async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
     const page = parseInt(req.query.page as string) || 1;
-    const limit = parseInt(req.query.limit as string) || 50;
+    const limit = Math.min(
+      parseInt(req.query.limit as string) || CONSTANTS.DEFAULT_PAGE_SIZE,
+      CONSTANTS.MAX_PAGE_SIZE
+    );
     const companyId = req.query.company_id as string;
-    const result = await CondoService.listCondos(req.user.id, page, limit, companyId);
+
+    const result = await CondoService.listCondos(req.user!.id, page, limit, companyId);
     res.json(result);
-  })
-);
+  } catch (error) {
+    next(error);
+  }
+});
 
-// ✅ GET /condos/:condoId
-router.get(
-  '/:condoId',
-  authenticateToken,
-  canAccessCondo(), // 🔒 UNIFIED MIDDLEWARE
-  asyncHandler(async (req, res) => {
-    const condo = await CondoService.getCondoById(req.params.condoId, req.user.id);
+// ✅ Get condo by ID
+condosRouter.get('/:id', canAccessCondo(), async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const condo = await CondoService.getCondoById(req.params.id, req.user!.id);
+
     if (!condo) {
-      return res.status(404).json({ error: 'Condo not found' });
+      throw new AppError('Condo not found', 404);
     }
-    res.json(condo);
-  })
-);
 
-// ✅ POST /condos - Только uk_director
-router.post(
-  '/',
-  authenticateToken,
-  authorize('uk_director'), // 🔒 UNIFIED
-  asyncHandler(async (req, res) => {
+    res.json(condo);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ✅ Create condo
+condosRouter.post('/', authorize('uk_director'), async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
     const { company_id, name, address, description, total_buildings, total_units } = req.body;
-    
+
     if (!company_id || !name || !address) {
-      return res.status(400).json({ error: 'company_id, name, and address are required' });
+      throw new AppError('company_id, name, and address are required', 400);
     }
-    
-    // Проверка доступа к company
-    req.params.companyId = company_id;
-    const middleware = canAccessCompany();
-    await new Promise((resolve, reject) => {
-      middleware(req, res, (err) => err ? reject(err) : resolve(null));
-    });
-    
+
+    // Check if user has admin access to company
+    const hasAccess = await CompanyService.checkUserAccess(company_id, req.user!.id, ['company_admin']);
+
+    if (!hasAccess) {
+      throw new AppError('Insufficient permissions to create condo in this company', 403);
+    }
+
     const condo = await CondoService.createCondo({
       company_id,
       name,
@@ -60,40 +67,52 @@ router.post(
       total_buildings,
       total_units,
     });
-    
-    res.status(201).json(condo);
-  })
-);
 
-// ✅ PATCH /condos/:condoId - Только uk_director/complex_admin
-router.patch(
-  '/:condoId',
-  authenticateToken,
-  authorize('uk_director', 'complex_admin'), // 🔒 UNIFIED
-  canAccessCondo(),
-  asyncHandler(async (req, res) => {
+    res.status(201).json(condo);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ✅ Update condo
+condosRouter.patch('/:id', authorize('uk_director', 'complex_admin'), canAccessCondo(), async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
     const { name, address, description, total_buildings, total_units } = req.body;
-    const condo = await CondoService.updateCondo(req.params.condoId, {
+
+    const condo = await CondoService.updateCondo(req.params.id, {
       name,
       address,
       description,
       total_buildings,
       total_units,
     });
+
     res.json(condo);
-  })
-);
+  } catch (error) {
+    next(error);
+  }
+});
 
-// ✅ DELETE /condos/:condoId - Только uk_director
-router.delete(
-  '/:condoId',
-  authenticateToken,
-  authorize('uk_director'),
-  canAccessCondo(),
-  asyncHandler(async (req, res) => {
-    await CondoService.deleteCondo(req.params.condoId);
+// ✅ Delete condo
+condosRouter.delete('/:id', authorize('uk_director'), async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    // Check if user has company admin access
+    const condo = await CondoService.getCondoById(req.params.id, req.user!.id);
+    if (!condo) {
+      throw new AppError('Condo not found', 404);
+    }
+
+    const hasAccess = await CompanyService.checkUserAccess(condo.company_id, req.user!.id, ['company_admin']);
+
+    if (!hasAccess) {
+      throw new AppError('Insufficient permissions', 403);
+    }
+
+    await CondoService.deleteCondo(req.params.id);
     res.json({ message: 'Condo deleted successfully' });
-  })
-);
+  } catch (error) {
+    next(error);
+  }
+});
 
-export default router;
+export { condosRouter };

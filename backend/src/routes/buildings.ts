@@ -1,111 +1,125 @@
-import { Router } from 'express';
-import { authenticateToken } from '../middleware/auth.middleware';
+import { Router, Response, NextFunction } from 'express';
+import { authenticate, AuthRequest } from '../middleware/auth';
 import { canAccessCondo, authorize } from '../middleware/authorize.middleware';
-import { asyncHandler } from '../utils/asyncHandler';
 import { BuildingService } from '../services/building.service';
+import { AppError } from '../middleware/errorHandler';
+import { CONSTANTS } from '../config/constants';
 
-const router = Router();
+const buildingsRouter = Router();
 
-// ✅ GET /condos/:condoId/buildings - Здания ЖК
-router.get(
-  '/condos/:condoId/buildings',
-  authenticateToken,
-  canAccessCondo(), // 🔒 UNIFIED MIDDLEWARE
-  asyncHandler(async (req, res) => {
+// All routes require authentication
+buildingsRouter.use(authenticate);
+
+// ✅ List buildings (by condo)
+buildingsRouter.get('/', canAccessCondo(), async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
     const page = parseInt(req.query.page as string) || 1;
-    const limit = parseInt(req.query.limit as string) || 50;
-    const result = await BuildingService.listBuildings(req.params.condoId, page, limit);
+    const limit = Math.min(
+      parseInt(req.query.limit as string) || CONSTANTS.DEFAULT_PAGE_SIZE,
+      CONSTANTS.MAX_PAGE_SIZE
+    );
+    const condoId = req.query.condo_id as string;
+
+    if (!condoId) {
+      throw new AppError('condo_id parameter is required', 400);
+    }
+
+    const result = await BuildingService.listBuildings(condoId, page, limit);
     res.json(result);
-  })
-);
+  } catch (error) {
+    next(error);
+  }
+});
 
-// ✅ GET /buildings/:id
-router.get(
-  '/buildings/:id',
-  authenticateToken,
-  asyncHandler(async (req, res) => {
+// ✅ Get building by ID
+buildingsRouter.get('/:id', async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
     const building = await BuildingService.getBuildingById(req.params.id);
-    if (!building) {
-      return res.status(404).json({ error: 'Building not found' });
-    }
-    
-    // Проверка доступа к ЖК
-    req.params.condoId = building.condo_id;
-    const middleware = canAccessCondo();
-    await new Promise((resolve, reject) => {
-      middleware(req, res, (err) => err ? reject(err) : resolve(null));
-    });
-    
-    res.json(building);
-  })
-);
 
-// ✅ POST /condos/:condoId/buildings - Только admin
-router.post(
-  '/condos/:condoId/buildings',
-  authenticateToken,
-  authorize('complex_admin', 'uk_director'), // 🔒 UNIFIED
-  canAccessCondo(),
-  asyncHandler(async (req, res) => {
-    const { number, address, floors, units_count } = req.body;
-    if (!number) {
-      return res.status(400).json({ error: 'number is required' });
+    if (!building) {
+      throw new AppError('Building not found', 404);
     }
-    
+
+    // Check access via middleware
+    req.query.condoId = building.condo_id;
+    const middleware = canAccessCondo();
+    await new Promise<void>((resolve, reject) => {
+      middleware(req, res, (err?: any) => err ? reject(err) : resolve());
+    });
+
+    res.json(building);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ✅ Create building
+buildingsRouter.post('/', authorize('complex_admin', 'uk_director'), canAccessCondo(), async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const { condo_id, number, address, floors, units_count } = req.body;
+
+    if (!condo_id || !number) {
+      throw new AppError('condo_id and number are required', 400);
+    }
+
     const building = await BuildingService.createBuilding({
-      condo_id: req.params.condoId,
+      condo_id,
       number,
       address,
       floors,
       units_count,
     });
-    
-    res.status(201).json(building);
-  })
-);
 
-// ✅ PATCH /buildings/:id
-router.patch(
-  '/buildings/:id',
-  authenticateToken,
-  authorize('complex_admin', 'uk_director'),
-  asyncHandler(async (req, res) => {
+    res.status(201).json(building);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ✅ Update building
+buildingsRouter.patch('/:id', authorize('complex_admin', 'uk_director'), async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
     const building = await BuildingService.getBuildingById(req.params.id);
+
     if (!building) {
-      return res.status(404).json({ error: 'Building not found' });
+      throw new AppError('Building not found', 404);
     }
-    
-    req.params.condoId = building.condo_id;
+
+    // Check access
+    req.query.condoId = building.condo_id;
     const middleware = canAccessCondo();
-    await new Promise((resolve, reject) => {
-      middleware(req, res, (err) => err ? reject(err) : resolve(null));
+    await new Promise<void>((resolve, reject) => {
+      middleware(req, res, (err?: any) => err ? reject(err) : resolve());
     });
-    
+
     const updated = await BuildingService.updateBuilding(req.params.id, req.body);
     res.json(updated);
-  })
-);
+  } catch (error) {
+    next(error);
+  }
+});
 
-// ✅ DELETE /buildings/:id
-router.delete(
-  '/buildings/:id',
-  authenticateToken,
-  authorize('complex_admin', 'uk_director'),
-  asyncHandler(async (req, res) => {
+// ✅ Delete building
+buildingsRouter.delete('/:id', authorize('complex_admin', 'uk_director'), async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
     const building = await BuildingService.getBuildingById(req.params.id);
+
     if (!building) {
-      return res.status(404).json({ error: 'Building not found' });
+      throw new AppError('Building not found', 404);
     }
-    
-    req.params.condoId = building.condo_id;
+
+    // Check access
+    req.query.condoId = building.condo_id;
     const middleware = canAccessCondo();
-    await new Promise((resolve, reject) => {
-      middleware(req, res, (err) => err ? reject(err) : resolve(null));
+    await new Promise<void>((resolve, reject) => {
+      middleware(req, res, (err?: any) => err ? reject(err) : resolve());
     });
-    
+
     await BuildingService.deleteBuilding(req.params.id);
     res.json({ message: 'Building deleted successfully' });
-  })
-);
+  } catch (error) {
+    next(error);
+  }
+});
 
-export default router;
+export { buildingsRouter };

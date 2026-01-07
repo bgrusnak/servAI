@@ -1,48 +1,55 @@
-import { Router } from 'express';
-import { authenticateToken } from '../middleware/auth.middleware';
+import { Router, Response, NextFunction } from 'express';
+import { authenticate, AuthRequest, requireRole } from '../middleware/auth';
 import { canAccessCompany, authorize } from '../middleware/authorize.middleware';
-import { asyncHandler } from '../utils/asyncHandler';
 import { CompanyService } from '../services/company.service';
+import { AppError } from '../middleware/errorHandler';
+import { CONSTANTS } from '../config/constants';
 
-const router = Router();
+const companiesRouter = Router();
 
-// ✅ GET /companies - Список УК (только свои)
-router.get(
-  '/',
-  authenticateToken,
-  asyncHandler(async (req, res) => {
+// All routes require authentication
+companiesRouter.use(authenticate);
+
+// ✅ List companies (user sees only companies where they have roles)
+companiesRouter.get('/', async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
     const page = parseInt(req.query.page as string) || 1;
-    const limit = parseInt(req.query.limit as string) || 50;
-    const result = await CompanyService.listCompanies(req.user.id, page, limit);
+    const limit = Math.min(
+      parseInt(req.query.limit as string) || CONSTANTS.DEFAULT_PAGE_SIZE,
+      CONSTANTS.MAX_PAGE_SIZE
+    );
+
+    const result = await CompanyService.listCompanies(req.user!.id, page, limit);
     res.json(result);
-  })
-);
+  } catch (error) {
+    next(error);
+  }
+});
 
-// ✅ GET /companies/:companyId
-router.get(
-  '/:companyId',
-  authenticateToken,
-  canAccessCompany(), // 🔒 UNIFIED MIDDLEWARE
-  asyncHandler(async (req, res) => {
-    const company = await CompanyService.getCompanyById(req.params.companyId, req.user.id);
+// ✅ Get company by ID
+companiesRouter.get('/:id', canAccessCompany(), async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const company = await CompanyService.getCompanyById(req.params.id, req.user!.id);
+
     if (!company) {
-      return res.status(404).json({ error: 'Company not found' });
+      throw new AppError('Company not found', 404);
     }
-    res.json(company);
-  })
-);
 
-// ✅ POST /companies - Только superadmin
-router.post(
-  '/',
-  authenticateToken,
-  authorize('superadmin'), // 🔒 UNIFIED
-  asyncHandler(async (req, res) => {
+    res.json(company);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ✅ Create company (system admin only)
+companiesRouter.post('/', authorize('superadmin'), async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
     const { name, legal_name, inn, kpp, address, phone, email, website } = req.body;
+
     if (!name) {
-      return res.status(400).json({ error: 'Company name is required' });
+      throw new AppError('Company name is required', 400);
     }
-    
+
     const company = await CompanyService.createCompany({
       name,
       legal_name,
@@ -52,21 +59,20 @@ router.post(
       phone,
       email,
       website,
-    }, req.user.id);
-    
-    res.status(201).json(company);
-  })
-);
+    }, req.user!.id);
 
-// ✅ PATCH /companies/:companyId - Только uk_director
-router.patch(
-  '/:companyId',
-  authenticateToken,
-  authorize('uk_director'), // 🔒 UNIFIED
-  canAccessCompany(),
-  asyncHandler(async (req, res) => {
+    res.status(201).json(company);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ✅ Update company
+companiesRouter.patch('/:id', authorize('uk_director'), canAccessCompany(), async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
     const { name, legal_name, inn, kpp, address, phone, email, website, is_active } = req.body;
-    const company = await CompanyService.updateCompany(req.params.companyId, {
+
+    const company = await CompanyService.updateCompany(req.params.id, {
       name,
       legal_name,
       inn,
@@ -77,19 +83,21 @@ router.patch(
       website,
       is_active,
     });
+
     res.json(company);
-  })
-);
+  } catch (error) {
+    next(error);
+  }
+});
 
-// ✅ DELETE /companies/:companyId - Только superadmin
-router.delete(
-  '/:companyId',
-  authenticateToken,
-  authorize('superadmin'),
-  asyncHandler(async (req, res) => {
-    await CompanyService.deleteCompany(req.params.companyId);
+// ✅ Delete company (soft delete)
+companiesRouter.delete('/:id', authorize('superadmin'), async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    await CompanyService.deleteCompany(req.params.id);
     res.json({ message: 'Company deleted successfully' });
-  })
-);
+  } catch (error) {
+    next(error);
+  }
+});
 
-export default router;
+export { companiesRouter };
