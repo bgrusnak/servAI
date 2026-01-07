@@ -9,10 +9,36 @@ import { Counter, Histogram, Gauge } from 'prom-client';
 import axios from 'axios';
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import { promisify } from 'util';
+import stream from 'stream';
+import {
+  sanitizeTelegramName,
+  sanitizeTelegramUsername,
+  sanitizeMessageText,
+  hashTelegramId,
+  isValidTelegramId
+} from '../utils/telegram-sanitizer';
 
-const writeFile = promisify(fs.writeFile);
-const unlink = promisify(fs.unlink);
+const pipeline = promisify(stream.pipeline);
+
+// Constants
+const CONVERSATION_HISTORY_LIMIT = parseInt(process.env.CONVERSATION_HISTORY_LIMIT || '20');
+const CONVERSATION_HISTORY_MAX_AGE_HOURS = parseInt(process.env.CONVERSATION_HISTORY_MAX_AGE_HOURS || '24');
+const INTENT_CONFIDENCE_THRESHOLD = parseFloat(process.env.INTENT_CONFIDENCE_THRESHOLD || '0.7');
+const MAX_RETRIES = 3;
+const RETRY_DELAY_MS = 1000;
+const TELEGRAM_RATE_LIMIT_PER_SECOND = parseInt(process.env.TELEGRAM_RATE_LIMIT_PER_SECOND || '25');
+const MESSAGE_INTERVAL_MS = 1000 / TELEGRAM_RATE_LIMIT_PER_SECOND;
+const MAX_FILE_SIZE_MB = 5;
+const MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024;
+const MAX_MESSAGE_LENGTH = 4096;  // Telegram's limit
+const TEMP_DIR = process.env.TEMP_DIR || '/tmp/servai-telegram';
+
+// Ensure temp directory exists
+if (!fs.existsSync(TEMP_DIR)) {
+  fs.mkdirSync(TEMP_DIR, { recursive: true });
+}
 
 // Metrics
 const telegramMessagesTotal = new Counter({
@@ -41,15 +67,11 @@ const telegramQueueDelayed = new Gauge({
   help: 'Number of delayed jobs in Telegram queue'
 });
 
-// Configuration
-const CONVERSATION_HISTORY_LIMIT = parseInt(process.env.CONVERSATION_HISTORY_LIMIT || '20');
-const INTENT_CONFIDENCE_THRESHOLD = parseFloat(process.env.INTENT_CONFIDENCE_THRESHOLD || '0.7');
-const MAX_RETRIES = 3;
-const RETRY_DELAY_MS = 1000;
-const TELEGRAM_RATE_LIMIT_PER_SECOND = parseInt(process.env.TELEGRAM_RATE_LIMIT_PER_SECOND || '25');
-const MESSAGE_INTERVAL_MS = 1000 / TELEGRAM_RATE_LIMIT_PER_SECOND;
-const MAX_FILE_SIZE_MB = 5;
-const TEMP_DIR = process.env.TEMP_DIR || '/tmp';
+const telegramSecurityEvents = new Counter({
+  name: 'telegram_security_events_total',
+  help: 'Security events in Telegram bot',
+  labelNames: ['event_type', 'severity']
+});
 
 interface TelegramUser {
   id: string;
@@ -103,14 +125,30 @@ class TelegramService {
     const useWebhook = process.env.TELEGRAM_USE_WEBHOOK === 'true';
     
     if (useWebhook) {
+      // Validate webhook configuration
       this.webhookUrl = process.env.TELEGRAM_WEBHOOK_URL || '';
       if (!this.webhookUrl) {
         throw new Error('TELEGRAM_WEBHOOK_URL required for webhook mode');
       }
 
+      const webhookSecret = process.env.TELEGRAM_WEBHOOK_SECRET;
+      if (!webhookSecret) {
+        throw new Error('TELEGRAM_WEBHOOK_SECRET is MANDATORY for webhook mode');
+      }
+
       this.bot = new TelegramBot(token, { webHook: true });
-      await this.bot.setWebHook(`${this.webhookUrl}/api/v1/telegram/webhook`);
-      logger.info('Telegram bot initialized in webhook mode', { url: this.webhookUrl });
+      
+      // Set webhook with secret token
+      await this.bot.setWebHook(`${this.webhookUrl}/api/v1/telegram/webhook`, {
+        secret_token: webhookSecret,
+        max_connections: 40,
+        allowed_updates: ['message', 'callback_query']
+      });
+      
+      logger.info('Telegram bot initialized in webhook mode', { 
+        url: this.webhookUrl,
+        hasSecret: true
+      });
     } else {
       this.bot = new TelegramBot(token, { polling: true });
       logger.info('Telegram bot initialized in polling mode');
@@ -118,6 +156,9 @@ class TelegramService {
 
     this.setupHandlers();
     await this.initializeMessageQueue();
+    
+    // Cleanup old temp files on start
+    this.cleanupOldTempFiles();
   }
 
   private async initializeMessageQueue(): Promise<void> {
@@ -271,7 +312,7 @@ class TelegramService {
         intervalMs: MESSAGE_INTERVAL_MS
       });
     } catch (error) {
-      logger.error('Failed to initialize message queue', error);
+      logger.error('Failed to initialize message queue', { error });
       throw error;
     }
   }
@@ -302,7 +343,10 @@ class TelegramService {
   private async handleStart(msg: TelegramBot.Message, inviteToken?: string): Promise<void> {
     try {
       const telegramId = msg.from?.id;
-      if (!telegramId) return;
+      if (!telegramId || !isValidTelegramId(telegramId)) {
+        logger.warn('Invalid telegram ID in /start', { telegramId });
+        return;
+      }
 
       telegramMessagesTotal.inc({ type: 'start', status: 'received' });
 
@@ -325,9 +369,11 @@ class TelegramService {
       await this.handleInviteRegistration(msg, inviteToken);
       telegramMessagesTotal.inc({ type: 'start', status: 'registered' });
     } catch (error) {
-      logger.error('Error handling /start:', error);
+      logger.error('Error handling /start', { error });
       telegramMessagesTotal.inc({ type: 'start', status: 'error' });
-      await this.sendMessage(msg.from!.id, 'Извините, произошла ошибка. Попробуйте позже.');
+      if (msg.from?.id) {
+        await this.sendMessage(msg.from.id, 'Извините, произошла ошибка. Попробуйте позже.');
+      }
     }
   }
 
@@ -337,6 +383,10 @@ class TelegramService {
 
     try {
       await client.query('BEGIN');
+      
+      // Validate and sanitize invite token
+      const sanitizedToken = inviteToken.replace(/[^a-zA-Z0-9-_]/g, '').substring(0, 64);
+      
       const inviteResult = await client.query(
         `SELECT i.*, u.id as unit_id, u.number as unit_number,
                 c.name as condo_name, b.name as building_name
@@ -347,11 +397,23 @@ class TelegramService {
          WHERE i.token = $1 AND i.status = 'pending'
            AND i.expires_at > NOW() AND i.deleted_at IS NULL
          FOR UPDATE`,
-        [inviteToken]
+        [sanitizedToken]
       );
 
       if (inviteResult.rows.length === 0) {
         await client.query('ROLLBACK');
+        
+        telegramSecurityEvents.inc({ 
+          event_type: 'invalid_invite', 
+          severity: 'medium' 
+        });
+        
+        logger.warn('Invalid invite token used', {
+          telegramId,
+          token: sanitizedToken.substring(0, 8) + '...',
+          languageCode: msg.from!.language_code
+        });
+        
         await this.sendMessage(telegramId,
           'Неверная или устаревшая ссылка-приглашение. Обратитесь к администратору.');
         return;
@@ -360,36 +422,86 @@ class TelegramService {
       const invite = inviteResult.rows[0];
       let userId = invite.user_id;
 
+      // Sanitize user input
+      const firstName = sanitizeTelegramName(msg.from!.first_name, 'Пользователь');
+      const lastName = sanitizeTelegramName(msg.from!.last_name, '');
+      const username = sanitizeTelegramUsername(msg.from!.username);
+      const hashedId = hashTelegramId(telegramId);
+
       if (!userId) {
         const userResult = await client.query(
           `INSERT INTO users (email, email_verified, first_name, last_name)
            VALUES ($1, false, $2, $3) RETURNING id`,
-          [`telegram_${telegramId}@servai.temp`, msg.from!.first_name || 'Пользователь', msg.from!.last_name || '']
+          [`tg_${hashedId}@servai.internal`, firstName, lastName]
         );
         userId = userResult.rows[0].id;
+        
         await client.query(
-          `UPDATE invites SET user_id = $1, accepted_at = NOW(), status = 'accepted' WHERE id = $2`,
+          `UPDATE invites SET user_id = $1, accepted_at = NOW(), status = 'accepted' 
+           WHERE id = $2`,
           [userId, invite.id]
         );
       }
 
+      // Check if telegram_id already registered
+      const existingTgUser = await client.query(
+        'SELECT id FROM telegram_users WHERE telegram_id = $1 AND deleted_at IS NULL',
+        [telegramId]
+      );
+      
+      if (existingTgUser.rows.length > 0) {
+        await client.query('ROLLBACK');
+        
+        telegramSecurityEvents.inc({ 
+          event_type: 'duplicate_telegram_id', 
+          severity: 'high' 
+        });
+        
+        logger.warn('Telegram ID already registered', { telegramId, userId });
+        await this.sendMessage(telegramId, 'Этот Telegram аккаунт уже зарегистрирован.');
+        return;
+      }
+
       const tgUserResult = await client.query(
-        `INSERT INTO telegram_users (user_id, telegram_id, telegram_username, first_name, last_name, language_code)
+        `INSERT INTO telegram_users (user_id, telegram_id, telegram_username, 
+                                      first_name, last_name, language_code)
          VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-        [userId, telegramId, msg.from!.username || null, msg.from!.first_name || null, msg.from!.last_name || null, msg.from!.language_code || 'ru']
+        [userId, telegramId, username, firstName, lastName, 
+         msg.from!.language_code || 'ru']
       );
 
-      await client.query(`INSERT INTO user_context (telegram_user_id, current_unit_id) VALUES ($1, $2)`, [tgUserResult.rows[0].id, invite.unit_id]);
-      await client.query(`INSERT INTO residents (user_id, unit_id, role) VALUES ($1, $2, $3)`, [userId, invite.unit_id, invite.role]);
+      await client.query(
+        `INSERT INTO user_context (telegram_user_id, current_unit_id) 
+         VALUES ($1, $2)`,
+        [tgUserResult.rows[0].id, invite.unit_id]
+      );
+      
+      await client.query(
+        `INSERT INTO residents (user_id, unit_id, role) VALUES ($1, $2, $3)`,
+        [userId, invite.unit_id, invite.role]
+      );
+      
       await client.query('COMMIT');
 
       const address = `${invite.condo_name}, ${invite.building_name}, Квартира ${invite.unit_number}`;
       await this.sendMessage(telegramId,
         `Добро пожаловать в servAI! 🏠\n\nВаш адрес: ${address}\n\nЧем могу помочь?`);
+      
       telegramActiveUsers.inc();
+      
+      logger.info('New user registered via Telegram', {
+        userId,
+        telegramId,
+        unitId: invite.unit_id
+      });
+      
     } catch (error) {
       await client.query('ROLLBACK');
-      logger.error('Error in invite registration:', error);
+      logger.error('Error in invite registration', { error, telegramId });
+      telegramSecurityEvents.inc({ 
+        event_type: 'registration_error', 
+        severity: 'high' 
+      });
       await this.sendMessage(telegramId, 'Извините, регистрация не удалась.');
       throw error;
     } finally {
@@ -399,85 +511,165 @@ class TelegramService {
 
   private async handleMessage(msg: TelegramBot.Message): Promise<void> {
     if (!msg.text || !msg.from) return;
+    
     try {
-      telegramMessagesTotal.inc({ type: 'text', status: 'received' });
-      const telegramUser = await this.getTelegramUser(msg.from.id);
-      if (!telegramUser) {
-        await this.sendMessage(msg.from.id, 'Пожалуйста, начните с команды /start.');
+      const telegramId = msg.from.id;
+      
+      if (!isValidTelegramId(telegramId)) {
+        logger.warn('Invalid telegram ID in message', { telegramId });
         return;
       }
-      await this.saveMessage(telegramUser.id, msg.message_id, 'user', msg.text);
-      await this.bot?.sendChatAction(msg.from.id, 'typing');
+      
+      // Validate and sanitize message
+      const sanitizedText = sanitizeMessageText(msg.text, MAX_MESSAGE_LENGTH);
+      
+      if (!sanitizedText) {
+        await this.sendMessage(telegramId, 'Сообщение содержит недопустимые символы.');
+        return;
+      }
+      
+      if (sanitizedText.length > MAX_MESSAGE_LENGTH) {
+        await this.sendMessage(telegramId, 
+          `Сообщение слишком длинное. Максимум ${MAX_MESSAGE_LENGTH} символов.`);
+        return;
+      }
+      
+      telegramMessagesTotal.inc({ type: 'text', status: 'received' });
+      
+      const telegramUser = await this.getTelegramUser(telegramId);
+      if (!telegramUser) {
+        await this.sendMessage(telegramId, 'Пожалуйста, начните с команды /start.');
+        return;
+      }
+      
+      await this.saveMessage(telegramUser.id, msg.message_id, 'user', sanitizedText);
+      await this.bot?.sendChatAction(telegramId, 'typing');
+      
       const timer = telegramIntentDuration.startTimer();
-      const intentResult = await this.processWithAI(telegramUser, msg.text);
+      const intentResult = await this.processWithAI(telegramUser, sanitizedText);
       timer();
-      await this.sendMessage(msg.from.id, intentResult.response);
-      await this.saveMessage(telegramUser.id, 0, 'assistant', intentResult.response, intentResult.intent, intentResult.confidence);
+      
+      await this.sendMessage(telegramId, intentResult.response);
+      await this.saveMessage(
+        telegramUser.id, 
+        0, 
+        'assistant', 
+        intentResult.response, 
+        intentResult.intent, 
+        intentResult.confidence
+      );
+      
       if (intentResult.summary_update) {
         await this.updateContext(telegramUser.id, intentResult.summary_update);
       }
+      
       if (intentResult.intent && intentResult.confidence > INTENT_CONFIDENCE_THRESHOLD) {
         await this.executeIntent(telegramUser, intentResult);
       }
+      
       telegramMessagesTotal.inc({ type: 'text', status: 'success' });
     } catch (error) {
-      logger.error('Error handling message:', error);
+      logger.error('Error handling message', { error, telegramId: msg.from?.id });
       telegramMessagesTotal.inc({ type: 'text', status: 'error' });
-      await this.sendMessage(msg.from.id, 'Извините, не смог обработать сообщение.');
+      if (msg.from?.id) {
+        await this.sendMessage(msg.from.id, 'Извините, не смог обработать сообщение.');
+      }
     }
   }
 
   private async handlePhoto(msg: TelegramBot.Message): Promise<void> {
     if (!msg.photo || !msg.from) return;
+    
+    let tempFilePath: string | null = null;
+    
     try {
+      const telegramId = msg.from.id;
+      
+      if (!isValidTelegramId(telegramId)) {
+        logger.warn('Invalid telegram ID in photo', { telegramId });
+        return;
+      }
+      
       telegramMessagesTotal.inc({ type: 'photo', status: 'received' });
-      const telegramUser = await this.getTelegramUser(msg.from.id);
+      
+      const telegramUser = await this.getTelegramUser(telegramId);
       if (!telegramUser) {
-        await this.sendMessage(msg.from.id, 'Пожалуйста, начните с /start.');
+        await this.sendMessage(telegramId, 'Пожалуйста, начните с /start.');
         return;
       }
       
       const photo = msg.photo[msg.photo.length - 1];
       
-      if (photo.file_size && photo.file_size > MAX_FILE_SIZE_MB * 1024 * 1024) {
-        await this.sendMessage(msg.from.id, `Файл слишком большой. Максимум ${MAX_FILE_SIZE_MB}MB.`);
+      // Validate file size
+      if (photo.file_size && photo.file_size > MAX_FILE_SIZE_BYTES) {
+        await this.sendMessage(telegramId, 
+          `Файл слишком большой. Максимум ${MAX_FILE_SIZE_MB}MB.`);
         return;
       }
 
-      await this.sendMessage(msg.from.id, 'Обрабатываю фото...');
+      await this.sendMessage(telegramId, 'Обрабатываю фото...');
       
       const fileLink = await this.bot?.getFileLink(photo.file_id);
       if (!fileLink) {
-        await this.sendMessage(msg.from.id, 'Не удалось получить файл.');
+        await this.sendMessage(telegramId, 'Не удалось получить файл.');
         return;
       }
 
-      const imageBase64 = await this.downloadAndConvertToBase64(fileLink);
+      // Download to temp file with proper cleanup
+      tempFilePath = path.join(
+        TEMP_DIR,
+        `tg_${telegramId}_${Date.now()}_${crypto.randomBytes(8).toString('hex')}.jpg`
+      );
+      
+      const imageBase64 = await this.downloadImageToBase64(fileLink, tempFilePath);
       const ocrResult = await openaiService.recognizeMeterReading(imageBase64);
       
       if (ocrResult.success && ocrResult.value) {
-        await this.sendMessage(msg.from.id, `Распознал: ${ocrResult.meter_type || 'счётчик'} = ${ocrResult.value}`);
+        await this.sendMessage(telegramId, 
+          `Распознал: ${ocrResult.meter_type || 'счётчик'} = ${ocrResult.value}`);
         telegramMessagesTotal.inc({ type: 'photo', status: 'ocr_success' });
       } else {
-        await this.sendMessage(msg.from.id, 'Не смог прочитать показания с фото. Попробуйте сфотографировать чётче.');
+        await this.sendMessage(telegramId, 
+          'Не смог прочитать показания с фото. Попробуйте сфотографировать чётче.');
         telegramMessagesTotal.inc({ type: 'photo', status: 'ocr_failed' });
       }
     } catch (error) {
-      logger.error('Error handling photo:', error);
+      logger.error('Error handling photo', { error, telegramId: msg.from?.id });
       telegramMessagesTotal.inc({ type: 'photo', status: 'error' });
-      await this.sendMessage(msg.from.id, 'Ошибка обработки фото.');
+      if (msg.from?.id) {
+        await this.sendMessage(msg.from.id, 'Ошибка обработки фото.');
+      }
+    } finally {
+      // ALWAYS cleanup temp file
+      if (tempFilePath) {
+        try {
+          await fs.promises.unlink(tempFilePath);
+          logger.debug('Temp file cleaned up', { tempFilePath });
+        } catch (err) {
+          logger.warn('Failed to delete temp file', { tempFilePath, error: err });
+        }
+      }
     }
   }
 
-  private async downloadAndConvertToBase64(url: string): Promise<string> {
+  private async downloadImageToBase64(url: string, tempFilePath: string): Promise<string> {
     try {
       const response = await axios.get(url, {
-        responseType: 'arraybuffer',
-        timeout: 10000
+        responseType: 'stream',
+        timeout: 10000,
+        maxContentLength: MAX_FILE_SIZE_BYTES
       });
 
-      const buffer = Buffer.from(response.data);
+      // Download to temp file
+      await pipeline(
+        response.data,
+        fs.createWriteStream(tempFilePath)
+      );
+
+      // Read and convert to base64
+      const buffer = await fs.promises.readFile(tempFilePath);
       return buffer.toString('base64');
+      
     } catch (error) {
       logger.error('Error downloading image', { error, url });
       throw new Error('Failed to download image');
@@ -489,20 +681,37 @@ class TelegramService {
     try {
       await this.bot?.answerCallbackQuery(query.id);
     } catch (error) {
-      logger.error('Error handling callback query:', error);
+      logger.error('Error handling callback query', { error });
     }
   }
 
   private async processWithAI(telegramUser: TelegramUser, message: string): Promise<IntentResult> {
     try {
-      const history = await this.getConversationHistory(telegramUser.id, CONVERSATION_HISTORY_LIMIT);
+      const history = await this.getConversationHistory(
+        telegramUser.id, 
+        CONVERSATION_HISTORY_LIMIT,
+        CONVERSATION_HISTORY_MAX_AGE_HOURS
+      );
       const context = await this.getContext(telegramUser.id);
       const systemPrompt = await this.getSystemPrompt(telegramUser.language_code);
       const intents = await this.getIntents();
-      return await openaiService.processMessage(message, history, context.conversation_summary || '', systemPrompt, intents, telegramUser.language_code);
+      
+      return await openaiService.processMessage(
+        message, 
+        history, 
+        context.conversation_summary || '', 
+        systemPrompt, 
+        intents, 
+        telegramUser.language_code
+      );
     } catch (error) {
-      logger.error('Error processing with AI:', error);
-      return { intent: 'unknown', confidence: 0, parameters: {}, response: 'Извините, не понял.' };
+      logger.error('Error processing with AI', { error });
+      return { 
+        intent: 'unknown', 
+        confidence: 0, 
+        parameters: {}, 
+        response: 'Извините, не понял.' 
+      };
     }
   }
 
@@ -512,44 +721,80 @@ class TelegramService {
 
   private async getTelegramUser(telegramId: number): Promise<TelegramUser | null> {
     const result = await pool.query(
-      `SELECT id, user_id, telegram_id, language_code FROM telegram_users WHERE telegram_id = $1 AND deleted_at IS NULL`,
+      `SELECT id, user_id, telegram_id, language_code 
+       FROM telegram_users 
+       WHERE telegram_id = $1 AND deleted_at IS NULL`,
       [telegramId]
     );
+    
     if (result.rows.length === 0) return null;
-    await pool.query('UPDATE telegram_users SET last_interaction_at = NOW() WHERE id = $1', [result.rows[0].id]);
+    
+    await pool.query(
+      'UPDATE telegram_users SET last_interaction_at = NOW() WHERE id = $1',
+      [result.rows[0].id]
+    );
+    
     return result.rows[0];
   }
 
-  private async saveMessage(telegramUserId: string, telegramMessageId: number, role: 'user' | 'assistant', content: string, intent?: string, confidence?: number): Promise<void> {
+  private async saveMessage(
+    telegramUserId: string, 
+    telegramMessageId: number, 
+    role: 'user' | 'assistant', 
+    content: string, 
+    intent?: string, 
+    confidence?: number
+  ): Promise<void> {
     await pool.query(
-      `INSERT INTO conversations (telegram_user_id, telegram_message_id, role, content, intent, intent_confidence) VALUES ($1, $2, $3, $4, $5, $6)`,
+      `INSERT INTO conversations 
+       (telegram_user_id, telegram_message_id, role, content, intent, intent_confidence) 
+       VALUES ($1, $2, $3, $4, $5, $6)`,
       [telegramUserId, telegramMessageId, role, content, intent, confidence]
     );
   }
 
-  private async getConversationHistory(telegramUserId: string, limit: number): Promise<ConversationMessage[]> {
+  private async getConversationHistory(
+    telegramUserId: string, 
+    limit: number,
+    maxAgeHours: number = 24
+  ): Promise<ConversationMessage[]> {
     const result = await pool.query(
-      `SELECT role, content FROM conversations WHERE telegram_user_id = $1 ORDER BY created_at DESC LIMIT $2`,
+      `SELECT role, content 
+       FROM conversations 
+       WHERE telegram_user_id = $1 
+         AND created_at > NOW() - INTERVAL '${maxAgeHours} hours'
+       ORDER BY created_at DESC 
+       LIMIT $2`,
       [telegramUserId, limit]
     );
     return result.rows.reverse();
   }
 
   private async getContext(telegramUserId: string): Promise<any> {
-    const result = await pool.query('SELECT * FROM user_context WHERE telegram_user_id = $1', [telegramUserId]);
+    const result = await pool.query(
+      'SELECT * FROM user_context WHERE telegram_user_id = $1',
+      [telegramUserId]
+    );
     return result.rows[0] || {};
   }
 
   private async updateContext(telegramUserId: string, summaryUpdate: string): Promise<void> {
     await pool.query(
-      `UPDATE user_context SET conversation_summary = COALESCE(conversation_summary || ' ', '') || $1, last_updated_at = NOW() WHERE telegram_user_id = $2`,
+      `UPDATE user_context 
+       SET conversation_summary = COALESCE(conversation_summary || ' ', '') || $1, 
+           last_updated_at = NOW() 
+       WHERE telegram_user_id = $2`,
       [summaryUpdate, telegramUserId]
     );
   }
 
   private async getSystemPrompt(languageCode: string): Promise<string> {
     const result = await pool.query(
-      `SELECT content FROM system_prompts WHERE is_active = true AND language_code = $1 ORDER BY version DESC LIMIT 1`,
+      `SELECT content 
+       FROM system_prompts 
+       WHERE is_active = true AND language_code = $1 
+       ORDER BY version DESC 
+       LIMIT 1`,
       [languageCode]
     );
     return result.rows[0]?.content || '';
@@ -557,7 +802,10 @@ class TelegramService {
 
   private async getIntents(): Promise<any[]> {
     const result = await pool.query(
-      `SELECT code, name, description, examples, parameters FROM intents WHERE is_active = true AND deleted_at IS NULL ORDER BY priority DESC, code`
+      `SELECT code, name, description, examples, parameters 
+       FROM intents 
+       WHERE is_active = true AND deleted_at IS NULL 
+       ORDER BY priority DESC, code`
     );
     return result.rows;
   }
@@ -581,13 +829,14 @@ class TelegramService {
       logger.debug('Message queued', { telegramId, textLength: text.length });
       telegramMessagesTotal.inc({ type: 'outgoing', status: 'queued' });
     } catch (error) {
-      logger.error('Failed to queue message', error);
+      logger.error('Failed to queue message', { error });
       await this.sendMessageDirect(telegramId, text, options);
     }
   }
 
   private async sendMessageDirect(telegramId: number, text: string, options?: any): Promise<void> {
     if (!this.bot) return;
+    
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
       try {
         await this.bot.sendMessage(telegramId, text, options);
@@ -609,6 +858,42 @@ class TelegramService {
     await this.sendMessage(telegramId, text, options);
   }
 
+  async getWebhookInfo(): Promise<any> {
+    if (!this.bot) {
+      throw new Error('Bot not initialized');
+    }
+    return await this.bot.getWebHookInfo();
+  }
+
+  private async cleanupOldTempFiles(): Promise<void> {
+    try {
+      const files = await fs.promises.readdir(TEMP_DIR);
+      const now = Date.now();
+      const maxAge = 24 * 60 * 60 * 1000; // 24 hours
+      
+      let cleaned = 0;
+      
+      for (const file of files) {
+        const filePath = path.join(TEMP_DIR, file);
+        try {
+          const stats = await fs.promises.stat(filePath);
+          if (now - stats.mtimeMs > maxAge) {
+            await fs.promises.unlink(filePath);
+            cleaned++;
+          }
+        } catch (err) {
+          logger.debug('Could not clean temp file', { file, error: err });
+        }
+      }
+      
+      if (cleaned > 0) {
+        logger.info('Cleaned up old temp files', { count: cleaned });
+      }
+    } catch (error) {
+      logger.error('Error cleaning up temp files', { error });
+    }
+  }
+
   private sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
@@ -618,27 +903,36 @@ class TelegramService {
     try {
       await this.bot.processUpdate(update);
     } catch (error) {
-      logger.error('Error processing webhook update:', error);
+      logger.error('Error processing webhook update', { error });
     }
   }
 
   async shutdown(): Promise<void> {
+    logger.info('Shutting down Telegram service...');
+    
     if (this.messageWorker) {
       await this.messageWorker.close();
       logger.info('Telegram message worker closed');
     }
+    
     if (this.messageQueue) {
       await this.messageQueue.close();
       logger.info('Telegram message queue closed');
     }
+    
     if (this.redisConnection) {
       await this.redisConnection.quit();
       logger.info('Redis connection closed');
     }
+    
     if (this.bot) {
       await this.bot.stopPolling();
       this.bot = null;
+      logger.info('Bot polling stopped');
     }
+    
+    // Cleanup temp files on shutdown
+    await this.cleanupOldTempFiles();
   }
 }
 
