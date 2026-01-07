@@ -5,7 +5,7 @@ import { db } from '../db';
 import { redis } from '../utils/redis';
 import { logger } from '../utils/logger';
 import { CONSTANTS } from '../config/constants';
-import { AuthService } from '../services/auth.service';
+import { authService } from '../services/auth.service';
 
 export interface AuthUser {
   id: string;
@@ -114,19 +114,41 @@ export const authenticate = async (
   next: NextFunction
 ) => {
   try {
-    const authHeader = req.headers.authorization;
+    // CHANGED: Read token from httpOnly cookie instead of Authorization header
+    const token = req.cookies?.accessToken;
     
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    if (!token) {
+      // Fallback to Authorization header for API clients (mobile apps, etc.)
+      const authHeader = req.headers.authorization;
+      if (authHeader && authHeader.startsWith('Bearer ')) {
+        const headerToken = authHeader.substring(7);
+        // Use header token
+        const decoded = authService.verifyAccessToken(headerToken);
+        const isRevoked = await authService.isTokenRevoked(decoded.tokenId);
+        if (isRevoked) {
+          throw new AppError('Token has been revoked', 401);
+        }
+        
+        let user = await getUserFromCache(decoded.userId);
+        if (!user) {
+          user = await loadUserFromDB(decoded.userId);
+        }
+        if (!user) {
+          throw new AppError('User not found', 401);
+        }
+        
+        req.user = user;
+        return next();
+      }
+      
       throw new AppError('Authentication required', 401);
     }
-
-    const token = authHeader.substring(7);
     
-    // Verify and decode token
-    const decoded = AuthService.verifyAccessToken(token);
+    // Verify and decode token from cookie
+    const decoded = authService.verifyAccessToken(token);
 
     // Check if token has been revoked
-    const isRevoked = await AuthService.isTokenRevoked(decoded.tokenId);
+    const isRevoked = await authService.isTokenRevoked(decoded.tokenId);
     if (isRevoked) {
       throw new AppError('Token has been revoked', 401);
     }
