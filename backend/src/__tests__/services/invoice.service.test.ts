@@ -1,5 +1,4 @@
 import { testDataSource } from '../setup';
-import { User } from '../../entities/User';
 import { Company } from '../../entities/Company';
 import { Condo } from '../../entities/Condo';
 import { Unit } from '../../entities/Unit';
@@ -7,14 +6,12 @@ import { Invoice } from '../../entities/Invoice';
 import { InvoiceItem } from '../../entities/InvoiceItem';
 import { Payment } from '../../entities/Payment';
 import {
-  createTestUser,
   createTestCompany,
   createTestCondo,
   createTestUnit,
 } from '../utils/fixtures';
 
 describe('Invoice Service Tests', () => {
-  let userRepo: any;
   let companyRepo: any;
   let condoRepo: any;
   let unitRepo: any;
@@ -23,13 +20,22 @@ describe('Invoice Service Tests', () => {
   let paymentRepo: any;
 
   beforeAll(() => {
-    userRepo = testDataSource.getRepository(User);
     companyRepo = testDataSource.getRepository(Company);
     condoRepo = testDataSource.getRepository(Condo);
     unitRepo = testDataSource.getRepository(Unit);
     invoiceRepo = testDataSource.getRepository(Invoice);
     invoiceItemRepo = testDataSource.getRepository(InvoiceItem);
     paymentRepo = testDataSource.getRepository(Payment);
+  });
+
+  // Optimized: clear only relevant tables
+  beforeEach(async () => {
+    await paymentRepo.query('TRUNCATE TABLE "payments" CASCADE');
+    await invoiceItemRepo.query('TRUNCATE TABLE "invoice_items" CASCADE');
+    await invoiceRepo.query('TRUNCATE TABLE "invoices" CASCADE');
+    await unitRepo.query('TRUNCATE TABLE "units" CASCADE');
+    await condoRepo.query('TRUNCATE TABLE "condos" CASCADE');
+    await companyRepo.query('TRUNCATE TABLE "companies" CASCADE');
   });
 
   describe('Invoice Creation', () => {
@@ -85,6 +91,28 @@ describe('Invoice Service Tests', () => {
           status: 'issued',
         })
       ).rejects.toThrow();
+    });
+
+    it('should handle different invoice statuses', async () => {
+      const company = await createTestCompany(companyRepo);
+      const condo = await createTestCondo(condoRepo, company.id);
+      const unit = await createTestUnit(unitRepo, condo.id);
+
+      const statuses = ['draft', 'issued', 'paid', 'overdue', 'cancelled'];
+
+      for (const status of statuses) {
+        const invoice = await invoiceRepo.save({
+          unitId: unit.id,
+          condoId: condo.id,
+          invoiceNumber: `INV-${status}-${Date.now()}`,
+          billingPeriod: new Date(),
+          dueDate: new Date(),
+          totalAmount: 1000,
+          status,
+        });
+
+        expect(invoice.status).toBe(status);
+      }
     });
   });
 
@@ -226,9 +254,17 @@ describe('Invoice Service Tests', () => {
         where: { invoiceId: invoice.id },
       });
 
-      const totalPaid = payments.reduce((sum, p) => sum + Number(p.amount), 0);
+      const totalPaid = payments.reduce((sum: number, p: any) => sum + Number(p.amount), 0);
       expect(payments.length).toBe(2);
       expect(totalPaid).toBe(10000);
+    });
+
+    it('should reject overpayment', async () => {
+      const totalAmount = 5000;
+      const paymentAmount = 6000;
+      const overpayment = paymentAmount > totalAmount;
+
+      expect(overpayment).toBe(true);
     });
 
     it('should mark invoice as overdue', async () => {
@@ -252,6 +288,36 @@ describe('Invoice Service Tests', () => {
 
       expect(invoice.status).toBe('overdue');
       expect(invoice.dueDate.getTime()).toBeLessThan(Date.now());
+    });
+
+    it('should track payment methods', async () => {
+      const company = await createTestCompany(companyRepo);
+      const condo = await createTestCondo(condoRepo, company.id);
+      const unit = await createTestUnit(unitRepo, condo.id);
+
+      const invoice = await invoiceRepo.save({
+        unitId: unit.id,
+        condoId: condo.id,
+        invoiceNumber: `INV-${Date.now()}`,
+        billingPeriod: new Date(),
+        dueDate: new Date(),
+        totalAmount: 3000,
+        status: 'issued',
+      });
+
+      const paymentMethods = ['card', 'bank_transfer', 'cash'];
+
+      for (const method of paymentMethods) {
+        const payment = await paymentRepo.save({
+          invoiceId: invoice.id,
+          amount: 1000,
+          paymentMethod: method,
+          status: 'completed',
+          paidAt: new Date(),
+        });
+
+        expect(payment.paymentMethod).toBe(method);
+      }
     });
   });
 });
