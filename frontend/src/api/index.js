@@ -1,8 +1,10 @@
 import axios from 'axios';
-import { useAuthStore } from '../stores';
 import router from '../router';
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3000/api';
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL;
+if (!API_BASE_URL) {
+  throw new Error('VITE_API_BASE_URL environment variable is not set');
+}
 
 const apiClient = axios.create({
   baseURL: API_BASE_URL,
@@ -10,10 +12,12 @@ const apiClient = axios.create({
   headers: { 'Content-Type': 'application/json' }
 });
 
+let authStore = null;
+export const setAuthStore = (store) => { authStore = store; };
+
 apiClient.interceptors.request.use(
   (config) => {
-    const authStore = useAuthStore();
-    if (authStore.token) {
+    if (authStore?.token) {
       config.headers.Authorization = `Bearer ${authStore.token}`;
     }
     return config;
@@ -21,15 +25,42 @@ apiClient.interceptors.request.use(
   (error) => Promise.reject(error)
 );
 
+const MAX_RETRIES = 3;
+const RETRY_DELAY = 1000;
+
+const shouldRetry = (error) => {
+  if (!error.config || error.config.__retryCount >= MAX_RETRIES) return false;
+  const status = error.response?.status;
+  return !status || status >= 500 || status === 408 || status === 429;
+};
+
+const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
 apiClient.interceptors.response.use(
   (response) => response,
-  (error) => {
-    if (error.response?.status === 401) {
-      const authStore = useAuthStore();
+  async (error) => {
+    const config = error.config;
+
+    if (shouldRetry(error)) {
+      config.__retryCount = config.__retryCount || 0;
+      config.__retryCount++;
+      await delay(RETRY_DELAY * config.__retryCount);
+      return apiClient(config);
+    }
+
+    if (error.response?.status === 401 && authStore) {
       authStore.logout();
       router.push('/login');
     }
-    return Promise.reject(error.response?.data || error);
+
+    if (!error.response && !navigator.onLine) {
+      return Promise.reject({
+        message: 'No internet connection. Please check your network.',
+        code: 'NETWORK_ERROR'
+      });
+    }
+
+    return Promise.reject(error.response?.data || { message: error.message });
   }
 );
 

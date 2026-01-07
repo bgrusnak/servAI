@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia';
-import { authAPI } from '../api';
+import { authAPI, setAuthStore } from '../api';
 
 export const useAuthStore = defineStore('auth', {
   state: () => ({
@@ -28,6 +28,7 @@ export const useAuthStore = defineStore('auth', {
         this.user = response.data.user;
         this.isAuthenticated = true;
         localStorage.setItem('token', this.token);
+        setAuthStore(this);
         return response.data;
       } catch (error) {
         this.error = error.message || 'Login failed';
@@ -41,7 +42,7 @@ export const useAuthStore = defineStore('auth', {
       try {
         await authAPI.logout();
       } catch (error) {
-        console.error('Logout API call failed', error);
+        // Ignore logout API errors
       } finally {
         this.user = null;
         this.token = null;
@@ -56,6 +57,7 @@ export const useAuthStore = defineStore('auth', {
         const response = await authAPI.me();
         this.user = response.data;
         this.isAuthenticated = true;
+        setAuthStore(this);
       } catch (error) {
         this.logout();
         throw error;

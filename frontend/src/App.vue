@@ -1,6 +1,13 @@
 <template>
   <router-view v-slot="{ Component }">
-    <component :is="Component" @vue:error="handleError" />
+    <suspense>
+      <component :is="Component" @vue:error="handleError" />
+      <template #fallback>
+        <div class="flex flex-center" style="min-height: 100vh;">
+          <q-spinner-dots color="primary" size="50px" />
+        </div>
+      </template>
+    </suspense>
   </router-view>
 </template>
 
@@ -8,19 +15,21 @@
 import { defineComponent, onMounted, onErrorCaptured } from 'vue';
 import { useAuthStore } from './stores';
 import { useQuasar } from 'quasar';
+import { useNetworkStatus } from './composables/useNetworkStatus';
 
 export default defineComponent({
   name: 'App',
   setup() {
     const authStore = useAuthStore();
     const $q = useQuasar();
+    const { isOnline } = useNetworkStatus();
 
     onMounted(async () => {
       if (authStore.token) {
         try {
           await authStore.fetchUser();
         } catch (error) {
-          console.error('Failed to fetch user on mount', error);
+          console.error('Failed to fetch user on mount:', error);
         }
       }
     });
@@ -28,10 +37,11 @@ export default defineComponent({
     onErrorCaptured((err, instance, info) => {
       console.error('Vue Error Caught:', err, info);
       $q.notify({
-        message: 'An error occurred. Please refresh the page.',
+        message: 'An unexpected error occurred. Please refresh the page.',
         color: 'negative',
         icon: 'error',
-        timeout: 5000
+        timeout: 5000,
+        actions: [{ label: 'Refresh', color: 'white', handler: () => window.location.reload() }]
       });
       return false;
     });
@@ -40,7 +50,16 @@ export default defineComponent({
       console.error('Component Error:', error);
     };
 
-    return { handleError };
+    window.addEventListener('unhandledrejection', (event) => {
+      console.error('Unhandled Promise Rejection:', event.reason);
+      $q.notify({
+        message: 'An error occurred while processing your request',
+        color: 'negative',
+        icon: 'error'
+      });
+    });
+
+    return { handleError, isOnline };
   }
 });
 </script>

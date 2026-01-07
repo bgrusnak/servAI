@@ -1,5 +1,6 @@
 import { createRouter, createWebHistory } from 'vue-router';
 import { useAuthStore } from '../stores';
+import { Loading } from 'quasar';
 
 const routes = [
   { path: '/login', name: 'Login', component: () => import('../pages/auth/LoginPage.vue'), meta: { requiresAuth: false } },
@@ -40,20 +41,35 @@ const routes = [
 
 const router = createRouter({ 
   history: createWebHistory(), 
-  routes 
+  routes,
+  scrollBehavior(to, from, savedPosition) {
+    if (savedPosition) {
+      return savedPosition;
+    } else {
+      return { top: 0 };
+    }
+  }
 });
 
 router.beforeEach((to, from, next) => {
+  Loading.show();
+  
   const authStore = useAuthStore();
   const requiresAuth = to.matched.some(record => record.meta.requiresAuth !== false);
   
   if (requiresAuth && !authStore.isAuthenticated) { 
+    Loading.hide();
     next('/login'); 
   } else if (to.path === '/login' && authStore.isAuthenticated) { 
+    Loading.hide();
     next('/'); 
   } else { 
     next(); 
   }
+});
+
+router.afterEach(() => {
+  Loading.hide();
 });
 
 export default router;
