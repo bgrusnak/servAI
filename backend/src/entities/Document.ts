@@ -6,11 +6,18 @@ import {
   UpdateDateColumn,
   ManyToOne,
   JoinColumn,
+  Index,
 } from 'typeorm';
 import { Condo } from './Condo';
 import { User } from './User';
 
 @Entity('documents')
+@Index('idx_documents_condo_id', ['condoId'])
+@Index('idx_documents_uploaded_by', ['uploadedBy'])
+@Index('idx_documents_document_type', ['documentType'])
+@Index('idx_documents_is_public', ['isPublic'])
+@Index('idx_documents_condo_type', ['condoId', 'documentType'])
+@Index('idx_documents_created_at', ['createdAt'])
 export class Document {
   @PrimaryGeneratedColumn('uuid')
   id: string;
