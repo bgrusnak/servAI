@@ -3,6 +3,8 @@ import express from 'express';
 import { createServer } from 'http';
 import cors from 'cors';
 import helmet from 'helmet';
+import cookieParser from 'cookie-parser';
+import csrf from 'csurf';
 import path from 'path';
 import { config } from './config';
 import { logger } from './utils/logger';
@@ -43,9 +45,12 @@ app.use(helmet());
 app.use(
   cors({
     origin: config.cors.allowedOrigins,
-    credentials: config.cors.credentials,
+    credentials: config.cors.credentials, // Important for cookies!
   })
 );
+
+// Cookie parser - MUST be before CSRF
+app.use(cookieParser());
 
 // Static files for uploads
 const uploadsDir = process.env.UPLOAD_DIR || path.join(process.cwd(), 'uploads');
@@ -55,8 +60,44 @@ app.use('/uploads', express.static(uploadsDir));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// Raw body for Stripe webhooks
+// Raw body for Stripe webhooks (before CSRF)
 app.use('/api/v1/stripe/webhook', express.raw({ type: 'application/json' }));
+
+// CSRF protection (skip for stripe webhook and monitoring)
+const csrfProtection = csrf({ 
+  cookie: { 
+    httpOnly: false, // Frontend needs to read it
+    sameSite: 'strict',
+    secure: config.env === 'production'
+  } 
+});
+
+// Apply CSRF to all routes except public ones
+app.use((req, res, next) => {
+  // Skip CSRF for:
+  // - Stripe webhooks (they have signature verification)
+  // - Monitoring endpoints
+  // - Login/Register (need to get CSRF token first)
+  const skipPaths = [
+    '/api/v1/stripe/webhook',
+    '/health',
+    '/metrics',
+    '/api/v1/auth/login',
+    '/api/v1/auth/register',
+    '/api/v1/auth/csrf-token'
+  ];
+  
+  if (skipPaths.some(path => req.path.startsWith(path))) {
+    return next();
+  }
+  
+  csrfProtection(req, res, next);
+});
+
+// Provide CSRF token endpoint
+app.get('/api/v1/auth/csrf-token', (req, res) => {
+  res.json({ csrfToken: req.csrfToken?.() || '' });
+});
 
 // Metrics collection
 app.use(metricsMiddleware);
@@ -150,11 +191,11 @@ async function shutdown() {
     process.exit(0);
   });
   
-  // Force shutdown after 10 seconds
+  // Force shutdown after 30 seconds (increased from 10)
   setTimeout(() => {
     logger.warn('Forcing shutdown');
     process.exit(1);
-  }, 10000);
+  }, 30000);
 }
 
 process.on('SIGTERM', shutdown);
