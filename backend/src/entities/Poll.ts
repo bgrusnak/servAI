@@ -7,6 +7,7 @@ import {
   ManyToOne,
   OneToMany,
   JoinColumn,
+  Index,
 } from 'typeorm';
 import { Condo } from './Condo';
 import { User } from './User';
@@ -26,6 +27,12 @@ export enum PollStatus {
 }
 
 @Entity('polls')
+@Index('idx_polls_condo_id', ['condoId'])
+@Index('idx_polls_created_by', ['createdBy'])
+@Index('idx_polls_status', ['status'])
+@Index('idx_polls_poll_type', ['pollType'])
+@Index('idx_polls_condo_status', ['condoId', 'status'])
+@Index('idx_polls_end_date', ['endDate'])
 export class Poll {
   @PrimaryGeneratedColumn('uuid')
   id: string;
