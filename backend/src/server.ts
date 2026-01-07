@@ -11,7 +11,7 @@ import { config } from './config';
 import { logger, securityLogger } from './utils/logger';
 import { errorHandler } from './middleware/errorHandler';
 import { requestLogger } from './middleware/requestLogger';
-import { metricsMiddleware } from './middleware/metricsMiddleware';
+import { metricsMiddleware } from './middleware/metrics'; // Updated import
 import { authenticateToken } from './middleware/auth';
 import { telegramService } from './services/telegram.service';
 import { websocketService } from './services/websocket.service';
@@ -281,6 +281,7 @@ app.use((req, res, next) => {
     '/api/v1/stripe/webhook',
     '/health',
     '/metrics',
+    '/ping',
     '/api/v1/auth/csrf-token',
   ];
 
@@ -298,13 +299,13 @@ app.use((req, res, next) => {
   csrfProtection(req, res, next);
 });
 
-// Metrics collection
+// Metrics collection (before request logging for accurate timing)
 app.use(metricsMiddleware);
 
 // Request logging
 app.use(requestLogger);
 
-// Monitoring endpoints (no /api prefix)
+// Monitoring endpoints (no /api prefix, no auth)
 app.use('/', monitoringRoutes);
 
 // API routes (v1)
@@ -406,8 +407,10 @@ if (require.main === module) {
     logger.info(`servAI Backend v${require('../package.json').version}`);
     logger.info(`Server running on port ${config.port}`);
     logger.info(`Environment: ${config.env}`);
-    logger.info(`Metrics: http://localhost:${config.port}/metrics`);
-    logger.info(`Health: http://localhost:${config.port}/health`);
+    logger.info(`Metrics: http://localhost:${config.port}/metrics (Prometheus format)`);
+    logger.info(`Health: http://localhost:${config.port}/health (detailed)`);
+    logger.info(`Health: http://localhost:${config.port}/health/live (liveness)`);
+    logger.info(`Health: http://localhost:${config.port}/health/ready (readiness)`);
     logger.info(`WebSocket: ws://localhost:${config.port}/ws`);
     logger.info(`Uploads: ${uploadsDir} (protected)`);
     logger.info(`CSRF: Enabled (Custom HMAC-based tokens, XSS-resistant)`);
