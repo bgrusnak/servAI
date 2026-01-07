@@ -4,6 +4,7 @@ import { canAccessCompany, authorize } from '../middleware/authorize.middleware'
 import { CompanyService } from '../services/company.service';
 import { AppError } from '../middleware/errorHandler';
 import { CONSTANTS } from '../config/constants';
+import { validate as isUUID } from 'uuid';
 
 const companiesRouter = Router();
 
@@ -29,8 +30,12 @@ companiesRouter.get('/', async (req: AuthRequest, res: Response, next: NextFunct
 // ✅ Get company by ID
 companiesRouter.get('/:id', canAccessCompany(), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
-    const company = await CompanyService.getCompanyById(req.params.id, req.user!.id);
+    // ✅ UUID validation
+    if (!isUUID(req.params.id)) {
+      throw new AppError('Invalid company ID format', 400);
+    }
 
+    const company = await CompanyService.getCompanyById(req.params.id, req.user!.id);
     if (!company) {
       throw new AppError('Company not found', 404);
     }
@@ -70,6 +75,11 @@ companiesRouter.post('/', authorize('superadmin'), async (req: AuthRequest, res:
 // ✅ Update company
 companiesRouter.patch('/:id', authorize('uk_director'), canAccessCompany(), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
+    // ✅ UUID validation
+    if (!isUUID(req.params.id)) {
+      throw new AppError('Invalid company ID format', 400);
+    }
+
     const { name, legal_name, inn, kpp, address, phone, email, website, is_active } = req.body;
 
     const company = await CompanyService.updateCompany(req.params.id, {
@@ -93,6 +103,11 @@ companiesRouter.patch('/:id', authorize('uk_director'), canAccessCompany(), asyn
 // ✅ Delete company (soft delete)
 companiesRouter.delete('/:id', authorize('superadmin'), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
+    // ✅ UUID validation
+    if (!isUUID(req.params.id)) {
+      throw new AppError('Invalid company ID format', 400);
+    }
+
     await CompanyService.deleteCompany(req.params.id);
     res.json({ message: 'Company deleted successfully' });
   } catch (error) {

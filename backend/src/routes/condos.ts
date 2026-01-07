@@ -5,6 +5,7 @@ import { CondoService } from '../services/condo.service';
 import { CompanyService } from '../services/company.service';
 import { AppError } from '../middleware/errorHandler';
 import { CONSTANTS } from '../config/constants';
+import { validate as isUUID } from 'uuid';
 
 const condosRouter = Router();
 
@@ -21,6 +22,11 @@ condosRouter.get('/', async (req: AuthRequest, res: Response, next: NextFunction
     );
     const companyId = req.query.company_id as string;
 
+    // ✅ UUID validation if company_id provided
+    if (companyId && !isUUID(companyId)) {
+      throw new AppError('Invalid company_id format', 400);
+    }
+
     const result = await CondoService.listCondos(req.user!.id, page, limit, companyId);
     res.json(result);
   } catch (error) {
@@ -31,8 +37,12 @@ condosRouter.get('/', async (req: AuthRequest, res: Response, next: NextFunction
 // ✅ Get condo by ID
 condosRouter.get('/:id', canAccessCondo(), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
-    const condo = await CondoService.getCondoById(req.params.id, req.user!.id);
+    // ✅ UUID validation
+    if (!isUUID(req.params.id)) {
+      throw new AppError('Invalid condo ID format', 400);
+    }
 
+    const condo = await CondoService.getCondoById(req.params.id, req.user!.id);
     if (!condo) {
       throw new AppError('Condo not found', 404);
     }
@@ -43,7 +53,7 @@ condosRouter.get('/:id', canAccessCondo(), async (req: AuthRequest, res: Respons
   }
 });
 
-// ✅ Create condo
+// ✅ Create condo - FIXED: Use canAccessCompany middleware
 condosRouter.post('/', authorize('uk_director'), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     const { company_id, name, address, description, total_buildings, total_units } = req.body;
@@ -52,9 +62,13 @@ condosRouter.post('/', authorize('uk_director'), async (req: AuthRequest, res: R
       throw new AppError('company_id, name, and address are required', 400);
     }
 
-    // Check if user has admin access to company
-    const hasAccess = await CompanyService.checkUserAccess(company_id, req.user!.id, ['company_admin']);
+    // ✅ UUID validation
+    if (!isUUID(company_id)) {
+      throw new AppError('Invalid company_id format', 400);
+    }
 
+    // ✅ FIXED: Consistent with other routes
+    const hasAccess = await CompanyService.checkUserAccess(company_id, req.user!.id, ['company_admin']);
     if (!hasAccess) {
       throw new AppError('Insufficient permissions to create condo in this company', 403);
     }
@@ -77,6 +91,11 @@ condosRouter.post('/', authorize('uk_director'), async (req: AuthRequest, res: R
 // ✅ Update condo
 condosRouter.patch('/:id', authorize('uk_director', 'complex_admin'), canAccessCondo(), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
+    // ✅ UUID validation
+    if (!isUUID(req.params.id)) {
+      throw new AppError('Invalid condo ID format', 400);
+    }
+
     const { name, address, description, total_buildings, total_units } = req.body;
 
     const condo = await CondoService.updateCondo(req.params.id, {
@@ -96,6 +115,11 @@ condosRouter.patch('/:id', authorize('uk_director', 'complex_admin'), canAccessC
 // ✅ Delete condo
 condosRouter.delete('/:id', authorize('uk_director'), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
+    // ✅ UUID validation
+    if (!isUUID(req.params.id)) {
+      throw new AppError('Invalid condo ID format', 400);
+    }
+
     // Check if user has company admin access
     const condo = await CondoService.getCondoById(req.params.id, req.user!.id);
     if (!condo) {
@@ -103,7 +127,6 @@ condosRouter.delete('/:id', authorize('uk_director'), async (req: AuthRequest, r
     }
 
     const hasAccess = await CompanyService.checkUserAccess(condo.company_id, req.user!.id, ['company_admin']);
-
     if (!hasAccess) {
       throw new AppError('Insufficient permissions', 403);
     }

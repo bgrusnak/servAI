@@ -5,6 +5,7 @@ import { ResidentService } from '../services/resident.service';
 import { CondoService } from '../services/condo.service';
 import { UnitService } from '../services/unit.service';
 import { AppError } from '../middleware/errorHandler';
+import { validate as isUUID } from 'uuid';
 
 const residentsRouter = Router();
 
@@ -14,6 +15,11 @@ residentsRouter.use(authenticate);
 // ✅ List residents by unit
 residentsRouter.get('/unit/:unitId', canAccessUnit(), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
+    // ✅ UUID validation
+    if (!isUUID(req.params.unitId)) {
+      throw new AppError('Invalid unit ID format', 400);
+    }
+
     const includeInactive = req.query.include_inactive === 'true';
     const residents = await ResidentService.listResidentsByUnit(req.params.unitId, includeInactive);
     res.json(residents);
@@ -36,8 +42,12 @@ residentsRouter.get('/my-units', async (req: AuthRequest, res: Response, next: N
 // ✅ Get resident by ID
 residentsRouter.get('/:id', async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
-    const resident = await ResidentService.getResidentById(req.params.id);
+    // ✅ UUID validation
+    if (!isUUID(req.params.id)) {
+      throw new AppError('Invalid resident ID format', 400);
+    }
 
+    const resident = await ResidentService.getResidentById(req.params.id);
     if (!resident) {
       throw new AppError('Resident not found', 404);
     }
@@ -74,8 +84,15 @@ residentsRouter.post('/', authorize('uk_director', 'complex_admin'), async (req:
       throw new AppError('user_id and unit_id are required', 400);
     }
 
-    const unit = await UnitService.getUnitById(unit_id);
+    // ✅ UUID validation
+    if (!isUUID(user_id)) {
+      throw new AppError('Invalid user_id format', 400);
+    }
+    if (!isUUID(unit_id)) {
+      throw new AppError('Invalid unit_id format', 400);
+    }
 
+    const unit = await UnitService.getUnitById(unit_id);
     if (!unit) {
       throw new AppError('Unit not found', 404);
     }
@@ -107,8 +124,12 @@ residentsRouter.post('/', authorize('uk_director', 'complex_admin'), async (req:
 // ✅ Update resident
 residentsRouter.patch('/:id', authorize('uk_director', 'complex_admin'), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
-    const resident = await ResidentService.getResidentById(req.params.id);
+    // ✅ UUID validation
+    if (!isUUID(req.params.id)) {
+      throw new AppError('Invalid resident ID format', 400);
+    }
 
+    const resident = await ResidentService.getResidentById(req.params.id);
     if (!resident) {
       throw new AppError('Resident not found', 404);
     }
@@ -147,8 +168,12 @@ residentsRouter.patch('/:id', authorize('uk_director', 'complex_admin'), async (
 // ✅ Move out resident
 residentsRouter.post('/:id/move-out', authorize('uk_director', 'complex_admin'), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
-    const resident = await ResidentService.getResidentById(req.params.id);
+    // ✅ UUID validation
+    if (!isUUID(req.params.id)) {
+      throw new AppError('Invalid resident ID format', 400);
+    }
 
+    const resident = await ResidentService.getResidentById(req.params.id);
     if (!resident) {
       throw new AppError('Resident not found', 404);
     }
@@ -179,8 +204,12 @@ residentsRouter.post('/:id/move-out', authorize('uk_director', 'complex_admin'),
 // ✅ Delete resident
 residentsRouter.delete('/:id', authorize('uk_director', 'complex_admin'), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
-    const resident = await ResidentService.getResidentById(req.params.id);
+    // ✅ UUID validation
+    if (!isUUID(req.params.id)) {
+      throw new AppError('Invalid resident ID format', 400);
+    }
 
+    const resident = await ResidentService.getResidentById(req.params.id);
     if (!resident) {
       throw new AppError('Resident not found', 404);
     }
