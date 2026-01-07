@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia';
 import { authAPI } from '../api';
 import { sanitizeEmail } from '../utils/sanitize';
+import { getPrimaryRole, hasRole, isAdmin, isSuperAdmin } from '../utils/roles';
 
 export const useAuthStore = defineStore('auth', {
   state: () => ({
@@ -14,32 +15,15 @@ export const useAuthStore = defineStore('auth', {
   getters: {
     currentUser: (state) => state.user,
     userRoles: (state) => state.user?.roles || [],
-    primaryRole: (state) => {
-      const roles = state.user?.roles || [];
-      const priority = ['superadmin', 'uk_director', 'complex_admin', 'accountant', 'employee', 'security_guard', 'resident'];
-      for (const role of priority) {
-        const found = roles.find(r => r.role === role);
-        if (found) return found.role;
-      }
-      return null;
-    },
+    primaryRole: (state) => getPrimaryRole(state.user?.roles || []),
     userName: (state) => {
       if (!state.user) return '';
       return state.user.name || `${state.user.firstName || ''} ${state.user.lastName || ''}`.trim();
     },
     userEmail: (state) => state.user?.email,
-    isAdmin: (state) => {
-      const roles = state.user?.roles || [];
-      return roles.some(r => ['superadmin', 'uk_director', 'complex_admin'].includes(r.role));
-    },
-    isSuperAdmin: (state) => {
-      const roles = state.user?.roles || [];
-      return roles.some(r => r.role === 'superadmin');
-    },
-    hasRole: (state) => (role) => {
-      const roles = state.user?.roles || [];
-      return roles.some(r => r.role === role);
-    }
+    isAdmin: (state) => isAdmin(state.user?.roles || []),
+    isSuperAdmin: (state) => isSuperAdmin(state.user?.roles || []),
+    hasRole: (state) => (role) => hasRole(state.user?.roles || [], role)
   },
 
   actions: {
