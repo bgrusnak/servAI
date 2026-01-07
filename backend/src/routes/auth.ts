@@ -2,15 +2,31 @@ import { Router } from 'express';
 import { authService } from '../services/auth.service';
 import { validate } from '../middleware/validate.middleware';
 import { loginSchema, registerSchema } from '../schemas/auth.schema';
-import { authenticateToken } from '../middleware/auth.middleware';
+import { authenticate } from '../middleware/auth';
 import { authorize } from '../middleware/authorize.middleware';
 import { asyncHandler } from '../utils/asyncHandler';
+import rateLimit from 'express-rate-limit';
 
 const router = Router();
 
+// Rate limiters
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5, // 5 attempts
+  message: 'Too many login attempts, please try again later',
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const refreshLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  message: 'Too many refresh requests',
+});
+
 /**
  * POST /auth/register
- * ✅ FIXED: Регистрация ТОЛЬКО с ролью 'resident'
+ * Public registration - resident role only
  */
 router.post(
   '/register',
@@ -19,12 +35,12 @@ router.post(
     const { email, password, firstName, lastName, phone } = req.body;
     
     const result = await authService.register({
-      email,
+      email: email.trim().toLowerCase(),
       password,
-      firstName,
-      lastName,
+      firstName: firstName.trim(),
+      lastName: lastName.trim(),
       phone,
-      role: 'resident', // 🔒 FIXED ROLE
+      role: 'resident',
     });
 
     res.status(201).json(result);
@@ -33,11 +49,11 @@ router.post(
 
 /**
  * POST /auth/create-user
- * ✅ NEW: Только superadmin может создавать пользователей с ролями
+ * Admin-only user creation with custom roles
  */
 router.post(
   '/create-user',
-  authenticateToken,
+  authenticate,
   authorize('superadmin'),
   validate(registerSchema),
   asyncHandler(async (req, res) => {
@@ -49,10 +65,10 @@ router.post(
     }
     
     const result = await authService.register({
-      email,
+      email: email.trim().toLowerCase(),
       password,
-      firstName,
-      lastName,
+      firstName: firstName.trim(),
+      lastName: lastName.trim(),
       phone,
       role,
       companyId,
@@ -63,31 +79,63 @@ router.post(
   })
 );
 
+/**
+ * POST /auth/login
+ */
 router.post(
   '/login',
+  loginLimiter,
   validate(loginSchema),
   asyncHandler(async (req, res) => {
     const { email, password } = req.body;
-    const result = await authService.login(email, password);
+    const result = await authService.login(email.trim().toLowerCase(), password);
     res.json(result);
   })
 );
 
+/**
+ * POST /auth/refresh
+ */
 router.post(
   '/refresh',
+  refreshLimiter,
   asyncHandler(async (req, res) => {
     const { refreshToken } = req.body;
-    const result = await authService.refreshToken(refreshToken);
+    
+    if (!refreshToken) {
+      return res.status(400).json({ error: 'Refresh token required' });
+    }
+    
+    const result = await authService.refreshAccessToken(refreshToken);
     res.json(result);
   })
 );
 
+/**
+ * POST /auth/logout
+ */
 router.post(
   '/logout',
-  authenticateToken,
+  authenticate,
   asyncHandler(async (req, res) => {
-    await authService.logout(req.user.id);
+    const { refreshToken } = req.body;
+    
+    if (refreshToken) {
+      await authService.logout(refreshToken);
+    }
+    
     res.json({ message: 'Logged out successfully' });
+  })
+);
+
+/**
+ * GET /auth/me
+ */
+router.get(
+  '/me',
+  authenticate,
+  asyncHandler(async (req, res) => {
+    res.json({ user: req.user });
   })
 );
 
