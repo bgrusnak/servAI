@@ -1,15 +1,19 @@
 <template>
-  <router-view />
+  <router-view v-slot="{ Component }">
+    <component :is="Component" @vue:error="handleError" />
+  </router-view>
 </template>
 
 <script>
-import { defineComponent, onMounted } from 'vue';
+import { defineComponent, onMounted, onErrorCaptured } from 'vue';
 import { useAuthStore } from './stores';
+import { useQuasar } from 'quasar';
 
 export default defineComponent({
   name: 'App',
   setup() {
     const authStore = useAuthStore();
+    const $q = useQuasar();
 
     onMounted(async () => {
       if (authStore.token) {
@@ -21,7 +25,22 @@ export default defineComponent({
       }
     });
 
-    return {};
+    onErrorCaptured((err, instance, info) => {
+      console.error('Vue Error Caught:', err, info);
+      $q.notify({
+        message: 'An error occurred. Please refresh the page.',
+        color: 'negative',
+        icon: 'error',
+        timeout: 5000
+      });
+      return false;
+    });
+
+    const handleError = (error) => {
+      console.error('Component Error:', error);
+    };
+
+    return { handleError };
   }
 });
 </script>
