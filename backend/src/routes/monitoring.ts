@@ -1,7 +1,6 @@
 import { Router } from 'express';
-import { metrics } from '../monitoring/metrics';
-import { db } from '../db';
-import { redis } from '../utils/redis';
+import { getMetrics } from '../middleware/metrics';
+import healthRouter from './health';
 import { logger } from '../utils/logger';
 
 const router = Router();
@@ -10,78 +9,45 @@ const router = Router();
  * @route GET /metrics
  * @desc Prometheus metrics endpoint
  * @access Public (should be restricted by firewall in production)
+ * 
+ * Usage:
+ * - Prometheus scraping: prometheus.yml -> scrape_configs
+ * - Manual check: curl http://localhost:3000/metrics
+ * 
+ * Metrics included:
+ * - Default Node.js metrics (CPU, memory, GC, event loop)
+ * - HTTP request duration & count
+ * - Database query duration & pool stats
+ * - Redis operations & connection status
+ * - Authentication attempts
+ * - Rate limit hits
+ * - Telegram bot messages
+ * - Business metrics (tickets, invoices, etc.)
  */
-router.get('/metrics', metrics.getMetricsHandler());
+router.get('/metrics', getMetrics);
 
 /**
- * @route GET /health
- * @desc Detailed health check
- * @access Public
+ * Health check endpoints
+ * 
+ * GET /health - Full health check with all components
+ * GET /health/live - Liveness probe (is process alive?)
+ * GET /health/ready - Readiness probe (can accept traffic?)
+ * 
+ * Usage:
+ * - Kubernetes probes
+ * - Docker healthcheck
+ * - Uptime monitoring services (Uptime Robot, Better Uptime, etc.)
+ * - Load balancer health checks
  */
-router.get('/health', async (req, res) => {
-  const health: any = {
-    status: 'ok',
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
-    checks: {},
-  };
-
-  // Check database
-  try {
-    await db.query('SELECT 1');
-    health.checks.database = { status: 'ok' };
-  } catch (error) {
-    health.checks.database = { status: 'error', error: String(error) };
-    health.status = 'degraded';
-  }
-
-  // Check Redis
-  try {
-    await redis.ping();
-    health.checks.redis = { status: 'ok' };
-  } catch (error) {
-    health.checks.redis = { status: 'error', error: String(error) };
-    // Redis failure is not critical (we have fallback)
-    if (health.status === 'ok') {
-      health.status = 'degraded';
-    }
-  }
-
-  // Memory usage
-  const memUsage = process.memoryUsage();
-  health.memory = {
-    heapUsed: Math.round(memUsage.heapUsed / 1024 / 1024) + ' MB',
-    heapTotal: Math.round(memUsage.heapTotal / 1024 / 1024) + ' MB',
-    rss: Math.round(memUsage.rss / 1024 / 1024) + ' MB',
-  };
-
-  const statusCode = health.status === 'ok' ? 200 : 503;
-  res.status(statusCode).json(health);
-});
+router.use('/health', healthRouter);
 
 /**
- * @route GET /health/liveness
- * @desc Kubernetes liveness probe
+ * @route GET /ping
+ * @desc Simple ping endpoint (minimal overhead)
  * @access Public
  */
-router.get('/health/liveness', (req, res) => {
-  res.json({ status: 'ok' });
-});
-
-/**
- * @route GET /health/readiness
- * @desc Kubernetes readiness probe
- * @access Public
- */
-router.get('/health/readiness', async (req, res) => {
-  try {
-    // Check database is ready
-    await db.query('SELECT 1');
-    res.json({ status: 'ready' });
-  } catch (error) {
-    logger.error('Readiness check failed', { error });
-    res.status(503).json({ status: 'not ready', error: String(error) });
-  }
+router.get('/ping', (req, res) => {
+  res.send('pong');
 });
 
 export default router;
