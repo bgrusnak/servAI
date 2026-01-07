@@ -9,82 +9,67 @@ import { validate as isUUID } from 'uuid';
 
 const residentsRouter = Router();
 
-// All routes require authentication
 residentsRouter.use(authenticate);
 
-// ✅ List residents by unit
+// List residents by unit
 residentsRouter.get('/unit/:unitId', canAccessUnit(), async (req: AuthRequest, res: Response, next: NextFunction) => {
-  try {
-    // ✅ UUID validation
-    if (!isUUID(req.params.unitId)) {
-      throw new AppError('Invalid unit ID format', 400);
-    }
-
-    const includeInactive = req.query.include_inactive === 'true';
-    const residents = await ResidentService.listResidentsByUnit(req.params.unitId, includeInactive);
-    res.json(residents);
-  } catch (error) {
-    next(error);
+  if (!isUUID(req.params.unitId)) {
+    throw new AppError('Invalid unit ID format', 400);
   }
+
+  const includeInactive = req.query.include_inactive === 'true';
+  const residents = await ResidentService.listResidentsByUnit(req.params.unitId, includeInactive);
+  res.json(residents);
 });
 
-// ✅ List units for current user
+// List units for current user
 residentsRouter.get('/my-units', async (req: AuthRequest, res: Response, next: NextFunction) => {
-  try {
-    const includeInactive = req.query.include_inactive === 'true';
-    const units = await ResidentService.listUnitsByUser(req.user!.id, includeInactive);
-    res.json(units);
-  } catch (error) {
-    next(error);
-  }
+  const includeInactive = req.query.include_inactive === 'true';
+  const units = await ResidentService.listUnitsByUser(req.user!.id, includeInactive);
+  res.json(units);
 });
 
-// ✅ Get resident by ID
+// Get resident by ID
 residentsRouter.get('/:id', async (req: AuthRequest, res: Response, next: NextFunction) => {
-  try {
-    // ✅ UUID validation
-    if (!isUUID(req.params.id)) {
-      throw new AppError('Invalid resident ID format', 400);
-    }
-
-    const resident = await ResidentService.getResidentById(req.params.id);
-    if (!resident) {
-      throw new AppError('Resident not found', 404);
-    }
-
-    // Check access - user can view their own or has condo access
-    if (resident.user_id !== req.user!.id) {
-      const unit = await UnitService.getUnitById(resident.unit_id);
-      if (!unit) {
-        throw new AppError('Unit not found', 404);
-      }
-
-      const hasAccess = await CondoService.checkUserAccess(
-        unit.condo_id,
-        req.user!.id
-      );
-
-      if (!hasAccess) {
-        throw new AppError('Access denied', 403);
-      }
-    }
-
-    res.json(resident);
-  } catch (error) {
-    next(error);
+  if (!isUUID(req.params.id)) {
+    throw new AppError('Invalid resident ID format', 400);
   }
+
+  const resident = await ResidentService.getResidentById(req.params.id);
+  if (!resident) {
+    throw new AppError('Resident not found', 404);
+  }
+
+  // Check access - user can view their own or has condo access
+  if (resident.user_id !== req.user!.id) {
+    const unit = await UnitService.getUnitById(resident.unit_id);
+    if (!unit) {
+      throw new AppError('Unit not found', 404);
+    }
+
+    const hasAccess = await CondoService.checkUserAccess(
+      unit.condo_id,
+      req.user!.id
+    );
+
+    if (!hasAccess) {
+      throw new AppError('Access denied', 403);
+    }
+  }
+
+  res.json(resident);
 });
 
-// ✅ Create resident (manual assignment by admin)
-residentsRouter.post('/', authorize('uk_director', 'complex_admin'), async (req: AuthRequest, res: Response, next: NextFunction) => {
-  try {
+// Create resident (manual assignment by admin)
+residentsRouter.post('/', 
+  authorize('uk_director', 'complex_admin'), 
+  async (req: AuthRequest, res: Response, next: NextFunction) => {
     const { user_id, unit_id, is_owner, moved_in_at } = req.body;
 
     if (!user_id || !unit_id) {
       throw new AppError('user_id and unit_id are required', 400);
     }
 
-    // ✅ UUID validation
     if (!isUUID(user_id)) {
       throw new AppError('Invalid user_id format', 400);
     }
@@ -97,7 +82,6 @@ residentsRouter.post('/', authorize('uk_director', 'complex_admin'), async (req:
       throw new AppError('Unit not found', 404);
     }
 
-    // Check admin access
     const hasAccess = await CondoService.checkUserAccess(
       unit.condo_id,
       req.user!.id,
@@ -116,15 +100,12 @@ residentsRouter.post('/', authorize('uk_director', 'complex_admin'), async (req:
     });
 
     res.status(201).json(resident);
-  } catch (error) {
-    next(error);
-  }
 });
 
-// ✅ Update resident
-residentsRouter.patch('/:id', authorize('uk_director', 'complex_admin'), async (req: AuthRequest, res: Response, next: NextFunction) => {
-  try {
-    // ✅ UUID validation
+// Update resident
+residentsRouter.patch('/:id', 
+  authorize('uk_director', 'complex_admin'), 
+  async (req: AuthRequest, res: Response, next: NextFunction) => {
     if (!isUUID(req.params.id)) {
       throw new AppError('Invalid resident ID format', 400);
     }
@@ -139,7 +120,6 @@ residentsRouter.patch('/:id', authorize('uk_director', 'complex_admin'), async (
       throw new AppError('Unit not found', 404);
     }
 
-    // Check admin access
     const hasAccess = await CondoService.checkUserAccess(
       unit.condo_id,
       req.user!.id,
@@ -160,15 +140,12 @@ residentsRouter.patch('/:id', authorize('uk_director', 'complex_admin'), async (
     });
 
     res.json(updated);
-  } catch (error) {
-    next(error);
-  }
 });
 
-// ✅ Move out resident
-residentsRouter.post('/:id/move-out', authorize('uk_director', 'complex_admin'), async (req: AuthRequest, res: Response, next: NextFunction) => {
-  try {
-    // ✅ UUID validation
+// Move out resident
+residentsRouter.post('/:id/move-out', 
+  authorize('uk_director', 'complex_admin'), 
+  async (req: AuthRequest, res: Response, next: NextFunction) => {
     if (!isUUID(req.params.id)) {
       throw new AppError('Invalid resident ID format', 400);
     }
@@ -183,7 +160,6 @@ residentsRouter.post('/:id/move-out', authorize('uk_director', 'complex_admin'),
       throw new AppError('Unit not found', 404);
     }
 
-    // Check admin access
     const hasAccess = await CondoService.checkUserAccess(
       unit.condo_id,
       req.user!.id,
@@ -196,15 +172,12 @@ residentsRouter.post('/:id/move-out', authorize('uk_director', 'complex_admin'),
 
     await ResidentService.moveOutResident(req.params.id);
     res.json({ message: 'Resident moved out successfully' });
-  } catch (error) {
-    next(error);
-  }
 });
 
-// ✅ Delete resident
-residentsRouter.delete('/:id', authorize('uk_director', 'complex_admin'), async (req: AuthRequest, res: Response, next: NextFunction) => {
-  try {
-    // ✅ UUID validation
+// Delete resident
+residentsRouter.delete('/:id', 
+  authorize('uk_director', 'complex_admin'), 
+  async (req: AuthRequest, res: Response, next: NextFunction) => {
     if (!isUUID(req.params.id)) {
       throw new AppError('Invalid resident ID format', 400);
     }
@@ -219,7 +192,6 @@ residentsRouter.delete('/:id', authorize('uk_director', 'complex_admin'), async 
       throw new AppError('Unit not found', 404);
     }
 
-    // Check admin access
     const hasAccess = await CondoService.checkUserAccess(
       unit.condo_id,
       req.user!.id,
@@ -232,9 +204,6 @@ residentsRouter.delete('/:id', authorize('uk_director', 'complex_admin'), async 
 
     await ResidentService.deleteResident(req.params.id);
     res.json({ message: 'Resident deleted successfully' });
-  } catch (error) {
-    next(error);
-  }
 });
 
 export { residentsRouter };

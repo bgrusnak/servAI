@@ -10,104 +10,82 @@ import { validate as isUUID } from 'uuid';
 
 const entrancesRouter = Router();
 
-// All routes require authentication
 entrancesRouter.use(authenticate);
 
-// ✅ List entrances (by building)
+// List entrances (by building)
 entrancesRouter.get('/', async (req: AuthRequest, res: Response, next: NextFunction) => {
-  try {
-    const page = parseInt(req.query.page as string) || 1;
-    const limit = Math.min(
-      parseInt(req.query.limit as string) || CONSTANTS.DEFAULT_PAGE_SIZE,
-      CONSTANTS.MAX_PAGE_SIZE
-    );
-    const buildingId = req.query.building_id as string;
+  const page = Math.max(1, parseInt(req.query.page as string) || 1);
+  const limit = Math.min(
+    Math.max(1, parseInt(req.query.limit as string) || CONSTANTS.DEFAULT_PAGE_SIZE),
+    CONSTANTS.MAX_PAGE_SIZE
+  );
+  const buildingId = req.query.building_id as string;
 
-    if (!buildingId) {
-      throw new AppError('building_id parameter is required', 400);
-    }
-
-    // ✅ UUID validation
-    if (!isUUID(buildingId)) {
-      throw new AppError('Invalid building_id format', 400);
-    }
-
-    // Get building to check access
-    const building = await BuildingService.getBuildingById(buildingId);
-    if (!building) {
-      throw new AppError('Building not found', 404);
-    }
-
-    // ✅ UNIFIED: Use middleware system
-    const hasAccess = await CondoService.checkUserAccess(building.condo_id, req.user!.id);
-    if (!hasAccess) {
-      throw new AppError('Access denied', 403);
-    }
-
-    const result = await EntranceService.listEntrances(buildingId, page, limit);
-    res.json(result);
-  } catch (error) {
-    next(error);
+  if (!buildingId) {
+    throw new AppError('building_id parameter is required', 400);
   }
+
+  if (!isUUID(buildingId)) {
+    throw new AppError('Invalid building_id format', 400);
+  }
+
+  const building = await BuildingService.getBuildingById(buildingId);
+  if (!building) {
+    throw new AppError('Building not found', 404);
+  }
+
+  const hasAccess = await CondoService.checkUserAccess(building.condo_id, req.user!.id);
+  if (!hasAccess) {
+    throw new AppError('Access denied', 403);
+  }
+
+  const result = await EntranceService.listEntrances(buildingId, page, limit);
+  res.json(result);
 });
 
-// ✅ Get entrance by ID
+// Get entrance by ID
 entrancesRouter.get('/:id', async (req: AuthRequest, res: Response, next: NextFunction) => {
-  try {
-    // ✅ UUID validation
-    if (!isUUID(req.params.id)) {
-      throw new AppError('Invalid entrance ID format', 400);
-    }
-
-    const entrance = await EntranceService.getEntranceById(req.params.id);
-    if (!entrance) {
-      throw new AppError('Entrance not found', 404);
-    }
-
-    // ✅ UUID validation
-    if (!isUUID(entrance.building_id)) {
-      throw new AppError('Invalid building_id format', 400);
-    }
-
-    // Get building to check access
-    const building = await BuildingService.getBuildingById(entrance.building_id);
-    if (!building) {
-      throw new AppError('Building not found', 404);
-    }
-
-    // Check access
-    const hasAccess = await CondoService.checkUserAccess(building.condo_id, req.user!.id);
-    if (!hasAccess) {
-      throw new AppError('Access denied', 403);
-    }
-
-    res.json(entrance);
-  } catch (error) {
-    next(error);
+  if (!isUUID(req.params.id)) {
+    throw new AppError('Invalid entrance ID format', 400);
   }
+
+  const entrance = await EntranceService.getEntranceById(req.params.id);
+  if (!entrance) {
+    throw new AppError('Entrance not found', 404);
+  }
+
+  const building = await BuildingService.getBuildingById(entrance.building_id);
+  if (!building) {
+    throw new AppError('Building not found', 404);
+  }
+
+  const hasAccess = await CondoService.checkUserAccess(building.condo_id, req.user!.id);
+  if (!hasAccess) {
+    throw new AppError('Access denied', 403);
+  }
+
+  res.json(entrance);
 });
 
-// ✅ Create entrance - ONLY ADMINS
-entrancesRouter.post('/', authorize('complex_admin', 'uk_director'), async (req: AuthRequest, res: Response, next: NextFunction) => {
-  try {
+// Create entrance - UNIFIED: Use service check
+entrancesRouter.post('/', 
+  authorize('complex_admin', 'uk_director'), 
+  async (req: AuthRequest, res: Response, next: NextFunction) => {
     const { building_id, number, floors, units_count } = req.body;
 
     if (!building_id || !number) {
       throw new AppError('building_id and number are required', 400);
     }
 
-    // ✅ UUID validation
     if (!isUUID(building_id)) {
       throw new AppError('Invalid building_id format', 400);
     }
 
-    // Get building to check access
     const building = await BuildingService.getBuildingById(building_id);
     if (!building) {
       throw new AppError('Building not found', 404);
     }
 
-    // Check admin access
     const hasAccess = await CondoService.checkUserAccess(
       building.condo_id,
       req.user!.id,
@@ -126,15 +104,12 @@ entrancesRouter.post('/', authorize('complex_admin', 'uk_director'), async (req:
     });
 
     res.status(201).json(entrance);
-  } catch (error) {
-    next(error);
-  }
 });
 
-// ✅ Update entrance - ONLY ADMINS
-entrancesRouter.patch('/:id', authorize('complex_admin', 'uk_director'), async (req: AuthRequest, res: Response, next: NextFunction) => {
-  try {
-    // ✅ UUID validation
+// Update entrance - UNIFIED
+entrancesRouter.patch('/:id', 
+  authorize('complex_admin', 'uk_director'), 
+  async (req: AuthRequest, res: Response, next: NextFunction) => {
     if (!isUUID(req.params.id)) {
       throw new AppError('Invalid entrance ID format', 400);
     }
@@ -149,7 +124,6 @@ entrancesRouter.patch('/:id', authorize('complex_admin', 'uk_director'), async (
       throw new AppError('Building not found', 404);
     }
 
-    // Check access
     const hasAccess = await CondoService.checkUserAccess(
       building.condo_id,
       req.user!.id,
@@ -162,15 +136,12 @@ entrancesRouter.patch('/:id', authorize('complex_admin', 'uk_director'), async (
 
     const updated = await EntranceService.updateEntrance(req.params.id, req.body);
     res.json(updated);
-  } catch (error) {
-    next(error);
-  }
 });
 
-// ✅ Delete entrance - ONLY ADMINS
-entrancesRouter.delete('/:id', authorize('complex_admin', 'uk_director'), async (req: AuthRequest, res: Response, next: NextFunction) => {
-  try {
-    // ✅ UUID validation
+// Delete entrance - UNIFIED
+entrancesRouter.delete('/:id', 
+  authorize('complex_admin', 'uk_director'), 
+  async (req: AuthRequest, res: Response, next: NextFunction) => {
     if (!isUUID(req.params.id)) {
       throw new AppError('Invalid entrance ID format', 400);
     }
@@ -185,7 +156,6 @@ entrancesRouter.delete('/:id', authorize('complex_admin', 'uk_director'), async 
       throw new AppError('Building not found', 404);
     }
 
-    // Check access
     const hasAccess = await CondoService.checkUserAccess(
       building.condo_id,
       req.user!.id,
@@ -198,9 +168,6 @@ entrancesRouter.delete('/:id', authorize('complex_admin', 'uk_director'), async 
 
     await EntranceService.deleteEntrance(req.params.id);
     res.json({ message: 'Entrance deleted successfully' });
-  } catch (error) {
-    next(error);
-  }
 });
 
 export { entrancesRouter };

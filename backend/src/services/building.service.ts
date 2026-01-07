@@ -1,115 +1,56 @@
 import { AppDataSource } from '../db/data-source';
 import { Building } from '../entities/Building';
-import { logger } from '../utils/logger';
+import { CondoService } from './condo.service';
+import { AppError } from '../middleware/errorHandler';
 
 const buildingRepository = AppDataSource.getRepository(Building);
 
 export class BuildingService {
-  /**
-   * Create building
-   */
-  async createBuilding(data: {
-    condoId: string;
-    name: string;
-    address?: string;
-    floors?: number;
-  }): Promise<Building> {
-    try {
-      const building = buildingRepository.create(data);
-      await buildingRepository.save(building);
+  static async listBuildings(condoId: string, page: number = 1, limit: number = 10) {
+    const [buildings, total] = await buildingRepository.findAndCount({
+      where: { condo_id: condoId },
+      skip: (page - 1) * limit,
+      take: limit,
+      order: { number: 'ASC' },
+    });
 
-      logger.info('Building created', { buildingId: building.id, name: building.name });
-      return building;
-    } catch (error) {
-      logger.error('Failed to create building', { error });
-      throw error;
-    }
+    return {
+      data: buildings,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+      },
+    };
+  }
+
+  static async getBuildingById(id: string) {
+    return await buildingRepository.findOne({ where: { id } });
+  }
+
+  static async createBuilding(data: Partial<Building>) {
+    const building = buildingRepository.create(data);
+    return await buildingRepository.save(building);
+  }
+
+  static async updateBuilding(id: string, data: Partial<Building>) {
+    await buildingRepository.update(id, data);
+    return await this.getBuildingById(id);
+  }
+
+  static async deleteBuilding(id: string) {
+    await buildingRepository.delete(id);
   }
 
   /**
-   * Get building by ID
+   * Check if user has access to building via condo
    */
-  async getBuildingById(buildingId: string): Promise<Building | null> {
-    try {
-      return await buildingRepository.findOne({
-        where: { id: buildingId },
-        relations: ['condo', 'entrances'],
-      });
-    } catch (error) {
-      logger.error('Failed to get building', { error, buildingId });
-      throw error;
-    }
-  }
-
-  /**
-   * Get buildings by condo
-   */
-  async getBuildingsByCondo(condoId: string): Promise<Building[]> {
-    try {
-      return await buildingRepository.find({
-        where: { condoId, isActive: true },
-        relations: ['entrances'],
-        order: { name: 'ASC' },
-      });
-    } catch (error) {
-      logger.error('Failed to get buildings by condo', { error, condoId });
-      throw error;
-    }
-  }
-
-  /**
-   * Update building
-   */
-  async updateBuilding(
-    buildingId: string,
-    data: Partial<{
-      name: string;
-      address: string;
-      floors: number;
-    }>
-  ): Promise<Building> {
-    try {
-      const building = await buildingRepository.findOne({
-        where: { id: buildingId },
-      });
-
-      if (!building) {
-        throw new Error('Building not found');
-      }
-
-      Object.assign(building, data);
-      await buildingRepository.save(building);
-
-      logger.info('Building updated', { buildingId });
-      return building;
-    } catch (error) {
-      logger.error('Failed to update building', { error, buildingId });
-      throw error;
-    }
-  }
-
-  /**
-   * Delete building (soft delete)
-   */
-  async deleteBuilding(buildingId: string): Promise<void> {
-    try {
-      const building = await buildingRepository.findOne({
-        where: { id: buildingId },
-      });
-
-      if (!building) {
-        throw new Error('Building not found');
-      }
-
-      building.isActive = false;
-      await buildingRepository.save(building);
-
-      logger.info('Building deleted', { buildingId });
-    } catch (error) {
-      logger.error('Failed to delete building', { error, buildingId });
-      throw error;
-    }
+  static async checkUserAccess(
+    condoId: string,
+    userId: string,
+    allowedRoles?: string[]
+  ): Promise<boolean> {
+    return await CondoService.checkUserAccess(condoId, userId, allowedRoles);
   }
 }
-
-export const buildingService = new BuildingService();

@@ -34,7 +34,10 @@ export const canAccessCompany = () => {
   return async (req: Request, res: Response, next: NextFunction) => {
     try {
       if (req.user.role === 'superadmin') return next();
-      const companyId = req.params.companyId || req.body.companyId || req.query.companyId;
+      
+      // FIXED: Check body first (for POST/PUT/PATCH), then params, then query
+      const companyId = req.body.company_id || req.params.companyId || req.query.company_id;
+      
       if (!companyId) throw new ForbiddenError('Company ID required');
       if (req.user.companyId !== companyId) throw new ForbiddenError('Access denied to this company');
       next();
@@ -48,7 +51,10 @@ export const canAccessCondo = () => {
   return async (req: Request, res: Response, next: NextFunction) => {
     try {
       if (req.user.role === 'superadmin') return next();
-      const condoId = req.params.condoId || req.body.condoId || req.query.condoId;
+      
+      // FIXED: Check body first (for POST/PUT/PATCH), then params, then query
+      const condoId = req.body.condo_id || req.params.condoId || req.params.id || req.query.condo_id;
+      
       if (!condoId) throw new ForbiddenError('Condo ID required');
       
       if (req.user.role === 'uk_director' || req.user.role === 'accountant') {
@@ -66,11 +72,52 @@ export const canAccessCondo = () => {
   };
 };
 
+export const canAccessBuilding = () => {
+  return async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      if (req.user.role === 'superadmin') return next();
+      
+      // FIXED: Check body first (for POST/PUT/PATCH), then params, then query
+      const buildingId = req.body.building_id || req.params.id || req.query.building_id;
+      
+      if (!buildingId) throw new ForbiddenError('Building ID required');
+      
+      const building = await AppDataSource.getRepository('Building').findOne({ 
+        where: { id: buildingId },
+        relations: ['condo']
+      });
+      
+      if (!building) throw new NotFoundError('Building');
+      
+      if (req.user.role === 'uk_director' || req.user.role === 'accountant') {
+        if (building.condo.companyId !== req.user.companyId) {
+          throw new ForbiddenError('Access denied to this building');
+        }
+        return next();
+      }
+      
+      if (req.user.role === 'complex_admin' || req.user.role === 'employee') {
+        if (building.condoId !== req.user.condoId) {
+          throw new ForbiddenError('Access denied to this building');
+        }
+        return next();
+      }
+      
+      throw new ForbiddenError('Insufficient permissions');
+    } catch (error) {
+      next(error);
+    }
+  };
+};
+
 export const canAccessUnit = () => {
   return async (req: Request, res: Response, next: NextFunction) => {
     try {
       if (req.user.role === 'superadmin') return next();
-      const unitId = req.params.unitId || req.body.unitId || req.query.unitId;
+      
+      // FIXED: Check body first (for POST/PUT/PATCH), then params, then query
+      const unitId = req.body.unit_id || req.params.unitId || req.params.id || req.query.unit_id;
+      
       if (!unitId) throw new ForbiddenError('Unit ID required');
       
       const unit = await unitRepository.findOne({ where: { id: unitId }, relations: ['condo'] });
@@ -171,6 +218,7 @@ export default {
   authorize,
   canAccessCompany,
   canAccessCondo,
+  canAccessBuilding,
   canAccessUnit,
   isSecurityGuard,
   canAccessTask,
