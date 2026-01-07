@@ -1,116 +1,90 @@
 import { Router } from 'express';
 import { authenticateToken } from '../middleware/auth.middleware';
-import { invoiceService } from '../services/invoice.service';
-import { logger } from '../utils/logger';
+import { canAccessUnit, authorize } from '../middleware/authorize.middleware';
+import { asyncHandler } from '../utils/asyncHandler';
+import { InvoiceService } from '../services/invoice.service';
 
 const router = Router();
+const invoiceService = new InvoiceService();
 
-/**
- * @route   GET /api/v1/invoices
- * @desc    Get invoices with filters
- * @access  Private
- */
-router.get('/invoices', authenticateToken, async (req, res) => {
-  try {
-    const { unitId, condoId, status, fromDate, toDate, limit, offset } = req.query;
+// ✅ GET /units/:unitId/invoices - Счета квартиры
+router.get(
+  '/units/:unitId/invoices',
+  authenticateToken,
+  canAccessUnit(), // 🔒 SECURITY: Только своя квартира
+  asyncHandler(async (req, res) => {
+    const invoices = await invoiceService.getByUnit(req.params.unitId);
+    res.json(invoices);
+  })
+);
 
-    const filter: any = {};
-    if (unitId) filter.unitId = unitId as string;
-    if (condoId) filter.condoId = condoId as string;
-    if (status) filter.status = status as string;
-    if (fromDate) filter.fromDate = fromDate as string;
-    if (toDate) filter.toDate = toDate as string;
+// ✅ GET /invoices/:id
+router.get(
+  '/invoices/:id',
+  authenticateToken,
+  asyncHandler(async (req, res) => {
+    const invoice = await invoiceService.getById(req.params.id);
+    
+    // Проверка доступа к квартире
+    req.params.unitId = invoice.unitId;
+    const middleware = canAccessUnit();
+    await new Promise((resolve, reject) => {
+      middleware(req, res, (err) => err ? reject(err) : resolve(null));
+    });
+    
+    res.json(invoice);
+  })
+);
 
-    const result = await invoiceService.getInvoices(
-      filter,
-      parseInt(limit as string) || 50,
-      parseInt(offset as string) || 0
-    );
+// ✅ POST /units/:unitId/invoices - Только admin/accountant
+router.post(
+  '/units/:unitId/invoices',
+  authenticateToken,
+  authorize('uk_director', 'accountant', 'complex_admin'), // 🔒 SECURITY
+  canAccessUnit(),
+  asyncHandler(async (req, res) => {
+    const invoice = await invoiceService.create(req.params.unitId, req.body);
+    res.status(201).json(invoice);
+  })
+);
 
-    res.json({ success: true, ...result });
-  } catch (error: any) {
-    logger.error('Error fetching invoices', { error });
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
+// ✅ PUT /invoices/:id - Только admin/accountant
+router.put(
+  '/invoices/:id',
+  authenticateToken,
+  authorize('uk_director', 'accountant', 'complex_admin'),
+  asyncHandler(async (req, res) => {
+    const invoice = await invoiceService.update(req.params.id, req.body);
+    res.json(invoice);
+  })
+);
 
-/**
- * @route   GET /api/v1/invoices/:invoiceId
- * @desc    Get invoice by ID with items
- * @access  Private
- */
-router.get('/invoices/:invoiceId', authenticateToken, async (req, res) => {
-  try {
-    const { invoiceId } = req.params;
-    const invoice = await invoiceService.getInvoiceById(invoiceId);
+// ✅ DELETE /invoices/:id - Только admin
+router.delete(
+  '/invoices/:id',
+  authenticateToken,
+  authorize('uk_director', 'complex_admin'),
+  asyncHandler(async (req, res) => {
+    await invoiceService.delete(req.params.id);
+    res.status(204).send();
+  })
+);
 
-    if (!invoice) {
-      return res.status(404).json({ success: false, error: 'Invoice not found' });
-    }
-
-    res.json({ success: true, invoice });
-  } catch (error: any) {
-    logger.error('Error fetching invoice', { error, invoiceId: req.params.invoiceId });
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-/**
- * @route   POST /api/v1/invoices/:invoiceId/payments
- * @desc    Record payment for invoice
- * @access  Private
- */
-router.post('/invoices/:invoiceId/payments', authenticateToken, async (req, res) => {
-  try {
-    const { invoiceId } = req.params;
-    const userId = (req as any).user.id;
-    const { amount, method } = req.body;
-
-    if (!amount || !method) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Amount and method are required' 
-      });
-    }
-
-    const payment = await invoiceService.recordPayment(
-      invoiceId,
-      userId,
-      parseFloat(amount),
-      method
-    );
-
-    res.status(201).json({ success: true, payment });
-  } catch (error: any) {
-    logger.error('Error recording payment', { error, invoiceId: req.params.invoiceId });
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-/**
- * @route   GET /api/v1/units/:unitId/invoices
- * @desc    Get invoices for specific unit
- * @access  Private
- */
-router.get('/units/:unitId/invoices', authenticateToken, async (req, res) => {
-  try {
-    const { unitId } = req.params;
-    const { status, limit, offset } = req.query;
-
-    const filter: any = { unitId };
-    if (status) filter.status = status as string;
-
-    const result = await invoiceService.getInvoices(
-      filter,
-      parseInt(limit as string) || 50,
-      parseInt(offset as string) || 0
-    );
-
-    res.json({ success: true, ...result });
-  } catch (error: any) {
-    logger.error('Error fetching unit invoices', { error, unitId: req.params.unitId });
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
+// ✅ POST /invoices/:id/pay - Оплата счёта
+router.post(
+  '/invoices/:id/pay',
+  authenticateToken,
+  asyncHandler(async (req, res) => {
+    const invoice = await invoiceService.getById(req.params.id);
+    req.params.unitId = invoice.unitId;
+    const middleware = canAccessUnit();
+    await new Promise((resolve, reject) => {
+      middleware(req, res, (err) => err ? reject(err) : resolve(null));
+    });
+    
+    const result = await invoiceService.pay(req.params.id, req.body);
+    res.json(result);
+  })
+);
 
 export default router;

@@ -1,253 +1,75 @@
 import { Router } from 'express';
-import { vehicleService } from '../services/vehicle.service';
 import { authenticateToken } from '../middleware/auth.middleware';
-import {
-  authorize,
-  canAccessUnit,
-  canAccessCondo,
-  isSecurityGuard,
-} from '../middleware/authorize.middleware';
-import { validate } from '../middleware/validate.middleware';
-import { asyncHandler } from '../middleware/error-handler.middleware';
-import {
-  createPermanentVehicleSchema,
-  createTemporaryPassSchema,
-  checkVehicleSchema,
-  getUnitVehiclesSchema,
-  deleteVehicleSchema,
-  deleteTemporaryPassSchema,
-  updateCondoVehicleSettingsSchema,
-} from '../schemas/vehicle.schema';
-import { logger } from '../utils/logger';
+import { canAccessCondo, canAccessUnit, isSecurityGuard, authorize } from '../middleware/authorize.middleware';
+import { asyncHandler } from '../utils/asyncHandler';
+import { vehicleService } from '../services/vehicle.service';
 
 const router = Router();
 
-/**
- * @route   POST /api/v1/vehicles/permanent
- * @desc    Create permanent vehicle for a unit
- * @access  Private (resident, admin)
- */
+// ✅ GET /condos/:condoId/vehicles - Авто ЖК
+router.get(
+  '/condos/:condoId/vehicles',
+  authenticateToken,
+  canAccessCondo(), // 🔒 SECURITY
+  asyncHandler(async (req, res) => {
+    const vehicles = await vehicleService.getByCondo(req.params.condoId);
+    res.json(vehicles);
+  })
+);
+
+// ✅ GET /units/:unitId/vehicles - Авто квартиры
+router.get(
+  '/units/:unitId/vehicles',
+  authenticateToken,
+  canAccessUnit(),
+  asyncHandler(async (req, res) => {
+    const vehicles = await vehicleService.getByUnit(req.params.unitId);
+    res.json(vehicles);
+  })
+);
+
+// ✅ POST /units/:unitId/vehicles - Добавить авто
 router.post(
-  '/permanent',
+  '/units/:unitId/vehicles',
   authenticateToken,
-  authorize('resident', 'complex_admin', 'uk_director', 'super_admin'),
-  validate(createPermanentVehicleSchema),
+  authorize('resident', 'complex_admin', 'uk_director'),
   canAccessUnit(),
   asyncHandler(async (req, res) => {
-    const userId = (req as any).user.id;
-    const { unitId, licensePlate, make, model, color, parkingSpot } = req.body;
-
-    const vehicle = await vehicleService.createPermanentVehicle({
-      unitId,
-      licensePlate,
-      make,
-      model,
-      color,
-      parkingSpot,
-      createdBy: userId,
-    });
-
-    logger.info('Permanent vehicle created', { vehicleId: vehicle.id, unitId, userId });
-
-    res.status(201).json({ success: true, vehicle });
+    const vehicle = await vehicleService.create(req.params.unitId, req.body);
+    res.status(201).json(vehicle);
   })
 );
 
-/**
- * @route   POST /api/v1/vehicles/temporary
- * @desc    Create temporary vehicle pass (duration from condo settings)
- * @access  Private (resident, admin)
- */
+// ✅ POST /vehicles/check-access - Проверка пропуска
 router.post(
-  '/temporary',
+  '/vehicles/check-access',
   authenticateToken,
-  authorize('resident', 'complex_admin', 'uk_director', 'super_admin'),
-  validate(createTemporaryPassSchema),
-  canAccessUnit(),
+  isSecurityGuard(), // 🔒 SECURITY: Только охрана
   asyncHandler(async (req, res) => {
-    const userId = (req as any).user.id;
-    const { unitId, licensePlate } = req.body;
-
-    const pass = await vehicleService.createTemporaryPass({
-      unitId,
-      licensePlate,
-      createdBy: userId,
-    });
-
-    logger.info('Temporary pass created', { licensePlate, unitId, userId });
-
-    res.status(201).json({ success: true, pass });
+    const result = await vehicleService.checkAccess(req.body.licensePlate, req.body.condoId);
+    res.json(result);
   })
 );
 
-/**
- * @route   GET /api/v1/vehicles/check/:plate
- * @desc    Check vehicle access (for security guard)
- * @access  Private (security guard, admin)
- */
-router.get(
-  '/check/:plate',
+// ✅ POST /vehicles/:id/temp-pass - Временный пропуск
+router.post(
+  '/vehicles/:id/temp-pass',
   authenticateToken,
-  isSecurityGuard(),
-  validate(checkVehicleSchema),
+  authorize('resident', 'complex_admin', 'uk_director'),
   asyncHandler(async (req, res) => {
-    const { plate } = req.params;
-    const userId = (req as any).user.id;
-
-    const result = await vehicleService.checkVehicleAccess(plate, userId);
-
-    res.json({ success: true, ...result });
+    const pass = await vehicleService.createTempPass(req.params.id, req.body);
+    res.status(201).json(pass);
   })
 );
 
-/**
- * @route   GET /api/v1/vehicles/unit/:unitId
- * @desc    Get all vehicles (permanent + temporary) for a unit
- * @access  Private (resident, admin)
- */
-router.get(
-  '/unit/:unitId',
-  authenticateToken,
-  authorize('resident', 'complex_admin', 'uk_director', 'super_admin'),
-  validate(getUnitVehiclesSchema),
-  canAccessUnit(),
-  asyncHandler(async (req, res) => {
-    const { unitId } = req.params;
-
-    const [permanentVehicles, temporaryPasses] = await Promise.all([
-      vehicleService.getUnitVehicles(unitId),
-      vehicleService.getUnitTemporaryPasses(unitId),
-    ]);
-
-    res.json({
-      success: true,
-      permanent: permanentVehicles,
-      temporary: temporaryPasses,
-    });
-  })
-);
-
-/**
- * @route   GET /api/v1/vehicles/history
- * @desc    Get vehicle access history
- * @access  Private (security guard, admin)
- */
-router.get(
-  '/history',
-  authenticateToken,
-  isSecurityGuard(),
-  asyncHandler(async (req, res) => {
-    const { unitId, licensePlate, from, to, limit = '100', offset = '0' } = req.query;
-
-    const history = await vehicleService.getAccessHistory({
-      unitId: unitId as string,
-      licensePlate: licensePlate as string,
-      from: from ? new Date(from as string) : undefined,
-      to: to ? new Date(to as string) : undefined,
-      limit: parseInt(limit as string, 10),
-      offset: parseInt(offset as string, 10),
-    });
-
-    res.json({ success: true, history });
-  })
-);
-
-/**
- * @route   GET /api/v1/vehicles/settings/:condoId
- * @desc    Get condo vehicle settings
- * @access  Private (admin)
- */
-router.get(
-  '/settings/:condoId',
-  authenticateToken,
-  authorize('complex_admin', 'uk_director', 'super_admin'),
-  canAccessCondo(),
-  asyncHandler(async (req, res) => {
-    const { condoId } = req.params;
-
-    const settings = await vehicleService.getCondoVehicleSettings(condoId);
-
-    res.json({ success: true, settings });
-  })
-);
-
-/**
- * @route   PUT /api/v1/vehicles/settings/:condoId
- * @desc    Update condo vehicle settings
- * @access  Private (admin)
- */
-router.put(
-  '/settings/:condoId',
-  authenticateToken,
-  authorize('complex_admin', 'uk_director', 'super_admin'),
-  validate(updateCondoVehicleSettingsSchema),
-  canAccessCondo(),
-  asyncHandler(async (req, res) => {
-    const { condoId } = req.params;
-    const { maxVehiclesPerUnit, temporaryPassDurationHours } = req.body;
-    const userId = (req as any).user.id;
-
-    await vehicleService.updateCondoVehicleSettings(condoId, {
-      maxVehiclesPerUnit,
-      temporaryPassDurationHours,
-    });
-
-    logger.info('Condo vehicle settings updated', {
-      condoId,
-      maxVehiclesPerUnit,
-      temporaryPassDurationHours,
-      userId,
-    });
-
-    res.json({ success: true, message: 'Settings updated' });
-  })
-);
-
-/**
- * @route   DELETE /api/v1/vehicles/permanent/:id
- * @desc    Delete permanent vehicle
- * @access  Private (resident, admin)
- */
+// ✅ DELETE /vehicles/:id - Только admin или владелец
 router.delete(
-  '/permanent/:id',
+  '/vehicles/:id',
   authenticateToken,
-  authorize('resident', 'complex_admin', 'uk_director', 'super_admin'),
-  validate(deleteVehicleSchema),
-  canAccessUnit(),
+  authorize('resident', 'complex_admin', 'uk_director'),
   asyncHandler(async (req, res) => {
-    const { id } = req.params;
-    const { unitId } = req.body;
-    const userId = (req as any).user.id;
-
-    await vehicleService.deleteVehicle(id, unitId);
-
-    logger.info('Permanent vehicle deleted', { vehicleId: id, unitId, userId });
-
-    res.json({ success: true, message: 'Vehicle deleted' });
-  })
-);
-
-/**
- * @route   DELETE /api/v1/vehicles/temporary/:plate
- * @desc    Delete temporary pass
- * @access  Private (resident, admin)
- */
-router.delete(
-  '/temporary/:plate',
-  authenticateToken,
-  authorize('resident', 'complex_admin', 'uk_director', 'super_admin'),
-  validate(deleteTemporaryPassSchema),
-  canAccessUnit(),
-  asyncHandler(async (req, res) => {
-    const { plate } = req.params;
-    const { unitId } = req.body;
-    const userId = (req as any).user.id;
-
-    await vehicleService.deleteTemporaryPass(plate, unitId);
-
-    logger.info('Temporary pass deleted', { licensePlate: plate, unitId, userId });
-
-    res.json({ success: true, message: 'Temporary pass deleted' });
+    await vehicleService.delete(req.params.id, req.user.id, req.user.role);
+    res.status(204).send();
   })
 );
 

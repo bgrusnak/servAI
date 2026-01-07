@@ -1,146 +1,100 @@
 import { Router } from 'express';
 import { authenticateToken } from '../middleware/auth.middleware';
-import { ticketService } from '../services/ticket.service';
-import { logger } from '../utils/logger';
+import { canAccessUnit, canAccessTask, authorize } from '../middleware/authorize.middleware';
+import { asyncHandler } from '../utils/asyncHandler';
+import { TicketService } from '../services/ticket.service';
 
 const router = Router();
+const ticketService = new TicketService();
 
-/**
- * @route   POST /api/v1/tickets
- * @desc    Create new ticket
- * @access  Private
- */
-router.post('/tickets', authenticateToken, async (req, res) => {
-  try {
-    const userId = (req as any).user.id;
-    const { unitId, condoId, categoryId, title, description, priority } = req.body;
+// ✅ GET /units/:unitId/tickets - Заявки квартиры
+router.get(
+  '/units/:unitId/tickets',
+  authenticateToken,
+  canAccessUnit(), // 🔒 SECURITY
+  asyncHandler(async (req, res) => {
+    const tickets = await ticketService.getByUnit(req.params.unitId);
+    res.json(tickets);
+  })
+);
 
-    if (!unitId || !condoId || !categoryId || !title || !description) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Missing required fields' 
-      });
-    }
+// ✅ GET /tickets/my - Мои задачи (для employee)
+router.get(
+  '/tickets/my',
+  authenticateToken,
+  authorize('employee', 'complex_admin', 'uk_director'),
+  asyncHandler(async (req, res) => {
+    const tickets = await ticketService.getMyTasks(req.user.id, req.user.role);
+    res.json(tickets);
+  })
+);
 
-    const ticket = await ticketService.createTicket({
-      unitId,
-      condoId,
-      createdBy: userId,
-      categoryId,
-      title,
-      description,
-      priority
-    });
+// ✅ GET /tickets/:id
+router.get(
+  '/tickets/:id',
+  authenticateToken,
+  canAccessTask(), // 🔒 SECURITY: Только свои задачи
+  asyncHandler(async (req, res) => {
+    const ticket = await ticketService.getById(req.params.id);
+    res.json(ticket);
+  })
+);
 
-    res.status(201).json({ success: true, ticket });
-  } catch (error: any) {
-    logger.error('Error creating ticket', { error });
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
+// ✅ POST /units/:unitId/tickets - Создать заявку
+router.post(
+  '/units/:unitId/tickets',
+  authenticateToken,
+  authorize('resident', 'complex_admin', 'uk_director'),
+  canAccessUnit(),
+  asyncHandler(async (req, res) => {
+    const ticket = await ticketService.create(req.params.unitId, req.body, req.user.id);
+    res.status(201).json(ticket);
+  })
+);
 
-/**
- * @route   GET /api/v1/tickets/:ticketId
- * @desc    Get ticket with comments
- * @access  Private
- */
-router.get('/tickets/:ticketId', authenticateToken, async (req, res) => {
-  try {
-    const { ticketId } = req.params;
-    const ticket = await ticketService.getTicketById(ticketId);
+// ✅ PUT /tickets/:id - Обновить заявку
+router.put(
+  '/tickets/:id',
+  authenticateToken,
+  canAccessTask(),
+  asyncHandler(async (req, res) => {
+    const ticket = await ticketService.update(req.params.id, req.body);
+    res.json(ticket);
+  })
+);
 
-    if (!ticket) {
-      return res.status(404).json({ success: false, error: 'Ticket not found' });
-    }
+// ✅ PUT /tickets/:id/assign - Назначить сотрудника
+router.put(
+  '/tickets/:id/assign',
+  authenticateToken,
+  authorize('complex_admin', 'uk_director'),
+  asyncHandler(async (req, res) => {
+    const ticket = await ticketService.assign(req.params.id, req.body.employeeId);
+    res.json(ticket);
+  })
+);
 
-    res.json({ success: true, ticket });
-  } catch (error: any) {
-    logger.error('Error fetching ticket', { error, ticketId: req.params.ticketId });
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
+// ✅ PUT /tickets/:id/complete - Завершить задачу
+router.put(
+  '/tickets/:id/complete',
+  authenticateToken,
+  authorize('employee', 'complex_admin', 'uk_director'),
+  canAccessTask(),
+  asyncHandler(async (req, res) => {
+    const ticket = await ticketService.complete(req.params.id);
+    res.json(ticket);
+  })
+);
 
-/**
- * @route   POST /api/v1/tickets/:ticketId/comments
- * @desc    Add comment to ticket
- * @access  Private
- */
-router.post('/tickets/:ticketId/comments', authenticateToken, async (req, res) => {
-  try {
-    const { ticketId } = req.params;
-    const userId = (req as any).user.id;
-    const { comment, isInternal } = req.body;
-
-    if (!comment) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Comment is required' 
-      });
-    }
-
-    const newComment = await ticketService.addComment(
-      ticketId,
-      userId,
-      comment,
-      isInternal || false
-    );
-
-    res.status(201).json({ success: true, comment: newComment });
-  } catch (error: any) {
-    logger.error('Error adding ticket comment', { error, ticketId: req.params.ticketId });
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-/**
- * @route   PATCH /api/v1/tickets/:ticketId/status
- * @desc    Update ticket status
- * @access  Private (Admin/Staff only)
- */
-router.patch('/tickets/:ticketId/status', authenticateToken, async (req, res) => {
-  try {
-    const { ticketId } = req.params;
-    const userId = (req as any).user.id;
-    const { status } = req.body;
-
-    if (!status) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Status is required' 
-      });
-    }
-
-    await ticketService.updateStatus(ticketId, status, userId);
-    res.json({ success: true, message: 'Status updated' });
-  } catch (error: any) {
-    logger.error('Error updating ticket status', { error, ticketId: req.params.ticketId });
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-/**
- * @route   PATCH /api/v1/tickets/:ticketId/assign
- * @desc    Assign ticket to staff
- * @access  Private (Admin only)
- */
-router.patch('/tickets/:ticketId/assign', authenticateToken, async (req, res) => {
-  try {
-    const { ticketId } = req.params;
-    const { assignedTo } = req.body;
-
-    if (!assignedTo) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'assignedTo is required' 
-      });
-    }
-
-    await ticketService.assignTicket(ticketId, assignedTo);
-    res.json({ success: true, message: 'Ticket assigned' });
-  } catch (error: any) {
-    logger.error('Error assigning ticket', { error, ticketId: req.params.ticketId });
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
+// ✅ DELETE /tickets/:id - Только admin
+router.delete(
+  '/tickets/:id',
+  authenticateToken,
+  authorize('complex_admin', 'uk_director'),
+  asyncHandler(async (req, res) => {
+    await ticketService.delete(req.params.id);
+    res.status(204).send();
+  })
+);
 
 export default router;

@@ -1,162 +1,68 @@
-import { Router, Response, NextFunction } from 'express';
-import { authenticate, AuthRequest } from '../middleware/auth';
+import { Router } from 'express';
+import { authenticateToken } from '../middleware/auth.middleware';
+import { canAccessCondo, canAccessUnit, authorize } from '../middleware/authorize.middleware';
+import { asyncHandler } from '../utils/asyncHandler';
 import { UnitService } from '../services/unit.service';
-import { CondoService } from '../services/condo.service';
-import { AppError } from '../middleware/errorHandler';
-import { CONSTANTS } from '../config/constants';
 
-const unitsRouter = Router();
+const router = Router();
+const unitService = new UnitService();
 
-// All routes require authentication
-unitsRouter.use(authenticate);
+// ✅ GET /condos/:condoId/units - Квартиры ЖК
+router.get(
+  '/condos/:condoId/units',
+  authenticateToken,
+  canAccessCondo(), // 🔒 SECURITY
+  asyncHandler(async (req, res) => {
+    const units = await unitService.getByCondo(req.params.condoId);
+    res.json(units);
+  })
+);
 
-// List units (filtered by condo)
-unitsRouter.get('/', async (req: AuthRequest, res: Response, next: NextFunction) => {
-  try {
-    const page = parseInt(req.query.page as string) || 1;
-    const limit = Math.min(
-      parseInt(req.query.limit as string) || CONSTANTS.DEFAULT_PAGE_SIZE,
-      CONSTANTS.MAX_PAGE_SIZE
-    );
-    const condoId = req.query.condo_id as string;
-
-    if (!condoId) {
-      throw new AppError('condo_id parameter is required', 400);
-    }
-
-    // Check user has access to this condo
-    const hasAccess = await CondoService.checkUserAccess(condoId, req.user!.id);
-    if (!hasAccess) {
-      throw new AppError('Access denied', 403);
-    }
-
-    const result = await UnitService.listUnits(condoId, page, limit);
-
-    res.json(result);
-  } catch (error) {
-    next(error);
-  }
-});
-
-// Get unit by ID
-unitsRouter.get('/:id', async (req: AuthRequest, res: Response, next: NextFunction) => {
-  try {
-    const unit = await UnitService.getUnitById(req.params.id);
-
-    if (!unit) {
-      throw new AppError('Unit not found', 404);
-    }
-
-    // Check access to condo
-    const hasAccess = await CondoService.checkUserAccess(unit.condo_id, req.user!.id);
-    if (!hasAccess) {
-      throw new AppError('Access denied', 403);
-    }
-
+// ✅ GET /units/:unitId
+router.get(
+  '/units/:unitId',
+  authenticateToken,
+  canAccessUnit(),
+  asyncHandler(async (req, res) => {
+    const unit = await unitService.getById(req.params.unitId);
     res.json(unit);
-  } catch (error) {
-    next(error);
-  }
-});
+  })
+);
 
-// Create unit
-unitsRouter.post('/', async (req: AuthRequest, res: Response, next: NextFunction) => {
-  try {
-    const { 
-      condo_id, 
-      building_id, 
-      entrance_id, 
-      unit_type_id, 
-      number, 
-      floor,
-      area_total,
-      area_living,
-      rooms,
-      owner_name,
-      owner_phone,
-      owner_email,
-      is_rented,
-    } = req.body;
-
-    if (!condo_id || !unit_type_id || !number) {
-      throw new AppError('condo_id, unit_type_id, and number are required', 400);
-    }
-
-    // Check if user has admin access to condo
-    const hasAccess = await CondoService.checkUserAccess(condo_id, req.user!.id, ['company_admin', 'condo_admin']);
-
-    if (!hasAccess) {
-      throw new AppError('Insufficient permissions', 403);
-    }
-
-    const unit = await UnitService.createUnit({
-      condo_id,
-      building_id,
-      entrance_id,
-      unit_type_id,
-      number,
-      floor,
-      area_total,
-      area_living,
-      rooms,
-      owner_name,
-      owner_phone,
-      owner_email,
-      is_rented,
-    });
-
+// ✅ POST /condos/:condoId/units - Только admin
+router.post(
+  '/condos/:condoId/units',
+  authenticateToken,
+  authorize('complex_admin', 'uk_director'),
+  canAccessCondo(),
+  asyncHandler(async (req, res) => {
+    const unit = await unitService.create(req.params.condoId, req.body);
     res.status(201).json(unit);
-  } catch (error) {
-    next(error);
-  }
-});
+  })
+);
 
-// Update unit
-unitsRouter.patch('/:id', async (req: AuthRequest, res: Response, next: NextFunction) => {
-  try {
-    const unit = await UnitService.getUnitById(req.params.id);
+// ✅ PUT /units/:unitId
+router.put(
+  '/units/:unitId',
+  authenticateToken,
+  authorize('complex_admin', 'uk_director'),
+  canAccessUnit(),
+  asyncHandler(async (req, res) => {
+    const unit = await unitService.update(req.params.unitId, req.body);
+    res.json(unit);
+  })
+);
 
-    if (!unit) {
-      throw new AppError('Unit not found', 404);
-    }
+// ✅ DELETE /units/:unitId
+router.delete(
+  '/units/:unitId',
+  authenticateToken,
+  authorize('uk_director'),
+  canAccessUnit(),
+  asyncHandler(async (req, res) => {
+    await unitService.delete(req.params.unitId);
+    res.status(204).send();
+  })
+);
 
-    // Check access
-    const hasAccess = await CondoService.checkUserAccess(unit.condo_id, req.user!.id, ['company_admin', 'condo_admin']);
-
-    if (!hasAccess) {
-      throw new AppError('Insufficient permissions', 403);
-    }
-
-    const updated = await UnitService.updateUnit(req.params.id, req.body);
-
-    res.json(updated);
-  } catch (error) {
-    next(error);
-  }
-});
-
-// Delete unit
-unitsRouter.delete('/:id', async (req: AuthRequest, res: Response, next: NextFunction) => {
-  try {
-    const unit = await UnitService.getUnitById(req.params.id);
-
-    if (!unit) {
-      throw new AppError('Unit not found', 404);
-    }
-
-    // Check access
-    const hasAccess = await CondoService.checkUserAccess(unit.condo_id, req.user!.id, ['company_admin', 'condo_admin']);
-
-    if (!hasAccess) {
-      throw new AppError('Insufficient permissions', 403);
-    }
-
-    await UnitService.deleteUnit(req.params.id);
-
-    res.json({ message: 'Unit deleted successfully' });
-  } catch (error) {
-    next(error);
-  }
-});
-
-export { unitsRouter };
+export default router;
