@@ -3,7 +3,7 @@ import { Pool, PoolClient } from 'pg';
 import { Queue, Worker, Job } from 'bullmq';
 import IORedis from 'ioredis';
 import { pool } from '../db';
-import { logger } from '../utils/logger';
+import { logger, securityLogger } from '../utils/logger';
 import { openaiService } from './openai.service';
 import { Counter, Histogram, Gauge } from 'prom-client';
 import axios from 'axios';
@@ -12,6 +12,7 @@ import path from 'path';
 import crypto from 'crypto';
 import { promisify } from 'util';
 import stream from 'stream';
+import { URL } from 'url';
 import {
   sanitizeTelegramName,
   sanitizeTelegramUsername,
@@ -36,8 +37,28 @@ const MAX_MESSAGE_LENGTH = 4096;  // Telegram's limit
 const TEMP_DIR = process.env.TEMP_DIR || '/tmp/servai-telegram';
 const JOB_TIMEOUT_MS = 30000; // 30 seconds
 const TEMP_CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
-const START_COMMAND_RATE_LIMIT = 5; // Max 5 /start per minute per user
+
+// CRITICAL: Redis-based rate limiting for /start command
+const START_COMMAND_RATE_LIMIT_PER_USER = 5; // Max 5 /start per minute per user
+const START_COMMAND_RATE_LIMIT_GLOBAL = 100; // Max 100 /start per minute globally
 const START_COMMAND_WINDOW_MS = 60 * 1000; // 1 minute
+
+// CRITICAL: Max age validation for conversation history
+const MIN_CONVERSATION_AGE_HOURS = 1;
+const MAX_CONVERSATION_AGE_HOURS = 720; // 30 days
+
+// CRITICAL: Telegram CDN whitelist (SSRF prevention)
+const TELEGRAM_CDN_DOMAINS = [
+  'api.telegram.org',
+  'cdn.telegram.org',
+];
+
+// CRITICAL: Official Telegram webhook IP ranges
+// Source: https://core.telegram.org/bots/webhooks#the-short-version
+const TELEGRAM_WEBHOOK_IPS = [
+  '149.154.160.0/20',
+  '91.108.4.0/22',
+];
 
 // Allowed language codes (ISO 639-1)
 const ALLOWED_LANGUAGE_CODES = ['ru', 'en', 'uk', 'kk', 'be'];
@@ -110,6 +131,111 @@ interface QueuedMessage {
   priority?: number;
 }
 
+/**
+ * CRITICAL: Check if IP is in CIDR range
+ */
+function isIPInRange(ip: string, cidr: string): boolean {
+  const [range, bits] = cidr.split('/');
+  const mask = ~(2 ** (32 - parseInt(bits)) - 1);
+  
+  const ipNum = ip.split('.').reduce((acc, octet) => (acc << 8) + parseInt(octet), 0);
+  const rangeNum = range.split('.').reduce((acc, octet) => (acc << 8) + parseInt(octet), 0);
+  
+  return (ipNum & mask) === (rangeNum & mask);
+}
+
+/**
+ * CRITICAL: Verify IP is from Telegram servers
+ */
+function isValidTelegramIP(ip: string): boolean {
+  if (!ip) return false;
+  
+  // Validate IP format
+  const ipRegex = /^(\d{1,3}\.){3}\d{1,3}$/;
+  if (!ipRegex.test(ip)) return false;
+  
+  // Check each octet is valid (0-255)
+  const octets = ip.split('.').map(Number);
+  if (octets.some(o => o < 0 || o > 255)) return false;
+  
+  // Check against Telegram IP ranges
+  for (const range of TELEGRAM_WEBHOOK_IPS) {
+    if (isIPInRange(ip, range)) {
+      return true;
+    }
+  }
+  
+  return false;
+}
+
+/**
+ * CRITICAL: Validate URL is from Telegram CDN (SSRF prevention)
+ */
+function isValidTelegramCDNUrl(urlString: string): boolean {
+  try {
+    const url = new URL(urlString);
+    
+    // Must be HTTPS
+    if (url.protocol !== 'https:') {
+      return false;
+    }
+    
+    // Must be Telegram CDN domain
+    const isValidDomain = TELEGRAM_CDN_DOMAINS.some(domain => 
+      url.hostname === domain || url.hostname.endsWith(`.${domain}`)
+    );
+    
+    if (!isValidDomain) {
+      return false;
+    }
+    
+    // Block private IP ranges (additional safety)
+    const hostname = url.hostname;
+    
+    // Block localhost
+    if (hostname === 'localhost' || hostname === '127.0.0.1') {
+      return false;
+    }
+    
+    // Block private IPs
+    const privateIPRanges = [
+      /^10\./,
+      /^172\.(1[6-9]|2[0-9]|3[0-1])\./,
+      /^192\.168\./,
+      /^169\.254\./, // AWS metadata
+      /^::1$/, // IPv6 localhost
+      /^fe80:/i, // IPv6 link-local
+    ];
+    
+    if (privateIPRanges.some(regex => regex.test(hostname))) {
+      return false;
+    }
+    
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * CRITICAL: Validate conversation history age parameter
+ */
+function validateConversationAge(hours: number): number {
+  if (typeof hours !== 'number' || isNaN(hours)) {
+    return CONVERSATION_HISTORY_MAX_AGE_HOURS;
+  }
+  
+  if (hours < MIN_CONVERSATION_AGE_HOURS) {
+    return MIN_CONVERSATION_AGE_HOURS;
+  }
+  
+  if (hours > MAX_CONVERSATION_AGE_HOURS) {
+    return MAX_CONVERSATION_AGE_HOURS;
+  }
+  
+  return Math.floor(hours);
+}
+
 class TelegramService {
   private bot: TelegramBot | null = null;
   private webhookUrl: string = '';
@@ -119,7 +245,6 @@ class TelegramService {
   private redisConnection: IORedis | null = null;
   private lastMessageTime = 0;
   private tempCleanupInterval: NodeJS.Timeout | null = null;
-  private startCommandRateLimiter: Map<number, number[]> = new Map();
   private redisHealthy: boolean = true;
 
   async initialize(): Promise<void> {
@@ -161,7 +286,8 @@ class TelegramService {
       await this.bot.setWebHook(`${this.webhookUrl}/api/v1/telegram/webhook`, {
         secret_token: this.webhookSecret,
         max_connections: 40,
-        allowed_updates: ['message', 'callback_query']
+        allowed_updates: ['message', 'callback_query'],
+        ip_address: undefined, // Let Telegram use default IPs
       });
       
       logger.info('Telegram bot initialized in webhook mode', { 
@@ -232,7 +358,7 @@ class TelegramService {
           },
           removeOnComplete: 100,
           removeOnFail: 500,
-          timeout: JOB_TIMEOUT_MS // Add timeout to prevent hanging jobs
+          timeout: JOB_TIMEOUT_MS
         }
       });
 
@@ -383,34 +509,47 @@ class TelegramService {
     logger.info('Telegram bot handlers setup complete');
   }
 
-  private isStartCommandRateLimited(telegramId: number): boolean {
+  /**
+   * CRITICAL: Redis-based rate limiting for /start command
+   */
+  private async isStartCommandRateLimited(telegramId: number): Promise<boolean> {
+    if (!this.redisConnection || !this.redisHealthy) {
+      logger.warn('Redis not available, allowing /start request');
+      return false;
+    }
+
     const now = Date.now();
-    const userRequests = this.startCommandRateLimiter.get(telegramId) || [];
-    
-    // Remove old requests outside the window
-    const recentRequests = userRequests.filter(
-      timestamp => now - timestamp < START_COMMAND_WINDOW_MS
-    );
-    
-    if (recentRequests.length >= START_COMMAND_RATE_LIMIT) {
-      return true;
+    const userKey = `telegram:ratelimit:start:user:${telegramId}`;
+    const globalKey = 'telegram:ratelimit:start:global';
+
+    try {
+      // Per-user rate limit
+      const userCount = await this.redisConnection.incr(userKey);
+      if (userCount === 1) {
+        await this.redisConnection.pexpire(userKey, START_COMMAND_WINDOW_MS);
+      }
+
+      if (userCount > START_COMMAND_RATE_LIMIT_PER_USER) {
+        telegramSecurityEvents.inc({ event_type: 'start_rate_limited_user', severity: 'medium' });
+        return true;
+      }
+
+      // Global rate limit
+      const globalCount = await this.redisConnection.incr(globalKey);
+      if (globalCount === 1) {
+        await this.redisConnection.pexpire(globalKey, START_COMMAND_WINDOW_MS);
+      }
+
+      if (globalCount > START_COMMAND_RATE_LIMIT_GLOBAL) {
+        telegramSecurityEvents.inc({ event_type: 'start_rate_limited_global', severity: 'high' });
+        return true;
+      }
+
+      return false;
+    } catch (error) {
+      logger.error('Error in rate limiting', { error });
+      return false; // Fail open in case of Redis error
     }
-    
-    recentRequests.push(now);
-    this.startCommandRateLimiter.set(telegramId, recentRequests);
-    
-    // Cleanup old entries periodically
-    if (this.startCommandRateLimiter.size > 10000) {
-      const entriesToDelete: number[] = [];
-      this.startCommandRateLimiter.forEach((timestamps, id) => {
-        if (timestamps.every(t => now - t > START_COMMAND_WINDOW_MS)) {
-          entriesToDelete.push(id);
-        }
-      });
-      entriesToDelete.forEach(id => this.startCommandRateLimiter.delete(id));
-    }
-    
-    return false;
   }
 
   private async handleStart(msg: TelegramBot.Message, inviteToken?: string): Promise<void> {
@@ -421,9 +560,8 @@ class TelegramService {
         return;
       }
 
-      // Rate limiting for /start command
-      if (this.isStartCommandRateLimited(telegramId)) {
-        telegramSecurityEvents.inc({ event_type: 'start_rate_limited', severity: 'medium' });
+      // CRITICAL: Redis-based rate limiting
+      if (await this.isStartCommandRateLimited(telegramId)) {
         logger.warn('Start command rate limited', { telegramId });
         await this.sendMessage(telegramId, 'Слишком много попыток. Подождите минуту.');
         return;
@@ -459,18 +597,14 @@ class TelegramService {
   }
 
   private validateInviteToken(token: string): string | null {
-    // Sanitize first
     const sanitized = token.replace(/[^a-zA-Z0-9-_]/g, '').substring(0, 64);
     
-    // Check if empty after sanitization
     if (!sanitized || sanitized.length < 8) {
       return null;
     }
     
-    // Validate UUID v4 format (optional but recommended)
     const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
     if (!uuidRegex.test(sanitized)) {
-      // If not UUID, check if it's alphanumeric with proper length
       if (sanitized.length < 16 || sanitized.length > 64) {
         return null;
       }
@@ -488,7 +622,7 @@ class TelegramService {
       return normalized;
     }
     
-    return 'ru'; // Default fallback
+    return 'ru';
   }
 
   private async handleInviteRegistration(msg: TelegramBot.Message, inviteToken: string): Promise<void> {
@@ -498,7 +632,6 @@ class TelegramService {
     try {
       await client.query('BEGIN');
       
-      // Validate and sanitize invite token
       const validatedToken = this.validateInviteToken(inviteToken);
       
       if (!validatedToken) {
@@ -553,7 +686,6 @@ class TelegramService {
       const invite = inviteResult.rows[0];
       let userId = invite.user_id;
 
-      // Sanitize user input
       const firstName = sanitizeTelegramName(msg.from!.first_name, 'Пользователь');
       const lastName = sanitizeTelegramName(msg.from!.last_name, '');
       const username = sanitizeTelegramUsername(msg.from!.username);
@@ -575,7 +707,6 @@ class TelegramService {
         );
       }
 
-      // Check if telegram_id already registered WITH LOCK to prevent race condition
       const existingTgUser = await client.query(
         `SELECT id FROM telegram_users 
          WHERE telegram_id = $1 AND deleted_at IS NULL 
@@ -653,7 +784,6 @@ class TelegramService {
         return;
       }
       
-      // Validate and sanitize message
       const sanitizedText = sanitizeMessageText(msg.text, MAX_MESSAGE_LENGTH);
       
       if (!sanitizedText) {
@@ -734,7 +864,6 @@ class TelegramService {
       
       const photo = msg.photo[msg.photo.length - 1];
       
-      // Validate file size
       if (photo.file_size && photo.file_size > MAX_FILE_SIZE_BYTES) {
         await this.sendMessage(telegramId, 
           `Файл слишком большой. Максимум ${MAX_FILE_SIZE_MB}MB.`);
@@ -749,13 +878,27 @@ class TelegramService {
         return;
       }
 
-      // Generate temp file path
+      // CRITICAL: Validate URL is from Telegram CDN (SSRF prevention)
+      if (!isValidTelegramCDNUrl(fileLink)) {
+        telegramSecurityEvents.inc({ 
+          event_type: 'ssrf_attempt', 
+          severity: 'critical' 
+        });
+        
+        logger.error('SSRF attempt detected - invalid Telegram CDN URL', {
+          telegramId,
+          url: fileLink
+        });
+        
+        await this.sendMessage(telegramId, 'Ошибка безопасности. Обратитесь в поддержку.');
+        return;
+      }
+
       tempFilePath = path.join(
         TEMP_DIR,
         `tg_${telegramId}_${Date.now()}_${crypto.randomBytes(8).toString('hex')}.jpg`
       );
       
-      // Download and validate image
       const imageBase64 = await this.downloadAndValidateImage(fileLink, tempFilePath);
       fileCreated = true;
       
@@ -777,7 +920,6 @@ class TelegramService {
         await this.sendMessage(msg.from.id, 'Ошибка обработки фото.');
       }
     } finally {
-      // ALWAYS cleanup temp file if it was created
       if (tempFilePath && fileCreated) {
         try {
           await fs.promises.unlink(tempFilePath);
@@ -798,7 +940,6 @@ class TelegramService {
         validateStatus: (status) => status === 200
       });
 
-      // Validate Content-Type
       const contentType = response.headers['content-type'];
       if (!contentType || !ALLOWED_IMAGE_TYPES.includes(contentType)) {
         telegramSecurityEvents.inc({ 
@@ -809,17 +950,13 @@ class TelegramService {
         throw new Error('Invalid image type');
       }
 
-      // Download to temp file
       await pipeline(
         response.data,
         fs.createWriteStream(tempFilePath)
       );
 
-      // Read and validate file signature
       const buffer = await fs.promises.readFile(tempFilePath);
       
-      // Validate JPEG signature (FF D8 FF)
-      // Validate PNG signature (89 50 4E 47)
       const isJPEG = buffer[0] === 0xFF && buffer[1] === 0xD8 && buffer[2] === 0xFF;
       const isPNG = buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4E && buffer[3] === 0x47;
       
@@ -833,7 +970,6 @@ class TelegramService {
           signature: buffer.slice(0, 4).toString('hex')
         });
         
-        // Delete invalid file immediately
         await fs.promises.unlink(tempFilePath);
         throw new Error('Invalid image file signature');
       }
@@ -843,7 +979,6 @@ class TelegramService {
     } catch (error) {
       logger.error('Error downloading image', { error, url });
       
-      // Cleanup on error
       try {
         if (fs.existsSync(tempFilePath)) {
           await fs.promises.unlink(tempFilePath);
@@ -938,7 +1073,9 @@ class TelegramService {
     limit: number,
     maxAgeHours: number = 24
   ): Promise<ConversationMessage[]> {
-    // FIX #27: Use parameterized query for maxAgeHours to prevent SQL injection
+    // CRITICAL: Validate maxAgeHours to prevent SQL injection via negative intervals
+    const validatedMaxAge = validateConversationAge(maxAgeHours);
+    
     const result = await pool.query(
       `SELECT role, content 
        FROM conversations 
@@ -946,7 +1083,7 @@ class TelegramService {
          AND created_at > NOW() - INTERVAL '1 hour' * $3
        ORDER BY created_at DESC 
        LIMIT $2`,
-      [telegramUserId, limit, maxAgeHours]
+      [telegramUserId, limit, validatedMaxAge]
     );
     return result.rows.reverse();
   }
@@ -992,7 +1129,6 @@ class TelegramService {
   }
 
   async sendMessage(telegramId: number, text: string, options?: any, priority: number = 0): Promise<void> {
-    // Graceful degradation if Redis is down
     if (!this.messageQueue || !this.redisHealthy) {
       logger.warn('Message queue not available, using direct send', { 
         redisHealthy: this.redisHealthy 
@@ -1050,17 +1186,21 @@ class TelegramService {
   }
 
   /**
-   * Verify webhook secret token
-   * CRITICAL: Must be called for every webhook request
+   * CRITICAL: Verify webhook request
+   * Checks both secret token AND source IP
    */
-  verifyWebhookSecret(providedSecret: string): boolean {
+  verifyWebhookRequest(providedSecret: string, sourceIP: string): boolean {
+    // CRITICAL: Verify webhook secret (constant-time comparison)
     if (!this.webhookSecret) {
       logger.error('Webhook secret not configured but verification attempted');
       return false;
     }
     
-    // Constant-time comparison to prevent timing attacks
     if (providedSecret.length !== this.webhookSecret.length) {
+      telegramSecurityEvents.inc({ 
+        event_type: 'webhook_secret_length_mismatch', 
+        severity: 'critical' 
+      });
       return false;
     }
     
@@ -1069,24 +1209,38 @@ class TelegramService {
       mismatch |= this.webhookSecret.charCodeAt(i) ^ providedSecret.charCodeAt(i);
     }
     
-    const isValid = mismatch === 0;
+    const secretValid = mismatch === 0;
     
-    if (!isValid) {
+    if (!secretValid) {
       telegramSecurityEvents.inc({ 
         event_type: 'webhook_secret_mismatch', 
         severity: 'critical' 
       });
-      logger.error('Webhook secret verification failed');
+      logger.error('Webhook secret verification failed', { sourceIP });
+      return false;
     }
     
-    return isValid;
+    // CRITICAL: Verify source IP is from Telegram
+    if (!isValidTelegramIP(sourceIP)) {
+      telegramSecurityEvents.inc({ 
+        event_type: 'webhook_invalid_ip', 
+        severity: 'critical' 
+      });
+      logger.error('Webhook request from non-Telegram IP', { 
+        sourceIP,
+        allowedRanges: TELEGRAM_WEBHOOK_IPS 
+      });
+      return false;
+    }
+    
+    return true;
   }
 
   private async cleanupOldTempFiles(): Promise<void> {
     try {
       const files = await fs.promises.readdir(TEMP_DIR);
       const now = Date.now();
-      const maxAge = 24 * 60 * 60 * 1000; // 24 hours
+      const maxAge = 24 * 60 * 60 * 1000;
       
       let cleaned = 0;
       
@@ -1115,13 +1269,13 @@ class TelegramService {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 
-  async processWebhookUpdate(update: any, providedSecret?: string): Promise<void> {
+  async processWebhookUpdate(update: any, providedSecret?: string, sourceIP?: string): Promise<void> {
     if (!this.bot) return;
     
-    // CRITICAL: Verify webhook secret if in webhook mode
-    if (this.webhookSecret && providedSecret) {
-      if (!this.verifyWebhookSecret(providedSecret)) {
-        throw new Error('Webhook secret verification failed');
+    // CRITICAL: Verify webhook secret AND source IP
+    if (this.webhookSecret && providedSecret && sourceIP) {
+      if (!this.verifyWebhookRequest(providedSecret, sourceIP)) {
+        throw new Error('Webhook verification failed');
       }
     }
     
@@ -1135,7 +1289,6 @@ class TelegramService {
   async shutdown(): Promise<void> {
     logger.info('Shutting down Telegram service...');
     
-    // Stop periodic cleanup
     if (this.tempCleanupInterval) {
       clearInterval(this.tempCleanupInterval);
       logger.info('Temp cleanup interval stopped');
@@ -1162,11 +1315,7 @@ class TelegramService {
       logger.info('Bot polling stopped');
     }
     
-    // Cleanup temp files on shutdown
     await this.cleanupOldTempFiles();
-    
-    // Clear rate limiter
-    this.startCommandRateLimiter.clear();
   }
 }
 
