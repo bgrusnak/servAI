@@ -1,88 +1,77 @@
 import { Router } from 'express';
-import { PasswordResetService } from '../services/password-reset.service';
-import { asyncHandler } from '../middleware/errorHandler';
-import { rateLimit } from '../middleware/rateLimiter';
-import { z } from 'zod';
+import { validate } from '../middleware/validate.middleware';
+import { passwordResetService } from '../services/password-reset.service';
+import { asyncHandler } from '../utils/asyncHandler';
+import rateLimit from 'express-rate-limit';
 
 const router = Router();
 
-// Validation schemas
-const RequestResetSchema = z.object({
-  email: z.string().email('Invalid email address'),
-});
-
-const ValidateTokenSchema = z.object({
-  token: z.string().min(1, 'Token is required'),
-});
-
-const ResetPasswordSchema = z.object({
-  token: z.string().min(1, 'Token is required'),
-  new_password: z
-    .string()
-    .min(8, 'Password must be at least 8 characters')
-    .max(100, 'Password is too long'),
+// Rate limiter to prevent email bombing
+const passwordResetLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5, // 5 requests per window
+  message: 'Too many password reset requests, please try again later',
+  standardHeaders: true,
+  legacyHeaders: false,
 });
 
 /**
- * @route POST /api/v1/password-reset/request
- * @desc Request password reset
- * @access Public
- * @ratelimit 3 requests per hour per IP
+ * POST /password-reset/request
+ * Request password reset email
  */
 router.post(
   '/request',
-  rateLimit({ points: 3, duration: 3600 }), // 3 attempts per hour
+  passwordResetLimiter,
   asyncHandler(async (req, res) => {
-    // Validate input
-    const data = RequestResetSchema.parse(req.body);
+    const { email } = req.body;
 
-    const result = await PasswordResetService.requestPasswordReset({
-      email: data.email,
-      ip_address: req.ip,
-      user_agent: req.get('user-agent'),
-    });
+    if (!email) {
+      return res.status(400).json({ error: 'Email required' });
+    }
 
-    res.json(result);
+    await passwordResetService.requestPasswordReset(email.trim().toLowerCase());
+
+    // Always return success to prevent email enumeration
+    res.json({ message: 'If the email exists, a reset link has been sent' });
   })
 );
 
 /**
- * @route GET /api/v1/password-reset/validate/:token
- * @desc Validate password reset token
- * @access Public
- */
-router.get(
-  '/validate/:token',
-  asyncHandler(async (req, res) => {
-    const { token } = req.params;
-
-    const result = await PasswordResetService.validateToken(token);
-
-    res.json(result);
-  })
-);
-
-/**
- * @route POST /api/v1/password-reset/reset
- * @desc Reset password using token
- * @access Public
- * @ratelimit 5 requests per 5 minutes per IP
+ * POST /password-reset/reset
+ * Reset password with token
  */
 router.post(
   '/reset',
-  rateLimit({ points: 5, duration: 300 }), // 5 attempts per 5 minutes
+  passwordResetLimiter,
   asyncHandler(async (req, res) => {
-    // Validate input
-    const data = ResetPasswordSchema.parse(req.body);
+    const { token, newPassword } = req.body;
 
-    const result = await PasswordResetService.resetPassword({
-      token: data.token,
-      new_password: data.new_password,
-      ip_address: req.ip,
-      user_agent: req.get('user-agent'),
-    });
+    if (!token || !newPassword) {
+      return res.status(400).json({ error: 'Token and new password required' });
+    }
 
-    res.json(result);
+    if (newPassword.length < 8) {
+      return res.status(400).json({ error: 'Password must be at least 8 characters' });
+    }
+
+    await passwordResetService.resetPassword(token, newPassword);
+
+    res.json({ message: 'Password reset successful' });
+  })
+);
+
+/**
+ * GET /password-reset/verify/:token
+ * Verify if reset token is valid
+ */
+router.get(
+  '/verify/:token',
+  asyncHandler(async (req, res) => {
+    const { token } = req.params;
+
+    const isValid = await passwordResetService.verifyResetToken(token);
+
+    res.json({ valid: isValid });
   })
 );
 
