@@ -93,7 +93,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed } from 'vue';
+import { ref, reactive } from 'vue';
 import { useRouter } from 'vue-router';
 import { useQuasar } from 'quasar';
 import { useI18n } from 'vue-i18n';
@@ -144,12 +144,12 @@ const handleLogin = async () => {
       position: 'top'
     });
     
-    // Security: Clear password from memory
+    // Clear form
     form.password = '';
     
     router.push('/');
   } catch (error) {
-    // Security: Clear password on error
+    // Clear password on error for user to re-enter
     form.password = '';
     
     $q.notify({
