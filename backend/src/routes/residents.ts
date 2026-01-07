@@ -1,230 +1,159 @@
-import { Router, Response, NextFunction } from 'express';
-import { authenticate, AuthRequest } from '../middleware/auth';
+import { Router } from 'express';
+import { authenticateToken } from '../middleware/auth.middleware';
+import { canAccessUnit, authorize } from '../middleware/authorize.middleware';
+import { asyncHandler } from '../utils/asyncHandler';
 import { ResidentService } from '../services/resident.service';
-import { CondoService } from '../services/condo.service';
 import { UnitService } from '../services/unit.service';
-import { AppError } from '../middleware/errorHandler';
 
-const residentsRouter = Router();
+const router = Router();
 
-// All routes require authentication
-residentsRouter.use(authenticate);
-
-// List residents by unit
-residentsRouter.get('/unit/:unitId', async (req: AuthRequest, res: Response, next: NextFunction) => {
-  try {
-    const unit = await UnitService.getUnitById(req.params.unitId);
-
-    if (!unit) {
-      throw new AppError('Unit not found', 404);
-    }
-
-    // Check access
-    const hasAccess = await CondoService.checkUserAccess(
-      unit.condo_id,
-      req.user!.id
-    );
-
-    if (!hasAccess) {
-      throw new AppError('Access denied', 403);
-    }
-
+// ✅ GET /units/:unitId/residents - Жители квартиры
+router.get(
+  '/units/:unitId/residents',
+  authenticateToken,
+  canAccessUnit(), // 🔒 UNIFIED MIDDLEWARE
+  asyncHandler(async (req, res) => {
     const includeInactive = req.query.include_inactive === 'true';
     const residents = await ResidentService.listResidentsByUnit(req.params.unitId, includeInactive);
-
     res.json(residents);
-  } catch (error) {
-    next(error);
-  }
-});
+  })
+);
 
-// List units for current user
-residentsRouter.get('/my-units', async (req: AuthRequest, res: Response, next: NextFunction) => {
-  try {
+// ✅ GET /residents/my-units - Мои квартиры
+router.get(
+  '/my-units',
+  authenticateToken,
+  asyncHandler(async (req, res) => {
     const includeInactive = req.query.include_inactive === 'true';
-    const units = await ResidentService.listUnitsByUser(req.user!.id, includeInactive);
-
+    const units = await ResidentService.listUnitsByUser(req.user.id, includeInactive);
     res.json(units);
-  } catch (error) {
-    next(error);
-  }
-});
+  })
+);
 
-// Get resident by ID
-residentsRouter.get('/:id', async (req: AuthRequest, res: Response, next: NextFunction) => {
-  try {
+// ✅ GET /residents/:id
+router.get(
+  '/:id',
+  authenticateToken,
+  asyncHandler(async (req, res) => {
     const resident = await ResidentService.getResidentById(req.params.id);
-
     if (!resident) {
-      throw new AppError('Resident not found', 404);
+      return res.status(404).json({ error: 'Resident not found' });
     }
-
-    // Check access - user can view their own or has condo access
-    if (resident.user_id !== req.user!.id) {
-      const unit = await UnitService.getUnitById(resident.unit_id);
-      if (!unit) {
-        throw new AppError('Unit not found', 404);
-      }
-
-      const hasAccess = await CondoService.checkUserAccess(
-        unit.condo_id,
-        req.user!.id
-      );
-
-      if (!hasAccess) {
-        throw new AppError('Access denied', 403);
-      }
+    
+    // Проверка доступа: свой или canAccessUnit
+    if (resident.user_id !== req.user.id) {
+      req.params.unitId = resident.unit_id;
+      const middleware = canAccessUnit();
+      await new Promise((resolve, reject) => {
+        middleware(req, res, (err) => err ? reject(err) : resolve(null));
+      });
     }
-
+    
     res.json(resident);
-  } catch (error) {
-    next(error);
-  }
-});
+  })
+);
 
-// Create resident (manual assignment by admin)
-residentsRouter.post('/', async (req: AuthRequest, res: Response, next: NextFunction) => {
-  try {
+// ✅ POST /residents - Создать жителя (только admin)
+router.post(
+  '/',
+  authenticateToken,
+  authorize('uk_director', 'complex_admin'), // 🔒 UNIFIED
+  asyncHandler(async (req, res) => {
     const { user_id, unit_id, is_owner, moved_in_at } = req.body;
-
+    
     if (!user_id || !unit_id) {
-      throw new AppError('user_id and unit_id are required', 400);
+      return res.status(400).json({ error: 'user_id and unit_id are required' });
     }
-
-    const unit = await UnitService.getUnitById(unit_id);
-
-    if (!unit) {
-      throw new AppError('Unit not found', 404);
-    }
-
-    // Check admin access
-    const hasAccess = await CondoService.checkUserAccess(
-      unit.condo_id,
-      req.user!.id,
-      ['company_admin', 'condo_admin']
-    );
-
-    if (!hasAccess) {
-      throw new AppError('Insufficient permissions', 403);
-    }
-
+    
+    // Проверка доступа к unit
+    req.params.unitId = unit_id;
+    const middleware = canAccessUnit();
+    await new Promise((resolve, reject) => {
+      middleware(req, res, (err) => err ? reject(err) : resolve(null));
+    });
+    
     const resident = await ResidentService.createResident({
       user_id,
       unit_id,
       is_owner,
       moved_in_at: moved_in_at ? new Date(moved_in_at) : undefined,
     });
-
+    
     res.status(201).json(resident);
-  } catch (error) {
-    next(error);
-  }
-});
+  })
+);
 
-// Update resident
-residentsRouter.patch('/:id', async (req: AuthRequest, res: Response, next: NextFunction) => {
-  try {
+// ✅ PATCH /residents/:id
+router.patch(
+  '/:id',
+  authenticateToken,
+  authorize('uk_director', 'complex_admin'),
+  asyncHandler(async (req, res) => {
     const resident = await ResidentService.getResidentById(req.params.id);
-
     if (!resident) {
-      throw new AppError('Resident not found', 404);
+      return res.status(404).json({ error: 'Resident not found' });
     }
-
-    const unit = await UnitService.getUnitById(resident.unit_id);
-    if (!unit) {
-      throw new AppError('Unit not found', 404);
-    }
-
-    // Check admin access
-    const hasAccess = await CondoService.checkUserAccess(
-      unit.condo_id,
-      req.user!.id,
-      ['company_admin', 'condo_admin']
-    );
-
-    if (!hasAccess) {
-      throw new AppError('Insufficient permissions', 403);
-    }
-
+    
+    req.params.unitId = resident.unit_id;
+    const middleware = canAccessUnit();
+    await new Promise((resolve, reject) => {
+      middleware(req, res, (err) => err ? reject(err) : resolve(null));
+    });
+    
     const { is_owner, is_active, moved_in_at, moved_out_at } = req.body;
-
     const updated = await ResidentService.updateResident(req.params.id, {
       is_owner,
       is_active,
       moved_in_at: moved_in_at ? new Date(moved_in_at) : undefined,
       moved_out_at: moved_out_at ? new Date(moved_out_at) : undefined,
     });
-
+    
     res.json(updated);
-  } catch (error) {
-    next(error);
-  }
-});
+  })
+);
 
-// Move out resident
-residentsRouter.post('/:id/move-out', async (req: AuthRequest, res: Response, next: NextFunction) => {
-  try {
+// ✅ POST /residents/:id/move-out
+router.post(
+  '/:id/move-out',
+  authenticateToken,
+  authorize('uk_director', 'complex_admin'),
+  asyncHandler(async (req, res) => {
     const resident = await ResidentService.getResidentById(req.params.id);
-
     if (!resident) {
-      throw new AppError('Resident not found', 404);
+      return res.status(404).json({ error: 'Resident not found' });
     }
-
-    const unit = await UnitService.getUnitById(resident.unit_id);
-    if (!unit) {
-      throw new AppError('Unit not found', 404);
-    }
-
-    // Check admin access
-    const hasAccess = await CondoService.checkUserAccess(
-      unit.condo_id,
-      req.user!.id,
-      ['company_admin', 'condo_admin']
-    );
-
-    if (!hasAccess) {
-      throw new AppError('Insufficient permissions', 403);
-    }
-
+    
+    req.params.unitId = resident.unit_id;
+    const middleware = canAccessUnit();
+    await new Promise((resolve, reject) => {
+      middleware(req, res, (err) => err ? reject(err) : resolve(null));
+    });
+    
     await ResidentService.moveOutResident(req.params.id);
-
     res.json({ message: 'Resident moved out successfully' });
-  } catch (error) {
-    next(error);
-  }
-});
+  })
+);
 
-// Delete resident
-residentsRouter.delete('/:id', async (req: AuthRequest, res: Response, next: NextFunction) => {
-  try {
+// ✅ DELETE /residents/:id
+router.delete(
+  '/:id',
+  authenticateToken,
+  authorize('uk_director', 'complex_admin'),
+  asyncHandler(async (req, res) => {
     const resident = await ResidentService.getResidentById(req.params.id);
-
     if (!resident) {
-      throw new AppError('Resident not found', 404);
+      return res.status(404).json({ error: 'Resident not found' });
     }
-
-    const unit = await UnitService.getUnitById(resident.unit_id);
-    if (!unit) {
-      throw new AppError('Unit not found', 404);
-    }
-
-    // Check admin access
-    const hasAccess = await CondoService.checkUserAccess(
-      unit.condo_id,
-      req.user!.id,
-      ['company_admin', 'condo_admin']
-    );
-
-    if (!hasAccess) {
-      throw new AppError('Insufficient permissions', 403);
-    }
-
+    
+    req.params.unitId = resident.unit_id;
+    const middleware = canAccessUnit();
+    await new Promise((resolve, reject) => {
+      middleware(req, res, (err) => err ? reject(err) : resolve(null));
+    });
+    
     await ResidentService.deleteResident(req.params.id);
-
     res.json({ message: 'Resident deleted successfully' });
-  } catch (error) {
-    next(error);
-  }
-});
+  })
+);
 
-export { residentsRouter };
+export default router;

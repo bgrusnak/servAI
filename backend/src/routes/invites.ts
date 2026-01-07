@@ -1,258 +1,152 @@
-import { Router, Response, NextFunction } from 'express';
-import { authenticate, AuthRequest } from '../middleware/auth';
+import { Router } from 'express';
+import { authenticateToken } from '../middleware/auth.middleware';
+import { canAccessUnit, authorize } from '../middleware/authorize.middleware';
+import { asyncHandler } from '../utils/asyncHandler';
 import { InviteService } from '../services/invite.service';
-import { ResidentService } from '../services/resident.service';
-import { CondoService } from '../services/condo.service';
 import { UnitService } from '../services/unit.service';
-import { AppError } from '../middleware/errorHandler';
-import { rateLimit } from '../middleware/rateLimiter';
-import { z } from 'zod';
 
-const invitesRouter = Router();
+const router = Router();
 
-// Validation schemas
-const CreateInviteSchema = z.object({
-  unit_id: z.string().uuid('Invalid unit_id format'),
-  email: z.string().email('Invalid email format').optional(),
-  phone: z.string().regex(/^\+?[1-9]\d{1,14}$/, 'Invalid phone format').optional(),
-  ttl_days: z.number().int().min(1).max(365).optional(),
-  max_uses: z.number().int().min(1).optional(),
-});
-
-// Public: Validate invite token (with rate limiting)
-invitesRouter.get(
+// ✅ GET /invites/validate/:token - Публичный endpoint
+router.get(
   '/validate/:token',
-  rateLimit({ points: 10, duration: 60 }), // 10 requests per minute per IP
-  async (req, res: Response, next: NextFunction) => {
-    try {
-      const validation = await InviteService.validateInvite(req.params.token);
-      res.json(validation);
-    } catch (error) {
-      next(error);
-    }
-  }
+  asyncHandler(async (req, res) => {
+    const validation = await InviteService.validateInvite(req.params.token);
+    res.json(validation);
+  })
 );
 
-// Public: Accept invite (with rate limiting and transaction)
-invitesRouter.post(
+// ✅ POST /invites/accept/:token - Принять приглашение
+router.post(
   '/accept/:token',
-  rateLimit({ points: 5, duration: 300 }), // 5 accepts per 5 minutes per IP
-  authenticate,
-  async (req: AuthRequest, res: Response, next: NextFunction) => {
-    try {
-      if (!req.user) {
-        throw new AppError('Authentication required', 401);
-      }
-
-      // Accept invite atomically (fixes CRIT-001)
-      const result = await InviteService.acceptInvite(req.params.token, req.user.id);
-
-      res.status(201).json({
-        message: 'Invite accepted successfully',
-        resident: result.resident,
-        unit: result.unit,
-      });
-    } catch (error) {
-      next(error);
-    }
-  }
+  authenticateToken,
+  asyncHandler(async (req, res) => {
+    const result = await InviteService.acceptInvite(req.params.token, req.user.id);
+    res.status(201).json({
+      message: 'Invite accepted successfully',
+      resident: result.resident,
+      unit: result.unit,
+    });
+  })
 );
 
-// Protected routes (require authentication)
-invitesRouter.use(authenticate);
-
-// Create invite for a unit
-invitesRouter.post('/', async (req: AuthRequest, res: Response, next: NextFunction) => {
-  try {
-    // Validate input (fixes HIGH-001)
-    const data = CreateInviteSchema.parse(req.body);
-
-    // Get unit to check access
-    const unit = await UnitService.getUnitById(data.unit_id);
-
-    if (!unit) {
-      throw new AppError('Unit not found', 404);
+// ✅ POST /invites - Создать приглашение
+router.post(
+  '/',
+  authenticateToken,
+  authorize('uk_director', 'complex_admin'), // 🔒 UNIFIED
+  asyncHandler(async (req, res) => {
+    const { unit_id, email, phone, ttl_days, max_uses } = req.body;
+    
+    if (!unit_id) {
+      return res.status(400).json({ error: 'unit_id is required' });
     }
-
-    // Check if user has access to the condo
-    const hasAccess = await CondoService.checkUserAccess(
-      unit.condo_id,
-      req.user!.id,
-      ['company_admin', 'condo_admin']
-    );
-
-    if (!hasAccess) {
-      throw new AppError('Insufficient permissions', 403);
-    }
-
-    const invite = await InviteService.createInvite({
-      unit_id: data.unit_id,
-      email: data.email,
-      phone: data.phone,
-      ttl_days: data.ttl_days,
-      max_uses: data.max_uses,
-      created_by: req.user!.id,
+    
+    // Проверка доступа к unit
+    req.params.unitId = unit_id;
+    const middleware = canAccessUnit();
+    await new Promise((resolve, reject) => {
+      middleware(req, res, (err) => err ? reject(err) : resolve(null));
     });
-
+    
+    const invite = await InviteService.createInvite({
+      unit_id,
+      email,
+      phone,
+      ttl_days,
+      max_uses,
+      created_by: req.user.id,
+    });
+    
     res.status(201).json(invite);
-  } catch (error) {
-    if (error instanceof z.ZodError) {
-      return next(new AppError(error.errors[0].message, 400));
-    }
-    next(error);
-  }
-});
+  })
+);
 
-// List invites for a unit
-invitesRouter.get('/unit/:unitId', async (req: AuthRequest, res: Response, next: NextFunction) => {
-  try {
-    const unit = await UnitService.getUnitById(req.params.unitId);
-
-    if (!unit) {
-      throw new AppError('Unit not found', 404);
-    }
-
-    // Check access
-    const hasAccess = await CondoService.checkUserAccess(
-      unit.condo_id,
-      req.user!.id,
-      ['company_admin', 'condo_admin']
-    );
-
-    if (!hasAccess) {
-      throw new AppError('Insufficient permissions', 403);
-    }
-
+// ✅ GET /units/:unitId/invites - Приглашения квартиры
+router.get(
+  '/units/:unitId/invites',
+  authenticateToken,
+  canAccessUnit(), // 🔒 UNIFIED MIDDLEWARE
+  asyncHandler(async (req, res) => {
     const includeExpired = req.query.include_expired === 'true';
     const invites = await InviteService.listInvitesByUnit(req.params.unitId, includeExpired);
-
     res.json(invites);
-  } catch (error) {
-    next(error);
-  }
-});
+  })
+);
 
-// Get invite statistics for a unit
-invitesRouter.get('/unit/:unitId/stats', async (req: AuthRequest, res: Response, next: NextFunction) => {
-  try {
-    const unit = await UnitService.getUnitById(req.params.unitId);
-
-    if (!unit) {
-      throw new AppError('Unit not found', 404);
-    }
-
-    // Check access
-    const hasAccess = await CondoService.checkUserAccess(
-      unit.condo_id,
-      req.user!.id,
-      ['company_admin', 'condo_admin']
-    );
-
-    if (!hasAccess) {
-      throw new AppError('Insufficient permissions', 403);
-    }
-
+// ✅ GET /units/:unitId/invites/stats
+router.get(
+  '/units/:unitId/invites/stats',
+  authenticateToken,
+  canAccessUnit(),
+  asyncHandler(async (req, res) => {
     const stats = await InviteService.getInviteStats(req.params.unitId);
-
     res.json(stats);
-  } catch (error) {
-    next(error);
-  }
-});
+  })
+);
 
-// Get invite by ID
-invitesRouter.get('/:id', async (req: AuthRequest, res: Response, next: NextFunction) => {
-  try {
+// ✅ GET /invites/:id
+router.get(
+  '/:id',
+  authenticateToken,
+  asyncHandler(async (req, res) => {
     const invite = await InviteService.getInviteById(req.params.id);
-
     if (!invite) {
-      throw new AppError('Invite not found', 404);
+      return res.status(404).json({ error: 'Invite not found' });
     }
-
-    const unit = await UnitService.getUnitById(invite.unit_id);
-    if (!unit) {
-      throw new AppError('Unit not found', 404);
-    }
-
-    // Check access
-    const hasAccess = await CondoService.checkUserAccess(
-      unit.condo_id,
-      req.user!.id,
-      ['company_admin', 'condo_admin']
-    );
-
-    if (!hasAccess) {
-      throw new AppError('Insufficient permissions', 403);
-    }
-
+    
+    req.params.unitId = invite.unit_id;
+    const middleware = canAccessUnit();
+    await new Promise((resolve, reject) => {
+      middleware(req, res, (err) => err ? reject(err) : resolve(null));
+    });
+    
     res.json(invite);
-  } catch (error) {
-    next(error);
-  }
-});
+  })
+);
 
-// Deactivate invite
-invitesRouter.post('/:id/deactivate', async (req: AuthRequest, res: Response, next: NextFunction) => {
-  try {
+// ✅ POST /invites/:id/deactivate
+router.post(
+  '/:id/deactivate',
+  authenticateToken,
+  authorize('uk_director', 'complex_admin'),
+  asyncHandler(async (req, res) => {
     const invite = await InviteService.getInviteById(req.params.id);
-
     if (!invite) {
-      throw new AppError('Invite not found', 404);
+      return res.status(404).json({ error: 'Invite not found' });
     }
-
-    const unit = await UnitService.getUnitById(invite.unit_id);
-    if (!unit) {
-      throw new AppError('Unit not found', 404);
-    }
-
-    const hasAccess = await CondoService.checkUserAccess(
-      unit.condo_id,
-      req.user!.id,
-      ['company_admin', 'condo_admin']
-    );
-
-    if (!hasAccess) {
-      throw new AppError('Insufficient permissions', 403);
-    }
-
+    
+    req.params.unitId = invite.unit_id;
+    const middleware = canAccessUnit();
+    await new Promise((resolve, reject) => {
+      middleware(req, res, (err) => err ? reject(err) : resolve(null));
+    });
+    
     await InviteService.deactivateInvite(req.params.id);
-
     res.json({ message: 'Invite deactivated successfully' });
-  } catch (error) {
-    next(error);
-  }
-});
+  })
+);
 
-// Delete invite
-invitesRouter.delete('/:id', async (req: AuthRequest, res: Response, next: NextFunction) => {
-  try {
+// ✅ DELETE /invites/:id
+router.delete(
+  '/:id',
+  authenticateToken,
+  authorize('uk_director', 'complex_admin'),
+  asyncHandler(async (req, res) => {
     const invite = await InviteService.getInviteById(req.params.id);
-
     if (!invite) {
-      throw new AppError('Invite not found', 404);
+      return res.status(404).json({ error: 'Invite not found' });
     }
-
-    const unit = await UnitService.getUnitById(invite.unit_id);
-    if (!unit) {
-      throw new AppError('Unit not found', 404);
-    }
-
-    const hasAccess = await CondoService.checkUserAccess(
-      unit.condo_id,
-      req.user!.id,
-      ['company_admin', 'condo_admin']
-    );
-
-    if (!hasAccess) {
-      throw new AppError('Insufficient permissions', 403);
-    }
-
+    
+    req.params.unitId = invite.unit_id;
+    const middleware = canAccessUnit();
+    await new Promise((resolve, reject) => {
+      middleware(req, res, (err) => err ? reject(err) : resolve(null));
+    });
+    
     await InviteService.deleteInvite(req.params.id);
-
     res.json({ message: 'Invite deleted successfully' });
-  } catch (error) {
-    next(error);
-  }
-});
+  })
+);
 
-export { invitesRouter };
+export default router;

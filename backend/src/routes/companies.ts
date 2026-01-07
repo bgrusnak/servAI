@@ -1,55 +1,48 @@
-import { Router, Response, NextFunction } from 'express';
-import { authenticate, AuthRequest, requireRole } from '../middleware/auth';
+import { Router } from 'express';
+import { authenticateToken } from '../middleware/auth.middleware';
+import { canAccessCompany, authorize } from '../middleware/authorize.middleware';
+import { asyncHandler } from '../utils/asyncHandler';
 import { CompanyService } from '../services/company.service';
-import { AppError } from '../middleware/errorHandler';
-import { CONSTANTS } from '../config/constants';
 
-const companiesRouter = Router();
+const router = Router();
 
-// All routes require authentication
-companiesRouter.use(authenticate);
-
-// List companies (user sees only companies where they have roles)
-companiesRouter.get('/', async (req: AuthRequest, res: Response, next: NextFunction) => {
-  try {
+// ✅ GET /companies - Список УК (только свои)
+router.get(
+  '/',
+  authenticateToken,
+  asyncHandler(async (req, res) => {
     const page = parseInt(req.query.page as string) || 1;
-    const limit = Math.min(
-      parseInt(req.query.limit as string) || CONSTANTS.DEFAULT_PAGE_SIZE,
-      CONSTANTS.MAX_PAGE_SIZE
-    );
-
-    const result = await CompanyService.listCompanies(req.user!.id, page, limit);
-
+    const limit = parseInt(req.query.limit as string) || 50;
+    const result = await CompanyService.listCompanies(req.user.id, page, limit);
     res.json(result);
-  } catch (error) {
-    next(error);
-  }
-});
+  })
+);
 
-// Get company by ID
-companiesRouter.get('/:id', async (req: AuthRequest, res: Response, next: NextFunction) => {
-  try {
-    const company = await CompanyService.getCompanyById(req.params.id, req.user!.id);
-
+// ✅ GET /companies/:companyId
+router.get(
+  '/:companyId',
+  authenticateToken,
+  canAccessCompany(), // 🔒 UNIFIED MIDDLEWARE
+  asyncHandler(async (req, res) => {
+    const company = await CompanyService.getCompanyById(req.params.companyId, req.user.id);
     if (!company) {
-      throw new AppError('Company not found', 404);
+      return res.status(404).json({ error: 'Company not found' });
     }
-
     res.json(company);
-  } catch (error) {
-    next(error);
-  }
-});
+  })
+);
 
-// Create company (system admin only for now, can be opened later)
-companiesRouter.post('/', requireRole('system_admin'), async (req: AuthRequest, res: Response, next: NextFunction) => {
-  try {
+// ✅ POST /companies - Только superadmin
+router.post(
+  '/',
+  authenticateToken,
+  authorize('superadmin'), // 🔒 UNIFIED
+  asyncHandler(async (req, res) => {
     const { name, legal_name, inn, kpp, address, phone, email, website } = req.body;
-
     if (!name) {
-      throw new AppError('Company name is required', 400);
+      return res.status(400).json({ error: 'Company name is required' });
     }
-
+    
     const company = await CompanyService.createCompany({
       name,
       legal_name,
@@ -59,27 +52,21 @@ companiesRouter.post('/', requireRole('system_admin'), async (req: AuthRequest, 
       phone,
       email,
       website,
-    }, req.user!.id);
-
+    }, req.user.id);
+    
     res.status(201).json(company);
-  } catch (error) {
-    next(error);
-  }
-});
+  })
+);
 
-// Update company
-companiesRouter.patch('/:id', async (req: AuthRequest, res: Response, next: NextFunction) => {
-  try {
-    // Check if user has admin role for this company
-    const hasAccess = await CompanyService.checkUserAccess(req.params.id, req.user!.id, ['company_admin']);
-
-    if (!hasAccess) {
-      throw new AppError('Insufficient permissions', 403);
-    }
-
+// ✅ PATCH /companies/:companyId - Только uk_director
+router.patch(
+  '/:companyId',
+  authenticateToken,
+  authorize('uk_director'), // 🔒 UNIFIED
+  canAccessCompany(),
+  asyncHandler(async (req, res) => {
     const { name, legal_name, inn, kpp, address, phone, email, website, is_active } = req.body;
-
-    const company = await CompanyService.updateCompany(req.params.id, {
+    const company = await CompanyService.updateCompany(req.params.companyId, {
       name,
       legal_name,
       inn,
@@ -90,22 +77,19 @@ companiesRouter.patch('/:id', async (req: AuthRequest, res: Response, next: Next
       website,
       is_active,
     });
-
     res.json(company);
-  } catch (error) {
-    next(error);
-  }
-});
+  })
+);
 
-// Delete company (soft delete)
-companiesRouter.delete('/:id', requireRole('system_admin'), async (req: AuthRequest, res: Response, next: NextFunction) => {
-  try {
-    await CompanyService.deleteCompany(req.params.id);
-
+// ✅ DELETE /companies/:companyId - Только superadmin
+router.delete(
+  '/:companyId',
+  authenticateToken,
+  authorize('superadmin'),
+  asyncHandler(async (req, res) => {
+    await CompanyService.deleteCompany(req.params.companyId);
     res.json({ message: 'Company deleted successfully' });
-  } catch (error) {
-    next(error);
-  }
-});
+  })
+);
 
-export { companiesRouter };
+export default router;
