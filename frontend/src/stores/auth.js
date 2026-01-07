@@ -1,21 +1,26 @@
 import { defineStore } from 'pinia';
-import { authAPI, setAuthStore } from '../api';
+import { authAPI } from '../api';
+import { LocalStorage } from 'quasar';
 
 export const useAuthStore = defineStore('auth', {
   state: () => ({
     user: null,
-    token: localStorage.getItem('token') || null,
-    isAuthenticated: !!localStorage.getItem('token'),
+    token: LocalStorage.getItem('authToken') || null,
+    isAuthenticated: !!LocalStorage.getItem('authToken'),
     loading: false,
     error: null
   }),
 
   getters: {
     currentUser: (state) => state.user,
-    userRole: (state) => state.user?.role,
-    userName: (state) => state.user?.name,
+    userRoles: (state) => state.user?.roles || [],
+    userRole: (state) => state.user?.roles?.[0]?.role || null,
+    userName: (state) => state.user?.name || `${state.user?.firstName} ${state.user?.lastName}`,
     userEmail: (state) => state.user?.email,
-    isAdmin: (state) => ['super_admin', 'uk_director'].includes(state.user?.role)
+    isAdmin: (state) => {
+      const roles = state.user?.roles || [];
+      return roles.some(r => ['superadmin', 'uk_director', 'complex_admin'].includes(r.role));
+    }
   },
 
   actions: {
@@ -24,11 +29,10 @@ export const useAuthStore = defineStore('auth', {
       this.error = null;
       try {
         const response = await authAPI.login(credentials);
-        this.token = response.data.token;
+        this.token = response.data.accessToken;
         this.user = response.data.user;
         this.isAuthenticated = true;
-        localStorage.setItem('token', this.token);
-        setAuthStore(this);
+        LocalStorage.set('authToken', this.token);
         return response.data;
       } catch (error) {
         this.error = error.message || 'Login failed';
@@ -40,14 +44,18 @@ export const useAuthStore = defineStore('auth', {
 
     async logout() {
       try {
-        await authAPI.logout();
+        const refreshToken = LocalStorage.getItem('refreshToken');
+        if (refreshToken) {
+          await authAPI.logout({ refreshToken });
+        }
       } catch (error) {
         // Ignore logout API errors
       } finally {
         this.user = null;
         this.token = null;
         this.isAuthenticated = false;
-        localStorage.removeItem('token');
+        LocalStorage.remove('authToken');
+        LocalStorage.remove('refreshToken');
       }
     },
 
@@ -55,9 +63,8 @@ export const useAuthStore = defineStore('auth', {
       if (!this.token) return;
       try {
         const response = await authAPI.me();
-        this.user = response.data;
+        this.user = response.data.user;
         this.isAuthenticated = true;
-        setAuthStore(this);
       } catch (error) {
         this.logout();
         throw error;
@@ -66,9 +73,18 @@ export const useAuthStore = defineStore('auth', {
 
     async refreshToken() {
       try {
-        const response = await authAPI.refresh();
-        this.token = response.data.token;
-        localStorage.setItem('token', this.token);
+        const refreshToken = LocalStorage.getItem('refreshToken');
+        if (!refreshToken) {
+          throw new Error('No refresh token');
+        }
+        
+        const response = await authAPI.refresh({ refreshToken });
+        this.token = response.data.accessToken;
+        LocalStorage.set('authToken', this.token);
+        
+        if (response.data.refreshToken) {
+          LocalStorage.set('refreshToken', response.data.refreshToken);
+        }
       } catch (error) {
         this.logout();
         throw error;

@@ -4,8 +4,15 @@ import { Queue, Worker, Job } from 'bullmq';
 import IORedis from 'ioredis';
 import { pool } from '../db';
 import { logger } from '../utils/logger';
-import { perplexityService } from './perplexity.service';
+import { openaiService } from './openai.service';
 import { Counter, Histogram, Gauge } from 'prom-client';
+import axios from 'axios';
+import fs from 'fs';
+import path from 'path';
+import { promisify } from 'util';
+
+const writeFile = promisify(fs.writeFile);
+const unlink = promisify(fs.unlink);
 
 // Metrics
 const telegramMessagesTotal = new Counter({
@@ -40,7 +47,9 @@ const INTENT_CONFIDENCE_THRESHOLD = parseFloat(process.env.INTENT_CONFIDENCE_THR
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 1000;
 const TELEGRAM_RATE_LIMIT_PER_SECOND = parseInt(process.env.TELEGRAM_RATE_LIMIT_PER_SECOND || '25');
-const MESSAGE_INTERVAL_MS = 1000 / TELEGRAM_RATE_LIMIT_PER_SECOND; // ~40ms for 25 msg/sec
+const MESSAGE_INTERVAL_MS = 1000 / TELEGRAM_RATE_LIMIT_PER_SECOND;
+const MAX_FILE_SIZE_MB = 5;
+const TEMP_DIR = process.env.TEMP_DIR || '/tmp';
 
 interface TelegramUser {
   id: string;
@@ -77,9 +86,6 @@ class TelegramService {
   private redisConnection: IORedis | null = null;
   private lastMessageTime = 0;
 
-  /**
-   * Initialize Telegram bot
-   */
   async initialize(): Promise<void> {
     const token = process.env.TELEGRAM_BOT_TOKEN;
     if (!token) {
@@ -97,7 +103,6 @@ class TelegramService {
     const useWebhook = process.env.TELEGRAM_USE_WEBHOOK === 'true';
     
     if (useWebhook) {
-      // Webhook mode (for production)
       this.webhookUrl = process.env.TELEGRAM_WEBHOOK_URL || '';
       if (!this.webhookUrl) {
         throw new Error('TELEGRAM_WEBHOOK_URL required for webhook mode');
@@ -107,7 +112,6 @@ class TelegramService {
       await this.bot.setWebHook(`${this.webhookUrl}/api/v1/telegram/webhook`);
       logger.info('Telegram bot initialized in webhook mode', { url: this.webhookUrl });
     } else {
-      // Polling mode (for development)
       this.bot = new TelegramBot(token, { polling: true });
       logger.info('Telegram bot initialized in polling mode');
     }
@@ -116,9 +120,6 @@ class TelegramService {
     await this.initializeMessageQueue();
   }
 
-  /**
-   * Initialize BullMQ message queue for rate-limited outgoing messages
-   */
   private async initializeMessageQueue(): Promise<void> {
     try {
       const redisUrl = process.env.REDIS_URL;
@@ -126,7 +127,6 @@ class TelegramService {
         throw new Error('REDIS_URL is required for message queue');
       }
       
-      // Create Redis connection for BullMQ
       this.redisConnection = new IORedis(redisUrl, {
         maxRetriesPerRequest: null,
         enableReadyCheck: true,
@@ -140,7 +140,6 @@ class TelegramService {
         logger.info('Redis connection ready for message queue');
       });
       
-      // Create BullMQ Queue
       this.messageQueue = new Queue<QueuedMessage>('telegram-outgoing-messages', {
         connection: this.redisConnection.duplicate(),
         defaultJobOptions: {
@@ -149,19 +148,17 @@ class TelegramService {
             type: 'exponential',
             delay: RETRY_DELAY_MS
           },
-          removeOnComplete: 100, // Keep last 100 completed
-          removeOnFail: 500 // Keep last 500 failed
+          removeOnComplete: 100,
+          removeOnFail: 500
         }
       });
 
-      // Create Worker to process queue
       this.messageWorker = new Worker<QueuedMessage>(
         'telegram-outgoing-messages',
         async (job: Job<QueuedMessage>) => {
           const { telegramId, text, options } = job.data;
           
           try {
-            // Ensure minimum interval between messages
             const now = Date.now();
             const timeSinceLastMessage = now - this.lastMessageTime;
             if (timeSinceLastMessage < MESSAGE_INTERVAL_MS) {
@@ -182,25 +179,20 @@ class TelegramService {
               queueSize: await this.messageQueue?.count()
             });
           } catch (error: any) {
-            // Handle Telegram rate limit (429)
             if (error.response?.statusCode === 429) {
               const retryAfter = error.response?.parameters?.retry_after || 1;
-              logger.warn('Telegram rate limit hit, delaying job', {
+              logger.warn('Telegram rate limit hit', {
                 telegramId,
                 jobId: job.id,
                 retryAfter
               });
               
               telegramMessagesTotal.inc({ type: 'outgoing', status: 'rate_limited' });
-              
-              // Delay this job by re-throwing with moveToDelayed
-              const delayMs = retryAfter * 1000;
-              throw new Error(`RATE_LIMIT:${delayMs}`);
+              throw new Error(`RATE_LIMIT:${retryAfter * 1000}`);
             }
             
-            // Handle FloodWait (too many messages to same chat)
             if (error.message?.includes('FLOOD_WAIT')) {
-              const match = error.message.match(/(\d+)/);
+              const match = error.message.match(/FLOOD_WAIT_(\d+)/);
               const waitSeconds = match ? parseInt(match[1]) : 60;
               logger.warn('Telegram flood wait', {
                 telegramId,
@@ -224,21 +216,19 @@ class TelegramService {
         },
         {
           connection: this.redisConnection.duplicate(),
-          concurrency: 1, // Process one at a time for rate limiting
+          concurrency: 1,
           limiter: {
             max: TELEGRAM_RATE_LIMIT_PER_SECOND,
-            duration: 1000 // Per second
+            duration: 1000
           }
         }
       );
 
-      // Worker event handlers
       this.messageWorker.on('completed', (job) => {
         logger.debug('Job completed', { jobId: job.id });
       });
 
       this.messageWorker.on('failed', async (job, err) => {
-        // Check if it's a rate limit or flood wait error
         if (err.message.startsWith('RATE_LIMIT:') || err.message.startsWith('FLOOD_WAIT:')) {
           const delayMs = parseInt(err.message.split(':')[1]);
           logger.info('Retrying job after delay', {
@@ -246,7 +236,6 @@ class TelegramService {
             delayMs
           });
           
-          // Re-add to queue with delay
           if (job && this.messageQueue) {
             await this.messageQueue.add(job.name, job.data, {
               delay: delayMs,
@@ -266,7 +255,6 @@ class TelegramService {
         logger.warn('Job stalled', { jobId });
       });
 
-      // Update metrics every 5 seconds
       setInterval(async () => {
         if (this.messageQueue) {
           const waiting = await this.messageQueue.getWaitingCount();
@@ -278,8 +266,7 @@ class TelegramService {
         }
       }, 5000);
 
-      logger.info('Telegram message queue initialized with BullMQ', {
-        redisUrl: redisUrl.replace(/:[^:]*@/, ':***@'), // Hide password
+      logger.info('Telegram message queue initialized', {
         rateLimit: TELEGRAM_RATE_LIMIT_PER_SECOND,
         intervalMs: MESSAGE_INTERVAL_MS
       });
@@ -289,38 +276,28 @@ class TelegramService {
     }
   }
 
-  /**
-   * Setup message handlers
-   */
   private setupHandlers(): void {
     if (!this.bot) return;
 
-    // Handle /start command
     this.bot.onText(/\/start(.*)/, async (msg, match) => {
       await this.handleStart(msg, match?.[1]?.trim());
     });
 
-    // Handle text messages
     this.bot.on('message', async (msg) => {
-      if (msg.text?.startsWith('/')) return; // Skip commands
+      if (msg.text?.startsWith('/')) return;
       await this.handleMessage(msg);
     });
 
-    // Handle photos
     this.bot.on('photo', async (msg) => {
       await this.handlePhoto(msg);
     });
 
-    // Handle callback queries (buttons)
     this.bot.on('callback_query', async (query) => {
       await this.handleCallbackQuery(query);
     });
 
     logger.info('Telegram bot handlers setup complete');
   }
-
-  // ... (rest of the methods remain the same: handleStart, handleMessage, handlePhoto, etc.)
-  // They work with this.sendMessage() which now uses BullMQ
 
   private async handleStart(msg: TelegramBot.Message, inviteToken?: string): Promise<void> {
     try {
@@ -329,7 +306,6 @@ class TelegramService {
 
       telegramMessagesTotal.inc({ type: 'start', status: 'received' });
 
-      // Check if user already exists
       const existingUser = await this.getTelegramUser(telegramId);
       
       if (existingUser) {
@@ -338,7 +314,6 @@ class TelegramService {
         return;
       }
 
-      // New user - require invite token
       if (!inviteToken) {
         await this.sendMessage(telegramId,
           'Добро пожаловать в servAI! Для регистрации нужна ссылка-приглашение.\n\n' +
@@ -347,7 +322,6 @@ class TelegramService {
         return;
       }
 
-      // Validate invite and create user
       await this.handleInviteRegistration(msg, inviteToken);
       telegramMessagesTotal.inc({ type: 'start', status: 'registered' });
     } catch (error) {
@@ -462,24 +436,51 @@ class TelegramService {
         await this.sendMessage(msg.from.id, 'Пожалуйста, начните с /start.');
         return;
       }
+      
       const photo = msg.photo[msg.photo.length - 1];
-      const fileLink = await this.bot?.getFileLink(photo.file_id);
-      if (!fileLink?.startsWith('https://api.telegram.org/')) {
-        await this.sendMessage(msg.from.id, 'Не удалось обработать фото.');
+      
+      if (photo.file_size && photo.file_size > MAX_FILE_SIZE_MB * 1024 * 1024) {
+        await this.sendMessage(msg.from.id, `Файл слишком большой. Максимум ${MAX_FILE_SIZE_MB}MB.`);
         return;
       }
+
       await this.sendMessage(msg.from.id, 'Обрабатываю фото...');
-      const ocrResult = await perplexityService.recognizeMeterReading(fileLink);
+      
+      const fileLink = await this.bot?.getFileLink(photo.file_id);
+      if (!fileLink) {
+        await this.sendMessage(msg.from.id, 'Не удалось получить файл.');
+        return;
+      }
+
+      const imageBase64 = await this.downloadAndConvertToBase64(fileLink);
+      const ocrResult = await openaiService.recognizeMeterReading(imageBase64);
+      
       if (ocrResult.success && ocrResult.value) {
         await this.sendMessage(msg.from.id, `Распознал: ${ocrResult.meter_type || 'счётчик'} = ${ocrResult.value}`);
         telegramMessagesTotal.inc({ type: 'photo', status: 'ocr_success' });
       } else {
-        await this.sendMessage(msg.from.id, 'Не смог прочитать показания с фото.');
+        await this.sendMessage(msg.from.id, 'Не смог прочитать показания с фото. Попробуйте сфотографировать чётче.');
         telegramMessagesTotal.inc({ type: 'photo', status: 'ocr_failed' });
       }
     } catch (error) {
       logger.error('Error handling photo:', error);
       telegramMessagesTotal.inc({ type: 'photo', status: 'error' });
+      await this.sendMessage(msg.from.id, 'Ошибка обработки фото.');
+    }
+  }
+
+  private async downloadAndConvertToBase64(url: string): Promise<string> {
+    try {
+      const response = await axios.get(url, {
+        responseType: 'arraybuffer',
+        timeout: 10000
+      });
+
+      const buffer = Buffer.from(response.data);
+      return buffer.toString('base64');
+    } catch (error) {
+      logger.error('Error downloading image', { error, url });
+      throw new Error('Failed to download image');
     }
   }
 
@@ -498,7 +499,7 @@ class TelegramService {
       const context = await this.getContext(telegramUser.id);
       const systemPrompt = await this.getSystemPrompt(telegramUser.language_code);
       const intents = await this.getIntents();
-      return await perplexityService.processMessage(message, history, context.conversation_summary || '', systemPrompt, intents, telegramUser.language_code);
+      return await openaiService.processMessage(message, history, context.conversation_summary || '', systemPrompt, intents, telegramUser.language_code);
     } catch (error) {
       logger.error('Error processing with AI:', error);
       return { intent: 'unknown', confidence: 0, parameters: {}, response: 'Извините, не понял.' };
@@ -561,9 +562,6 @@ class TelegramService {
     return result.rows;
   }
 
-  /**
-   * Send message via BullMQ queue (non-blocking, rate-limited)
-   */
   async sendMessage(telegramId: number, text: string, options?: any, priority: number = 0): Promise<void> {
     if (!this.messageQueue) {
       logger.warn('Message queue not initialized, using fallback');

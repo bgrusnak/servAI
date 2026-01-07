@@ -10,7 +10,6 @@ const buildingsRouter = Router();
 
 buildingsRouter.use(authenticate);
 
-// List buildings (by condo)
 buildingsRouter.get('/', canAccessCondo(), async (req: AuthRequest, res: Response, next: NextFunction) => {
   const page = Math.max(1, parseInt(req.query.page as string) || 1);
   const limit = Math.min(
@@ -31,7 +30,6 @@ buildingsRouter.get('/', canAccessCondo(), async (req: AuthRequest, res: Respons
   res.json(result);
 });
 
-// Get building by ID
 buildingsRouter.get('/:id', async (req: AuthRequest, res: Response, next: NextFunction) => {
   if (!isUUID(req.params.id)) {
     throw new AppError('Invalid building ID format', 400);
@@ -42,7 +40,6 @@ buildingsRouter.get('/:id', async (req: AuthRequest, res: Response, next: NextFu
     throw new AppError('Building not found', 404);
   }
 
-  // Check access using service (consistent with PATCH/DELETE)
   const hasAccess = await BuildingService.checkUserAccess(
     building.condo_id,
     req.user!.id
@@ -55,7 +52,6 @@ buildingsRouter.get('/:id', async (req: AuthRequest, res: Response, next: NextFu
   res.json(building);
 });
 
-// Create building - FIXED: Now canAccessCondo() reads from body
 buildingsRouter.post('/', 
   authorize('complex_admin', 'uk_director'), 
   canAccessCondo(), 
@@ -81,7 +77,6 @@ buildingsRouter.post('/',
     res.status(201).json(building);
 });
 
-// Update building - UNIFIED: Use middleware + service check
 buildingsRouter.patch('/:id', 
   authorize('complex_admin', 'uk_director'), 
   async (req: AuthRequest, res: Response, next: NextFunction) => {
@@ -94,7 +89,6 @@ buildingsRouter.patch('/:id',
       throw new AppError('Building not found', 404);
     }
 
-    // Check access using service
     const hasAccess = await BuildingService.checkUserAccess(
       building.condo_id,
       req.user!.id,
@@ -109,7 +103,6 @@ buildingsRouter.patch('/:id',
     res.json(updated);
 });
 
-// Delete building - UNIFIED: Use service check
 buildingsRouter.delete('/:id', 
   authorize('complex_admin', 'uk_director'), 
   async (req: AuthRequest, res: Response, next: NextFunction) => {
@@ -122,7 +115,6 @@ buildingsRouter.delete('/:id',
       throw new AppError('Building not found', 404);
     }
 
-    // Check access using service
     const hasAccess = await BuildingService.checkUserAccess(
       building.condo_id,
       req.user!.id,
