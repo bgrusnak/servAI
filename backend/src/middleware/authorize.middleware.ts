@@ -1,249 +1,178 @@
 import { Request, Response, NextFunction } from 'express';
 import { AppDataSource } from '../db/data-source';
 import { Resident } from '../entities/Resident';
-import { User } from '../entities/User';
 import { Unit } from '../entities/Unit';
-import { Condo } from '../entities/Condo';
-import { Company } from '../entities/Company';
-import { logger } from '../utils/logger';
+import { User } from '../entities/User';
+import { ForbiddenError, NotFoundError } from '../utils/errors';
 
 const residentRepository = AppDataSource.getRepository(Resident);
 const unitRepository = AppDataSource.getRepository(Unit);
-const condoRepository = AppDataSource.getRepository(Condo);
-const companyRepository = AppDataSource.getRepository(Company);
+const userRepository = AppDataSource.getRepository(User);
 
-/**
- * Check if user has one of the allowed roles
- */
-export function authorize(...allowedRoles: string[]) {
+export type UserRole = 
+  | 'superadmin'
+  | 'uk_director'
+  | 'accountant'
+  | 'complex_admin'
+  | 'employee'
+  | 'security_guard'
+  | 'resident';
+
+export const authorize = (...allowedRoles: UserRole[]) => {
+  return (req: Request, res: Response, next: NextFunction) => {
+    if (!req.user) {
+      throw new ForbiddenError('Authentication required');
+    }
+    if (!allowedRoles.includes(req.user.role)) {
+      throw new ForbiddenError(`Access denied. Required roles: ${allowedRoles.join(', ')}`);
+    }
+    next();
+  };
+};
+
+export const canAccessCompany = () => {
   return async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const user = (req as any).user as User;
-
-      if (!user) {
-        return res.status(401).json({
-          success: false,
-          error: 'Unauthorized - No user in request',
-        });
-      }
-
-      // Check if user has one of the allowed roles
-      if (!allowedRoles.includes(user.role)) {
-        logger.warn('Authorization failed', {
-          userId: user.id,
-          userRole: user.role,
-          allowedRoles,
-          path: req.path,
-        });
-
-        return res.status(403).json({
-          success: false,
-          error: 'Insufficient permissions',
-        });
-      }
-
+      if (req.user.role === 'superadmin') return next();
+      const companyId = req.params.companyId || req.body.companyId || req.query.companyId;
+      if (!companyId) throw new ForbiddenError('Company ID required');
+      if (req.user.companyId !== companyId) throw new ForbiddenError('Access denied to this company');
       next();
     } catch (error) {
-      logger.error('Authorization middleware error', { error });
-      res.status(500).json({
-        success: false,
-        error: 'Internal server error',
-      });
+      next(error);
     }
   };
-}
+};
 
-/**
- * Check if user can access specific unit
- * Super admin and complex admin can access all units in their scope
- */
-export function canAccessUnit() {
+export const canAccessCondo = () => {
   return async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const user = (req as any).user as User;
-      const unitId = req.params.unitId || req.body.unitId;
-
-      if (!unitId) {
-        return res.status(400).json({
-          success: false,
-          error: 'unitId is required',
-        });
-      }
-
-      // Super admin can access everything
-      if (user.role === 'super_admin') {
+      if (req.user.role === 'superadmin') return next();
+      const condoId = req.params.condoId || req.body.condoId || req.query.condoId;
+      if (!condoId) throw new ForbiddenError('Condo ID required');
+      
+      if (req.user.role === 'uk_director' || req.user.role === 'accountant') {
+        const condo = await AppDataSource.getRepository('Condo').findOne({ where: { id: condoId } });
+        if (!condo) throw new NotFoundError('Condo');
+        if (condo.companyId !== req.user.companyId) throw new ForbiddenError('Access denied to this condo');
         return next();
       }
-
-      // Get unit with relations
-      const unit = await unitRepository.findOne({
-        where: { id: unitId },
-        relations: ['condo', 'condo.company'],
-      });
-
-      if (!unit) {
-        return res.status(404).json({
-          success: false,
-          error: 'Unit not found',
-        });
-      }
-
-      // UK director can access units in their company
-      if (user.role === 'uk_director' && user.companyId === unit.condo.companyId) {
-        return next();
-      }
-
-      // Complex admin can access units in their condo
-      if (user.role === 'complex_admin' && user.condoId === unit.condoId) {
-        return next();
-      }
-
-      // Check if user is resident of this unit
-      const resident = await residentRepository.findOne({
-        where: { userId: user.id, unitId },
-      });
-
-      if (resident) {
-        return next();
-      }
-
-      // Access denied
-      logger.warn('Unit access denied', {
-        userId: user.id,
-        userRole: user.role,
-        unitId,
-        condoId: unit.condoId,
-      });
-
-      return res.status(403).json({
-        success: false,
-        error: 'Access denied to this unit',
-      });
+      
+      if (req.user.condoId !== condoId) throw new ForbiddenError('Access denied to this condo');
+      next();
     } catch (error) {
-      logger.error('canAccessUnit middleware error', { error });
-      res.status(500).json({
-        success: false,
-        error: 'Internal server error',
-      });
+      next(error);
     }
   };
-}
+};
 
-/**
- * Check if user can access specific condo
- */
-export function canAccessCondo() {
+export const canAccessUnit = () => {
   return async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const user = (req as any).user as User;
-      const condoId = req.params.condoId || req.params.id || req.body.condoId;
-
-      if (!condoId) {
-        return res.status(400).json({
-          success: false,
-          error: 'condoId is required',
-        });
-      }
-
-      // Super admin can access everything
-      if (user.role === 'super_admin') {
+      if (req.user.role === 'superadmin') return next();
+      const unitId = req.params.unitId || req.body.unitId || req.query.unitId;
+      if (!unitId) throw new ForbiddenError('Unit ID required');
+      
+      const unit = await unitRepository.findOne({ where: { id: unitId }, relations: ['condo'] });
+      if (!unit) throw new NotFoundError('Unit');
+      
+      if (req.user.role === 'uk_director' || req.user.role === 'accountant') {
+        if (unit.condo.companyId !== req.user.companyId) throw new ForbiddenError('Access denied to this unit');
         return next();
       }
-
-      // Get condo
-      const condo = await condoRepository.findOne({
-        where: { id: condoId },
-      });
-
-      if (!condo) {
-        return res.status(404).json({
-          success: false,
-          error: 'Condo not found',
-        });
-      }
-
-      // UK director can access condos in their company
-      if (user.role === 'uk_director' && user.companyId === condo.companyId) {
+      
+      if (req.user.role === 'complex_admin' || req.user.role === 'employee') {
+        if (unit.condoId !== req.user.condoId) throw new ForbiddenError('Access denied to this unit');
         return next();
       }
-
-      // Complex admin can access their condo
-      if (user.role === 'complex_admin' && user.condoId === condoId) {
-        return next();
+      
+      if (req.user.role === 'resident') {
+        const resident = await residentRepository.findOne({ where: { userId: req.user.id, unitId } });
+        if (!resident) throw new ForbiddenError('Access denied to this unit');
       }
-
-      // Access denied
-      logger.warn('Condo access denied', {
-        userId: user.id,
-        userRole: user.role,
-        condoId,
-        companyId: condo.companyId,
-      });
-
-      return res.status(403).json({
-        success: false,
-        error: 'Access denied to this condo',
-      });
+      
+      next();
     } catch (error) {
-      logger.error('canAccessCondo middleware error', { error });
-      res.status(500).json({
-        success: false,
-        error: 'Internal server error',
-      });
+      next(error);
     }
   };
-}
+};
 
-/**
- * Check if user can access specific company
- */
-export function canAccessCompany() {
+export const isSecurityGuard = () => {
+  return (req: Request, res: Response, next: NextFunction) => {
+    if (req.user.role !== 'security_guard' && req.user.role !== 'superadmin') {
+      throw new ForbiddenError('Only security guards can access this');
+    }
+    next();
+  };
+};
+
+export const canAccessTask = () => {
   return async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const user = (req as any).user as User;
-      const companyId = req.params.companyId || req.params.id || req.body.companyId;
-
-      if (!companyId) {
-        return res.status(400).json({
-          success: false,
-          error: 'companyId is required',
-        });
-      }
-
-      // Super admin can access everything
-      if (user.role === 'super_admin') {
+      if (req.user.role === 'superadmin') return next();
+      const taskId = req.params.taskId || req.params.id;
+      if (!taskId) throw new ForbiddenError('Task ID required');
+      
+      const task = await AppDataSource.getRepository('Ticket').findOne({
+        where: { id: taskId },
+        relations: ['unit', 'unit.condo'],
+      });
+      if (!task) throw new NotFoundError('Task');
+      
+      if (req.user.role === 'uk_director' || req.user.role === 'accountant') {
+        if (task.unit.condo.companyId !== req.user.companyId) throw new ForbiddenError('Access denied to this task');
         return next();
       }
-
-      // UK director can access their company
-      if (user.role === 'uk_director' && user.companyId === companyId) {
+      
+      if (req.user.role === 'complex_admin') {
+        if (task.unit.condoId !== req.user.condoId) throw new ForbiddenError('Access denied to this task');
         return next();
       }
-
-      // Access denied
-      logger.warn('Company access denied', {
-        userId: user.id,
-        userRole: user.role,
-        companyId,
-      });
-
-      return res.status(403).json({
-        success: false,
-        error: 'Access denied to this company',
-      });
+      
+      if (req.user.role === 'employee') {
+        if (task.assignedTo !== req.user.id) throw new ForbiddenError('Access denied to this task');
+        return next();
+      }
+      
+      if (req.user.role === 'resident') {
+        const resident = await residentRepository.findOne({ where: { userId: req.user.id, unitId: task.unitId } });
+        if (!resident) throw new ForbiddenError('Access denied to this task');
+      }
+      
+      next();
     } catch (error) {
-      logger.error('canAccessCompany middleware error', { error });
-      res.status(500).json({
-        success: false,
-        error: 'Internal server error',
-      });
+      next(error);
     }
   };
-}
+};
 
-/**
- * Check if user is security guard
- */
-export function isSecurityGuard() {
-  return authorize('security_guard', 'complex_admin', 'uk_director', 'super_admin');
-}
+export const canAccessFinances = () => {
+  return async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      if (req.user.role === 'superadmin') return next();
+      if (req.user.role !== 'uk_director' && req.user.role !== 'accountant') {
+        throw new ForbiddenError('Access denied to financial data');
+      }
+      
+      const companyId = req.params.companyId || req.body.companyId || req.query.companyId;
+      if (companyId && companyId !== req.user.companyId) {
+        throw new ForbiddenError('Access denied to this company finances');
+      }
+      
+      next();
+    } catch (error) {
+      next(error);
+    }
+  };
+};
+
+export default {
+  authorize,
+  canAccessCompany,
+  canAccessCondo,
+  canAccessUnit,
+  isSecurityGuard,
+  canAccessTask,
+  canAccessFinances,
+};
