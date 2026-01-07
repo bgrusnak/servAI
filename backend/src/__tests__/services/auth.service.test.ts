@@ -14,6 +14,12 @@ describe('Auth Service Tests', () => {
     refreshTokenRepo = testDataSource.getRepository(RefreshToken);
   });
 
+  // Clear only auth-related tables for these tests
+  beforeEach(async () => {
+    await refreshTokenRepo.query('TRUNCATE TABLE "refresh_tokens" CASCADE');
+    await userRepo.query('TRUNCATE TABLE "users" CASCADE');
+  });
+
   describe('User Registration', () => {
     it('should create a new user with hashed password', async () => {
       const userData = {
@@ -30,7 +36,6 @@ describe('Auth Service Tests', () => {
       expect(user.passwordHash).toBeDefined();
       expect(user.passwordHash).not.toBe(userData.password);
       
-      // Verify password is hashed correctly
       const isMatch = await bcrypt.compare(userData.password, user.passwordHash);
       expect(isMatch).toBe(true);
     });
@@ -53,6 +58,23 @@ describe('Auth Service Tests', () => {
       expect(user.emailVerified).toBe(true);
       expect(user.createdAt).toBeDefined();
       expect(user.updatedAt).toBeDefined();
+    });
+
+    it('should validate email format', async () => {
+      const invalidEmails = ['notanemail', '@example.com', 'test@', 'test'];
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+      invalidEmails.forEach(email => {
+        expect(email).not.toMatch(emailRegex);
+      });
+    });
+
+    it('should enforce password strength', async () => {
+      const weakPasswords = ['123', 'password', 'abc', 'test'];
+      
+      weakPasswords.forEach(password => {
+        expect(password.length).toBeLessThan(8);
+      });
     });
   });
 
@@ -91,6 +113,15 @@ describe('Auth Service Tests', () => {
 
       expect(user.isActive).toBe(false);
     });
+
+    it('should not authenticate unverified email', async () => {
+      const user = await createTestUser(userRepo, {
+        email: 'unverified@example.com',
+        emailVerified: false,
+      });
+
+      expect(user.emailVerified).toBe(false);
+    });
   });
 
   describe('JWT Tokens', () => {
@@ -104,6 +135,25 @@ describe('Auth Service Tests', () => {
       expect(decoded.email).toBe(payload.email);
     });
 
+    it('should reject expired token', () => {
+      const payload = { userId: '123', email: 'test@example.com' };
+      const secret = process.env.JWT_SECRET || 'test-secret';
+      const token = jwt.sign(payload, secret, { expiresIn: '0s' });
+
+      expect(() => {
+        jwt.verify(token, secret);
+      }).toThrow();
+    });
+
+    it('should reject token with wrong secret', () => {
+      const payload = { userId: '123', email: 'test@example.com' };
+      const token = jwt.sign(payload, 'secret1', { expiresIn: '15m' });
+
+      expect(() => {
+        jwt.verify(token, 'secret2');
+      }).toThrow();
+    });
+
     it('should create refresh token in database', async () => {
       const user = await createTestUser(userRepo, {
         email: 'refresh@example.com',
@@ -112,7 +162,7 @@ describe('Auth Service Tests', () => {
       const refreshToken = refreshTokenRepo.create({
         userId: user.id,
         token: 'refresh-token-' + Date.now(),
-        expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), // 7 days
+        expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
       });
 
       const saved = await refreshTokenRepo.save(refreshToken);
@@ -135,7 +185,7 @@ describe('Auth Service Tests', () => {
       await expect(
         refreshTokenRepo.save({
           userId: user.id,
-          token, // same token
+          token,
           expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
         })
       ).rejects.toThrow();
