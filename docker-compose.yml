@@ -6,20 +6,32 @@ services:
     image: postgres:16-alpine
     container_name: servai-postgres
     environment:
-      POSTGRES_DB: ${POSTGRES_DB:-servai}
-      POSTGRES_USER: ${POSTGRES_USER:-servai}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-servai_password}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
       - "5432:5432"
     networks:
       - servai-network
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-servai}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 10s
 
   # Redis for caching and sessions
   redis:
@@ -31,29 +43,48 @@ services:
       - redis_data:/data
     networks:
       - servai-network
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 10s
 
   # Backend API
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
+      target: dev
     container_name: servai-backend
     environment:
       NODE_ENV: ${NODE_ENV:-development}
       PORT: 3000
-      DATABASE_URL: postgresql://${POSTGRES_USER:-servai}:${POSTGRES_PASSWORD:-servai_password}@postgres:5432/${POSTGRES_DB:-servai}
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       REDIS_HOST: redis
       REDIS_PORT: 6379
-      JWT_SECRET: ${JWT_SECRET:-your_jwt_secret_key_change_in_production}
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
       PERPLEXITY_API_KEY: ${PERPLEXITY_API_KEY}
       STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY}
       STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET}
+      EMAIL_HOST: ${EMAIL_HOST}
+      EMAIL_PORT: ${EMAIL_PORT}
+      EMAIL_USER: ${EMAIL_USER}
+      EMAIL_PASSWORD: ${EMAIL_PASSWORD}
+      EMAIL_FROM: ${EMAIL_FROM}
     volumes:
       - ./backend:/app
       - /app/node_modules
@@ -67,6 +98,18 @@ services:
         condition: service_healthy
     networks:
       - servai-network
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '1.0'
+          memory: 1G
+    # Healthcheck inherited from Dockerfile
     command: npm run dev
 
   # Frontend
@@ -86,14 +129,26 @@ services:
       - "9000:9000"
     networks:
       - servai-network
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
     command: npm run dev
 
-  # Nginx Reverse Proxy (Production)
+  # Nginx Reverse Proxy (Production only)
   nginx:
     image: nginx:alpine
     container_name: servai-nginx
     ports:
       - "80:80"
+      - "443:443"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     depends_on:
@@ -101,6 +156,23 @@ services:
       - frontend
     networks:
       - servai-network
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+        reservations:
+          cpus: '0.25'
+          memory: 128M
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
     profiles:
       - production
 
