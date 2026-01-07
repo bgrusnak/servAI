@@ -5,6 +5,7 @@ import {
   CreateDateColumn,
   ManyToOne,
   JoinColumn,
+  Index,
 } from 'typeorm';
 import { Invoice } from './Invoice';
 
@@ -16,6 +17,10 @@ export enum PaymentStatus {
 }
 
 @Entity('payments')
+@Index('idx_payments_invoice_id', ['invoiceId'])
+@Index('idx_payments_status', ['status'])
+@Index('idx_payments_stripe_payment_id', ['stripePaymentId'])
+@Index('idx_payments_created_at', ['createdAt'])
 export class Payment {
   @PrimaryGeneratedColumn('uuid')
   id: string;
