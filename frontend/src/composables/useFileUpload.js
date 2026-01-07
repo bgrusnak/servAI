@@ -83,15 +83,11 @@ export function useFileUpload() {
     try {
       const formData = new FormData();
       
-      // Create new File object with sanitized name
-      const sanitizedFile = new File(
-        [file], 
-        validation.sanitizedName, 
-        { type: file.type }
-      );
-      
-      formData.append('file', sanitizedFile);
+      // OPTIMIZATION: Don't create new File object - just append original
+      // Send sanitized name as separate parameter
+      formData.append('file', file);
       formData.append('folder', folder);
+      formData.append('sanitizedName', validation.sanitizedName);
 
       const response = await apiClient.post('/files/upload', formData, {
         headers: {
@@ -120,12 +116,14 @@ export function useFileUpload() {
   };
 
   /**
-   * Upload multiple files
+   * Upload multiple files in parallel with concurrency limit
+   * OPTIMIZATION: Parallel uploads instead of sequential
    * @param {FileList|Array} files - Files to upload
    * @param {string} folder - Target folder
+   * @param {number} concurrency - Max parallel uploads (default: 3)
    * @returns {Promise<Array>} - Array of upload results
    */
-  const uploadMultiple = async (files, folder = 'general') => {
+  const uploadMultiple = async (files, folder = 'general', concurrency = 3) => {
     const fileArray = Array.from(files);
 
     // Validate all files first
@@ -155,21 +153,34 @@ export function useFileUpload() {
     const errors = [];
 
     try {
-      // Upload files sequentially to avoid overwhelming the server
-      for (const item of validations) {
-        try {
-          const result = await uploadFile(item.file, folder);
-          results.push(result);
-        } catch (err) {
-          errors.push({ file: item.file.name, error: err.message });
-        }
+      // OPTIMIZATION: Parallel uploads with concurrency limit
+      // Process files in chunks
+      for (let i = 0; i < validations.length; i += concurrency) {
+        const chunk = validations.slice(i, i + concurrency);
+        
+        const chunkPromises = chunk.map(async (item) => {
+          try {
+            const result = await uploadFile(item.file, folder);
+            results.push(result);
+          } catch (err) {
+            errors.push({ file: item.file.name, error: err.message });
+          }
+        });
+
+        await Promise.allSettled(chunkPromises);
       }
 
       if (errors.length > 0) {
         const errorMsg = errors.map(e => 
           `${e.file}: ${e.error}`
         ).join('; ');
-        throw new Error(`Some files failed to upload: ${errorMsg}`);
+        
+        // Partial success - some files uploaded
+        if (results.length > 0) {
+          console.warn(`Partial upload success: ${errorMsg}`);
+        } else {
+          throw new Error(`All files failed to upload: ${errorMsg}`);
+        }
       }
 
       return results;
