@@ -42,7 +42,7 @@ router.post('/permanent', authenticateToken, async (req: Request, res: Response)
 
 /**
  * @route   POST /api/v1/vehicles/temporary
- * @desc    Create temporary vehicle pass (24 hours)
+ * @desc    Create temporary vehicle pass (duration from condo settings)
  * @access  Private (resident, admin)
  */
 router.post('/temporary', authenticateToken, async (req: Request, res: Response) => {
@@ -148,6 +148,50 @@ router.get('/history', authenticateToken, async (req: Request, res: Response) =>
   } catch (error: any) {
     logger.error('Error getting access history', { error });
     res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * @route   GET /api/v1/vehicles/settings/:condoId
+ * @desc    Get condo vehicle settings
+ * @access  Private (admin)
+ */
+router.get('/settings/:condoId', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const { condoId } = req.params;
+
+    // TODO: Check if user has access to this condo
+
+    const settings = await vehicleService.getCondoVehicleSettings(condoId);
+
+    res.json({ success: true, settings });
+  } catch (error: any) {
+    logger.error('Error getting condo vehicle settings', { error });
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * @route   PUT /api/v1/vehicles/settings/:condoId
+ * @desc    Update condo vehicle settings
+ * @access  Private (admin)
+ */
+router.put('/settings/:condoId', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const { condoId } = req.params;
+    const { maxVehiclesPerUnit, temporaryPassDurationHours } = req.body;
+
+    // TODO: Check if user is admin of this condo
+
+    await vehicleService.updateCondoVehicleSettings(condoId, {
+      maxVehiclesPerUnit,
+      temporaryPassDurationHours,
+    });
+
+    res.json({ success: true, message: 'Settings updated' });
+  } catch (error: any) {
+    logger.error('Error updating condo vehicle settings', { error });
+    res.status(400).json({ success: false, error: error.message });
   }
 });
 

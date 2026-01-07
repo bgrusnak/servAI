@@ -39,6 +39,13 @@ export class Condo {
   @Column({ name: 'is_active', default: true })
   isActive: boolean;
 
+  // Vehicle settings
+  @Column({ name: 'max_vehicles_per_unit', type: 'int', default: 2 })
+  maxVehiclesPerUnit: number;
+
+  @Column({ name: 'temporary_pass_duration_hours', type: 'int', default: 24 })
+  temporaryPassDurationHours: number;
+
   @CreateDateColumn({ name: 'created_at' })
   createdAt: Date;
 

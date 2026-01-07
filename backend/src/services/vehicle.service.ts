@@ -1,11 +1,13 @@
 import { AppDataSource } from '../db/data-source';
 import { Vehicle } from '../entities/Vehicle';
 import { Unit } from '../entities/Unit';
+import { Condo } from '../entities/Condo';
 import { logger } from '../utils/logger';
 import { LessThan, MoreThan, In } from 'typeorm';
 
 const vehicleRepository = AppDataSource.getRepository(Vehicle);
 const unitRepository = AppDataSource.getRepository(Unit);
+const condoRepository = AppDataSource.getRepository(Condo);
 
 export interface VehicleAccessLog {
   id: string;
@@ -33,11 +35,18 @@ export class VehicleService {
     parkingSpot?: string;
   }): Promise<Vehicle> {
     try {
-      // Check if unit exists
-      const unit = await unitRepository.findOne({ where: { id: data.unitId } });
+      // Check if unit exists and get condo settings
+      const unit = await unitRepository.findOne({
+        where: { id: data.unitId },
+        relations: ['condo'],
+      });
+
       if (!unit) {
         throw new Error('Unit not found');
       }
+
+      // Get condo settings for vehicle limit
+      const maxVehicles = unit.condo?.maxVehiclesPerUnit || 2;
 
       // Normalize license plate (uppercase, no spaces)
       const normalizedPlate = data.licensePlate.toUpperCase().replace(/\s+/g, '');
@@ -51,13 +60,15 @@ export class VehicleService {
         throw new Error('License plate already registered');
       }
 
-      // Check unit vehicle limit (max 2 permanent vehicles per unit)
+      // Check unit vehicle limit (from condo settings)
       const unitVehicles = await vehicleRepository.count({
         where: { unitId: data.unitId, isActive: true },
       });
 
-      if (unitVehicles >= 2) {
-        throw new Error('Unit has reached maximum permanent vehicles limit (2)');
+      if (unitVehicles >= maxVehicles) {
+        throw new Error(
+          `Unit has reached maximum permanent vehicles limit (${maxVehicles} per unit)`
+        );
       }
 
       // Create vehicle
@@ -77,6 +88,7 @@ export class VehicleService {
         vehicleId: vehicle.id,
         licensePlate: vehicle.licensePlate,
         unitId: data.unitId,
+        maxVehicles,
       });
 
       return vehicle;
@@ -87,10 +99,11 @@ export class VehicleService {
   }
 
   /**
-   * Create temporary vehicle pass (valid for 24 hours)
+   * Create temporary vehicle pass (duration from condo settings)
    * Note: In-memory storage for simplicity. In production, use database table.
    */
-  private temporaryPasses: Map<string, { unitId: string; expiresAt: Date; createdBy: string }> = new Map();
+  private temporaryPasses: Map<string, { unitId: string; expiresAt: Date; createdBy: string }> =
+    new Map();
 
   async createTemporaryPass(data: {
     unitId: string;
@@ -98,18 +111,25 @@ export class VehicleService {
     createdBy: string;
   }): Promise<{ licensePlate: string; expiresAt: Date }> {
     try {
-      // Check if unit exists
-      const unit = await unitRepository.findOne({ where: { id: data.unitId } });
+      // Check if unit exists and get condo settings
+      const unit = await unitRepository.findOne({
+        where: { id: data.unitId },
+        relations: ['condo'],
+      });
+
       if (!unit) {
         throw new Error('Unit not found');
       }
 
+      // Get condo settings for pass duration
+      const durationHours = unit.condo?.temporaryPassDurationHours || 24;
+
       // Normalize license plate
       const normalizedPlate = data.licensePlate.toUpperCase().replace(/\s+/g, '');
 
-      // Create expiration (24 hours from now)
+      // Create expiration (from condo settings)
       const expiresAt = new Date();
-      expiresAt.setHours(expiresAt.getHours() + 24);
+      expiresAt.setHours(expiresAt.getHours() + durationHours);
 
       // Store temporary pass
       this.temporaryPasses.set(normalizedPlate, {
@@ -122,6 +142,7 @@ export class VehicleService {
         licensePlate: normalizedPlate,
         unitId: data.unitId,
         expiresAt,
+        durationHours,
       });
 
       return {
@@ -265,6 +286,73 @@ export class VehicleService {
     });
 
     return passes;
+  }
+
+  /**
+   * Get condo vehicle settings
+   */
+  async getCondoVehicleSettings(condoId: string): Promise<{
+    maxVehiclesPerUnit: number;
+    temporaryPassDurationHours: number;
+  }> {
+    try {
+      const condo = await condoRepository.findOne({ where: { id: condoId } });
+
+      if (!condo) {
+        throw new Error('Condo not found');
+      }
+
+      return {
+        maxVehiclesPerUnit: condo.maxVehiclesPerUnit || 2,
+        temporaryPassDurationHours: condo.temporaryPassDurationHours || 24,
+      };
+    } catch (error) {
+      logger.error('Failed to get condo vehicle settings', { error, condoId });
+      throw error;
+    }
+  }
+
+  /**
+   * Update condo vehicle settings
+   */
+  async updateCondoVehicleSettings(
+    condoId: string,
+    settings: {
+      maxVehiclesPerUnit?: number;
+      temporaryPassDurationHours?: number;
+    }
+  ): Promise<void> {
+    try {
+      const condo = await condoRepository.findOne({ where: { id: condoId } });
+
+      if (!condo) {
+        throw new Error('Condo not found');
+      }
+
+      if (settings.maxVehiclesPerUnit !== undefined) {
+        if (settings.maxVehiclesPerUnit < 1 || settings.maxVehiclesPerUnit > 10) {
+          throw new Error('maxVehiclesPerUnit must be between 1 and 10');
+        }
+        condo.maxVehiclesPerUnit = settings.maxVehiclesPerUnit;
+      }
+
+      if (settings.temporaryPassDurationHours !== undefined) {
+        if (
+          settings.temporaryPassDurationHours < 1 ||
+          settings.temporaryPassDurationHours > 168
+        ) {
+          throw new Error('temporaryPassDurationHours must be between 1 and 168 (1 week)');
+        }
+        condo.temporaryPassDurationHours = settings.temporaryPassDurationHours;
+      }
+
+      await condoRepository.save(condo);
+
+      logger.info('Condo vehicle settings updated', { condoId, settings });
+    } catch (error) {
+      logger.error('Failed to update condo vehicle settings', { error, condoId, settings });
+      throw error;
+    }
   }
 
   /**
