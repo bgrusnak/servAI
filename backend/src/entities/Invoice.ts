@@ -7,6 +7,7 @@ import {
   ManyToOne,
   OneToMany,
   JoinColumn,
+  Index,
 } from 'typeorm';
 import { Unit } from './Unit';
 import { Condo } from './Condo';
@@ -22,6 +23,12 @@ export enum InvoiceStatus {
 }
 
 @Entity('invoices')
+@Index('idx_invoices_unit_id', ['unitId'])
+@Index('idx_invoices_condo_id', ['condoId'])
+@Index('idx_invoices_status', ['status'])
+@Index('idx_invoices_unit_status', ['unitId', 'status'])
+@Index('idx_invoices_billing_period', ['billingPeriod'])
+@Index('idx_invoices_due_date', ['dueDate'])
 export class Invoice {
   @PrimaryGeneratedColumn('uuid')
   id: string;
