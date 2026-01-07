@@ -34,6 +34,16 @@ const MAX_FILE_SIZE_MB = 5;
 const MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024;
 const MAX_MESSAGE_LENGTH = 4096;  // Telegram's limit
 const TEMP_DIR = process.env.TEMP_DIR || '/tmp/servai-telegram';
+const JOB_TIMEOUT_MS = 30000; // 30 seconds
+const TEMP_CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
+const START_COMMAND_RATE_LIMIT = 5; // Max 5 /start per minute per user
+const START_COMMAND_WINDOW_MS = 60 * 1000; // 1 minute
+
+// Allowed language codes (ISO 639-1)
+const ALLOWED_LANGUAGE_CODES = ['ru', 'en', 'uk', 'kk', 'be'];
+
+// Allowed image MIME types
+const ALLOWED_IMAGE_TYPES = ['image/jpeg', 'image/png'];
 
 // Ensure temp directory exists
 if (!fs.existsSync(TEMP_DIR)) {
@@ -103,10 +113,14 @@ interface QueuedMessage {
 class TelegramService {
   private bot: TelegramBot | null = null;
   private webhookUrl: string = '';
+  private webhookSecret: string = '';
   private messageQueue: Queue<QueuedMessage> | null = null;
   private messageWorker: Worker<QueuedMessage> | null = null;
   private redisConnection: IORedis | null = null;
   private lastMessageTime = 0;
+  private tempCleanupInterval: NodeJS.Timeout | null = null;
+  private startCommandRateLimiter: Map<number, number[]> = new Map();
+  private redisHealthy: boolean = true;
 
   async initialize(): Promise<void> {
     const token = process.env.TELEGRAM_BOT_TOKEN;
@@ -131,23 +145,29 @@ class TelegramService {
         throw new Error('TELEGRAM_WEBHOOK_URL required for webhook mode');
       }
 
-      const webhookSecret = process.env.TELEGRAM_WEBHOOK_SECRET;
-      if (!webhookSecret) {
+      this.webhookSecret = process.env.TELEGRAM_WEBHOOK_SECRET || '';
+      if (!this.webhookSecret) {
         throw new Error('TELEGRAM_WEBHOOK_SECRET is MANDATORY for webhook mode');
+      }
+
+      // Validate webhook secret strength
+      if (this.webhookSecret.length < 32) {
+        throw new Error('TELEGRAM_WEBHOOK_SECRET must be at least 32 characters');
       }
 
       this.bot = new TelegramBot(token, { webHook: true });
       
       // Set webhook with secret token
       await this.bot.setWebHook(`${this.webhookUrl}/api/v1/telegram/webhook`, {
-        secret_token: webhookSecret,
+        secret_token: this.webhookSecret,
         max_connections: 40,
         allowed_updates: ['message', 'callback_query']
       });
       
       logger.info('Telegram bot initialized in webhook mode', { 
         url: this.webhookUrl,
-        hasSecret: true
+        hasSecret: true,
+        secretLength: this.webhookSecret.length
       });
     } else {
       this.bot = new TelegramBot(token, { polling: true });
@@ -158,7 +178,14 @@ class TelegramService {
     await this.initializeMessageQueue();
     
     // Cleanup old temp files on start
-    this.cleanupOldTempFiles();
+    await this.cleanupOldTempFiles();
+    
+    // Setup periodic temp file cleanup
+    this.tempCleanupInterval = setInterval(() => {
+      this.cleanupOldTempFiles().catch(err => {
+        logger.error('Error in periodic temp cleanup', { error: err });
+      });
+    }, TEMP_CLEANUP_INTERVAL_MS);
   }
 
   private async initializeMessageQueue(): Promise<void> {
@@ -171,14 +198,28 @@ class TelegramService {
       this.redisConnection = new IORedis(redisUrl, {
         maxRetriesPerRequest: null,
         enableReadyCheck: true,
+        retryStrategy: (times) => {
+          if (times > 10) {
+            this.redisHealthy = false;
+            logger.error('Redis connection failed after 10 retries');
+            return null;
+          }
+          return Math.min(times * 100, 3000);
+        }
       });
 
       this.redisConnection.on('error', (err) => {
+        this.redisHealthy = false;
         logger.error('Redis connection error', { error: err });
       });
 
       this.redisConnection.on('ready', () => {
+        this.redisHealthy = true;
         logger.info('Redis connection ready for message queue');
+      });
+
+      this.redisConnection.on('reconnecting', () => {
+        logger.warn('Redis reconnecting...');
       });
       
       this.messageQueue = new Queue<QueuedMessage>('telegram-outgoing-messages', {
@@ -190,7 +231,8 @@ class TelegramService {
             delay: RETRY_DELAY_MS
           },
           removeOnComplete: 100,
-          removeOnFail: 500
+          removeOnFail: 500,
+          timeout: JOB_TIMEOUT_MS // Add timeout to prevent hanging jobs
         }
       });
 
@@ -309,7 +351,8 @@ class TelegramService {
 
       logger.info('Telegram message queue initialized', {
         rateLimit: TELEGRAM_RATE_LIMIT_PER_SECOND,
-        intervalMs: MESSAGE_INTERVAL_MS
+        intervalMs: MESSAGE_INTERVAL_MS,
+        jobTimeout: JOB_TIMEOUT_MS
       });
     } catch (error) {
       logger.error('Failed to initialize message queue', { error });
@@ -340,11 +383,49 @@ class TelegramService {
     logger.info('Telegram bot handlers setup complete');
   }
 
+  private isStartCommandRateLimited(telegramId: number): boolean {
+    const now = Date.now();
+    const userRequests = this.startCommandRateLimiter.get(telegramId) || [];
+    
+    // Remove old requests outside the window
+    const recentRequests = userRequests.filter(
+      timestamp => now - timestamp < START_COMMAND_WINDOW_MS
+    );
+    
+    if (recentRequests.length >= START_COMMAND_RATE_LIMIT) {
+      return true;
+    }
+    
+    recentRequests.push(now);
+    this.startCommandRateLimiter.set(telegramId, recentRequests);
+    
+    // Cleanup old entries periodically
+    if (this.startCommandRateLimiter.size > 10000) {
+      const entriesToDelete: number[] = [];
+      this.startCommandRateLimiter.forEach((timestamps, id) => {
+        if (timestamps.every(t => now - t > START_COMMAND_WINDOW_MS)) {
+          entriesToDelete.push(id);
+        }
+      });
+      entriesToDelete.forEach(id => this.startCommandRateLimiter.delete(id));
+    }
+    
+    return false;
+  }
+
   private async handleStart(msg: TelegramBot.Message, inviteToken?: string): Promise<void> {
     try {
       const telegramId = msg.from?.id;
       if (!telegramId || !isValidTelegramId(telegramId)) {
         logger.warn('Invalid telegram ID in /start', { telegramId });
+        return;
+      }
+
+      // Rate limiting for /start command
+      if (this.isStartCommandRateLimited(telegramId)) {
+        telegramSecurityEvents.inc({ event_type: 'start_rate_limited', severity: 'medium' });
+        logger.warn('Start command rate limited', { telegramId });
+        await this.sendMessage(telegramId, 'Слишком много попыток. Подождите минуту.');
         return;
       }
 
@@ -377,6 +458,39 @@ class TelegramService {
     }
   }
 
+  private validateInviteToken(token: string): string | null {
+    // Sanitize first
+    const sanitized = token.replace(/[^a-zA-Z0-9-_]/g, '').substring(0, 64);
+    
+    // Check if empty after sanitization
+    if (!sanitized || sanitized.length < 8) {
+      return null;
+    }
+    
+    // Validate UUID v4 format (optional but recommended)
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    if (!uuidRegex.test(sanitized)) {
+      // If not UUID, check if it's alphanumeric with proper length
+      if (sanitized.length < 16 || sanitized.length > 64) {
+        return null;
+      }
+    }
+    
+    return sanitized;
+  }
+
+  private validateLanguageCode(code: string | undefined): string {
+    if (!code) return 'ru';
+    
+    const normalized = code.toLowerCase().substring(0, 2);
+    
+    if (ALLOWED_LANGUAGE_CODES.includes(normalized)) {
+      return normalized;
+    }
+    
+    return 'ru'; // Default fallback
+  }
+
   private async handleInviteRegistration(msg: TelegramBot.Message, inviteToken: string): Promise<void> {
     const telegramId = msg.from!.id;
     const client = await pool.connect();
@@ -385,7 +499,25 @@ class TelegramService {
       await client.query('BEGIN');
       
       // Validate and sanitize invite token
-      const sanitizedToken = inviteToken.replace(/[^a-zA-Z0-9-_]/g, '').substring(0, 64);
+      const validatedToken = this.validateInviteToken(inviteToken);
+      
+      if (!validatedToken) {
+        await client.query('ROLLBACK');
+        
+        telegramSecurityEvents.inc({ 
+          event_type: 'invalid_invite_format', 
+          severity: 'medium' 
+        });
+        
+        logger.warn('Invalid invite token format', {
+          telegramId,
+          tokenLength: inviteToken.length
+        });
+        
+        await this.sendMessage(telegramId,
+          'Неверный формат ссылки-приглашения. Обратитесь к администратору.');
+        return;
+      }
       
       const inviteResult = await client.query(
         `SELECT i.*, u.id as unit_id, u.number as unit_number,
@@ -397,7 +529,7 @@ class TelegramService {
          WHERE i.token = $1 AND i.status = 'pending'
            AND i.expires_at > NOW() AND i.deleted_at IS NULL
          FOR UPDATE`,
-        [sanitizedToken]
+        [validatedToken]
       );
 
       if (inviteResult.rows.length === 0) {
@@ -408,10 +540,9 @@ class TelegramService {
           severity: 'medium' 
         });
         
-        logger.warn('Invalid invite token used', {
+        logger.warn('Invalid or expired invite token', {
           telegramId,
-          token: sanitizedToken.substring(0, 8) + '...',
-          languageCode: msg.from!.language_code
+          token: validatedToken.substring(0, 8) + '...'
         });
         
         await this.sendMessage(telegramId,
@@ -427,6 +558,7 @@ class TelegramService {
       const lastName = sanitizeTelegramName(msg.from!.last_name, '');
       const username = sanitizeTelegramUsername(msg.from!.username);
       const hashedId = hashTelegramId(telegramId);
+      const languageCode = this.validateLanguageCode(msg.from!.language_code);
 
       if (!userId) {
         const userResult = await client.query(
@@ -443,9 +575,11 @@ class TelegramService {
         );
       }
 
-      // Check if telegram_id already registered
+      // Check if telegram_id already registered WITH LOCK to prevent race condition
       const existingTgUser = await client.query(
-        'SELECT id FROM telegram_users WHERE telegram_id = $1 AND deleted_at IS NULL',
+        `SELECT id FROM telegram_users 
+         WHERE telegram_id = $1 AND deleted_at IS NULL 
+         FOR UPDATE`,
         [telegramId]
       );
       
@@ -466,8 +600,7 @@ class TelegramService {
         `INSERT INTO telegram_users (user_id, telegram_id, telegram_username, 
                                       first_name, last_name, language_code)
          VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-        [userId, telegramId, username, firstName, lastName, 
-         msg.from!.language_code || 'ru']
+        [userId, telegramId, username, firstName, lastName, languageCode]
       );
 
       await client.query(
@@ -581,6 +714,7 @@ class TelegramService {
     if (!msg.photo || !msg.from) return;
     
     let tempFilePath: string | null = null;
+    let fileCreated = false;
     
     try {
       const telegramId = msg.from.id;
@@ -615,13 +749,16 @@ class TelegramService {
         return;
       }
 
-      // Download to temp file with proper cleanup
+      // Generate temp file path
       tempFilePath = path.join(
         TEMP_DIR,
         `tg_${telegramId}_${Date.now()}_${crypto.randomBytes(8).toString('hex')}.jpg`
       );
       
-      const imageBase64 = await this.downloadImageToBase64(fileLink, tempFilePath);
+      // Download and validate image
+      const imageBase64 = await this.downloadAndValidateImage(fileLink, tempFilePath);
+      fileCreated = true;
+      
       const ocrResult = await openaiService.recognizeMeterReading(imageBase64);
       
       if (ocrResult.success && ocrResult.value) {
@@ -640,8 +777,8 @@ class TelegramService {
         await this.sendMessage(msg.from.id, 'Ошибка обработки фото.');
       }
     } finally {
-      // ALWAYS cleanup temp file
-      if (tempFilePath) {
+      // ALWAYS cleanup temp file if it was created
+      if (tempFilePath && fileCreated) {
         try {
           await fs.promises.unlink(tempFilePath);
           logger.debug('Temp file cleaned up', { tempFilePath });
@@ -652,13 +789,25 @@ class TelegramService {
     }
   }
 
-  private async downloadImageToBase64(url: string, tempFilePath: string): Promise<string> {
+  private async downloadAndValidateImage(url: string, tempFilePath: string): Promise<string> {
     try {
       const response = await axios.get(url, {
         responseType: 'stream',
         timeout: 10000,
-        maxContentLength: MAX_FILE_SIZE_BYTES
+        maxContentLength: MAX_FILE_SIZE_BYTES,
+        validateStatus: (status) => status === 200
       });
+
+      // Validate Content-Type
+      const contentType = response.headers['content-type'];
+      if (!contentType || !ALLOWED_IMAGE_TYPES.includes(contentType)) {
+        telegramSecurityEvents.inc({ 
+          event_type: 'invalid_content_type', 
+          severity: 'high' 
+        });
+        logger.warn('Invalid content type in image download', { contentType, url });
+        throw new Error('Invalid image type');
+      }
 
       // Download to temp file
       await pipeline(
@@ -666,13 +815,44 @@ class TelegramService {
         fs.createWriteStream(tempFilePath)
       );
 
-      // Read and convert to base64
+      // Read and validate file signature
       const buffer = await fs.promises.readFile(tempFilePath);
+      
+      // Validate JPEG signature (FF D8 FF)
+      // Validate PNG signature (89 50 4E 47)
+      const isJPEG = buffer[0] === 0xFF && buffer[1] === 0xD8 && buffer[2] === 0xFF;
+      const isPNG = buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4E && buffer[3] === 0x47;
+      
+      if (!isJPEG && !isPNG) {
+        telegramSecurityEvents.inc({ 
+          event_type: 'invalid_file_signature', 
+          severity: 'critical' 
+        });
+        logger.error('Invalid file signature detected', {
+          url,
+          signature: buffer.slice(0, 4).toString('hex')
+        });
+        
+        // Delete invalid file immediately
+        await fs.promises.unlink(tempFilePath);
+        throw new Error('Invalid image file signature');
+      }
+      
       return buffer.toString('base64');
       
     } catch (error) {
       logger.error('Error downloading image', { error, url });
-      throw new Error('Failed to download image');
+      
+      // Cleanup on error
+      try {
+        if (fs.existsSync(tempFilePath)) {
+          await fs.promises.unlink(tempFilePath);
+        }
+      } catch (cleanupErr) {
+        logger.warn('Failed to cleanup file after error', { tempFilePath });
+      }
+      
+      throw new Error('Failed to download or validate image');
     }
   }
 
@@ -758,14 +938,15 @@ class TelegramService {
     limit: number,
     maxAgeHours: number = 24
   ): Promise<ConversationMessage[]> {
+    // FIX #27: Use parameterized query for maxAgeHours to prevent SQL injection
     const result = await pool.query(
       `SELECT role, content 
        FROM conversations 
        WHERE telegram_user_id = $1 
-         AND created_at > NOW() - INTERVAL '${maxAgeHours} hours'
+         AND created_at > NOW() - INTERVAL '1 hour' * $3
        ORDER BY created_at DESC 
        LIMIT $2`,
-      [telegramUserId, limit]
+      [telegramUserId, limit, maxAgeHours]
     );
     return result.rows.reverse();
   }
@@ -811,8 +992,11 @@ class TelegramService {
   }
 
   async sendMessage(telegramId: number, text: string, options?: any, priority: number = 0): Promise<void> {
-    if (!this.messageQueue) {
-      logger.warn('Message queue not initialized, using fallback');
+    // Graceful degradation if Redis is down
+    if (!this.messageQueue || !this.redisHealthy) {
+      logger.warn('Message queue not available, using direct send', { 
+        redisHealthy: this.redisHealthy 
+      });
       return this.sendMessageDirect(telegramId, text, options);
     }
 
@@ -829,7 +1013,7 @@ class TelegramService {
       logger.debug('Message queued', { telegramId, textLength: text.length });
       telegramMessagesTotal.inc({ type: 'outgoing', status: 'queued' });
     } catch (error) {
-      logger.error('Failed to queue message', { error });
+      logger.error('Failed to queue message, falling back to direct send', { error });
       await this.sendMessageDirect(telegramId, text, options);
     }
   }
@@ -865,6 +1049,39 @@ class TelegramService {
     return await this.bot.getWebHookInfo();
   }
 
+  /**
+   * Verify webhook secret token
+   * CRITICAL: Must be called for every webhook request
+   */
+  verifyWebhookSecret(providedSecret: string): boolean {
+    if (!this.webhookSecret) {
+      logger.error('Webhook secret not configured but verification attempted');
+      return false;
+    }
+    
+    // Constant-time comparison to prevent timing attacks
+    if (providedSecret.length !== this.webhookSecret.length) {
+      return false;
+    }
+    
+    let mismatch = 0;
+    for (let i = 0; i < this.webhookSecret.length; i++) {
+      mismatch |= this.webhookSecret.charCodeAt(i) ^ providedSecret.charCodeAt(i);
+    }
+    
+    const isValid = mismatch === 0;
+    
+    if (!isValid) {
+      telegramSecurityEvents.inc({ 
+        event_type: 'webhook_secret_mismatch', 
+        severity: 'critical' 
+      });
+      logger.error('Webhook secret verification failed');
+    }
+    
+    return isValid;
+  }
+
   private async cleanupOldTempFiles(): Promise<void> {
     try {
       const files = await fs.promises.readdir(TEMP_DIR);
@@ -898,8 +1115,16 @@ class TelegramService {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 
-  async processWebhookUpdate(update: any): Promise<void> {
+  async processWebhookUpdate(update: any, providedSecret?: string): Promise<void> {
     if (!this.bot) return;
+    
+    // CRITICAL: Verify webhook secret if in webhook mode
+    if (this.webhookSecret && providedSecret) {
+      if (!this.verifyWebhookSecret(providedSecret)) {
+        throw new Error('Webhook secret verification failed');
+      }
+    }
+    
     try {
       await this.bot.processUpdate(update);
     } catch (error) {
@@ -909,6 +1134,12 @@ class TelegramService {
 
   async shutdown(): Promise<void> {
     logger.info('Shutting down Telegram service...');
+    
+    // Stop periodic cleanup
+    if (this.tempCleanupInterval) {
+      clearInterval(this.tempCleanupInterval);
+      logger.info('Temp cleanup interval stopped');
+    }
     
     if (this.messageWorker) {
       await this.messageWorker.close();
@@ -933,6 +1164,9 @@ class TelegramService {
     
     // Cleanup temp files on shutdown
     await this.cleanupOldTempFiles();
+    
+    // Clear rate limiter
+    this.startCommandRateLimiter.clear();
   }
 }
 
