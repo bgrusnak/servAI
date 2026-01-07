@@ -2,20 +2,23 @@
   <q-layout view="hHh lpR fFf">
     <q-page-container>
       <q-page class="flex flex-center bg-gradient">
-        <q-card style="width: 400px; max-width: 90vw;" class="q-pa-md">
+        <q-card style="width: 420px; max-width: 90vw;" class="q-pa-md">
           <q-card-section class="text-center">
             <div class="text-h4 text-weight-bold text-primary q-mb-xs">{{ $t('app.name') }}</div>
             <div class="text-subtitle2 text-grey-7">{{ $t('app.tagline') }}</div>
           </q-card-section>
 
           <q-card-section>
-            <q-form @submit="handleLogin" class="q-gutter-md">
+            <q-form @submit.prevent="handleLogin" class="q-gutter-md" ref="formRef">
               <q-input
                 v-model="form.email"
                 :label="$t('auth.email')"
                 type="email"
                 outlined
-                :rules="[val => !!val || $t('validation.required'), val => /.+@.+\..+/.test(val) || $t('validation.email')]"
+                autocomplete="email"
+                :rules="emailRules"
+                lazy-rules
+                @blur="form.email = form.email.trim().toLowerCase()"
               >
                 <template v-slot:prepend><q-icon name="email" /></template>
               </q-input>
@@ -25,7 +28,9 @@
                 :label="$t('auth.password')"
                 :type="showPassword ? 'text' : 'password'"
                 outlined
-                :rules="[val => !!val || $t('validation.required')]"
+                autocomplete="current-password"
+                :rules="passwordRules"
+                lazy-rules
               >
                 <template v-slot:prepend><q-icon name="lock" /></template>
                 <template v-slot:append>
@@ -40,7 +45,15 @@
               <div class="row items-center">
                 <q-checkbox v-model="form.rememberMe" :label="$t('auth.rememberMe')" />
                 <q-space />
-                <q-btn flat dense no-caps :label="$t('auth.forgotPassword')" color="primary" size="sm" />
+                <q-btn 
+                  flat 
+                  dense 
+                  no-caps 
+                  :label="$t('auth.forgotPassword')" 
+                  color="primary" 
+                  size="sm"
+                  @click="$router.push('/forgot-password')"
+                />
               </div>
 
               <q-btn
@@ -50,6 +63,7 @@
                 class="full-width"
                 size="lg"
                 :loading="loading"
+                :disable="loading"
                 no-caps
                 unelevated
               />
@@ -61,7 +75,15 @@
           <q-card-section class="text-center">
             <div class="text-caption text-grey-7">
               {{ $t('auth.noAccount') }}
-              <q-btn flat dense no-caps :label="$t('auth.signUp')" color="primary" size="sm" />
+              <q-btn 
+                flat 
+                dense 
+                no-caps 
+                :label="$t('auth.signUp')" 
+                color="primary" 
+                size="sm"
+                @click="$router.push('/register')"
+              />
             </div>
           </q-card-section>
         </q-card>
@@ -70,61 +92,76 @@
   </q-layout>
 </template>
 
-<script>
-import { defineComponent, ref } from 'vue';
+<script setup>
+import { ref, reactive, computed } from 'vue';
 import { useRouter } from 'vue-router';
 import { useQuasar } from 'quasar';
 import { useI18n } from 'vue-i18n';
-import { useAuthStore } from '../../stores';
+import { useAuthStore } from '../../stores/auth';
+import { validateEmail } from '../../utils/validators';
 
-export default defineComponent({
-  name: 'LoginPage',
-  setup() {
-    const router = useRouter();
-    const $q = useQuasar();
-    const { t } = useI18n();
-    const authStore = useAuthStore();
+const router = useRouter();
+const $q = useQuasar();
+const { t } = useI18n();
+const authStore = useAuthStore();
 
-    const loading = ref(false);
-    const showPassword = ref(false);
-    const form = ref({
-      email: '',
-      password: '',
-      rememberMe: false
-    });
-
-    const handleLogin = async () => {
-      loading.value = true;
-      try {
-        await authStore.login({
-          email: form.value.email,
-          password: form.value.password
-        });
-        $q.notify({
-          message: t('auth.loginSuccess'),
-          color: 'positive',
-          icon: 'check'
-        });
-        router.push('/');
-      } catch (error) {
-        $q.notify({
-          message: error.message || t('auth.loginError'),
-          color: 'negative',
-          icon: 'error'
-        });
-      } finally {
-        loading.value = false;
-      }
-    };
-
-    return {
-      loading,
-      showPassword,
-      form,
-      handleLogin
-    };
-  }
+const loading = ref(false);
+const showPassword = ref(false);
+const formRef = ref(null);
+const form = reactive({
+  email: '',
+  password: '',
+  rememberMe: authStore.rememberMe
 });
+
+const emailRules = [
+  val => !!val || t('validation.required'),
+  val => validateEmail(val) || t('validation.email')
+];
+
+const passwordRules = [
+  val => !!val || t('validation.required'),
+  val => val.length >= 8 || t('validation.passwordMin', { min: 8 })
+];
+
+const handleLogin = async () => {
+  const valid = await formRef.value.validate();
+  if (!valid) return;
+  
+  loading.value = true;
+  
+  try {
+    await authStore.login({
+      email: form.email,
+      password: form.password,
+      rememberMe: form.rememberMe
+    });
+    
+    $q.notify({
+      message: t('auth.loginSuccess'),
+      color: 'positive',
+      icon: 'check',
+      position: 'top'
+    });
+    
+    // Security: Clear password from memory
+    form.password = '';
+    
+    router.push('/');
+  } catch (error) {
+    // Security: Clear password on error
+    form.password = '';
+    
+    $q.notify({
+      message: t(error.message) || t('auth.loginError'),
+      color: 'negative',
+      icon: 'error',
+      position: 'top'
+    });
+  } finally {
+    loading.value = false;
+  }
+};
 </script>
 
 <style lang="scss" scoped>
