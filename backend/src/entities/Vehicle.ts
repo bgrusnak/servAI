@@ -6,10 +6,13 @@ import {
   UpdateDateColumn,
   ManyToOne,
   JoinColumn,
+  Index,
 } from 'typeorm';
 import { Unit } from './Unit';
 
 @Entity('vehicles')
+@Index('idx_vehicles_unit_id', ['unitId'])
+@Index('idx_vehicles_is_active', ['isActive'])
 export class Vehicle {
   @PrimaryGeneratedColumn('uuid')
   id: string;
