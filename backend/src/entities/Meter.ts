@@ -7,12 +7,16 @@ import {
   ManyToOne,
   OneToMany,
   JoinColumn,
+  Index,
 } from 'typeorm';
 import { Unit } from './Unit';
 import { MeterType } from './MeterType';
 import { MeterReading } from './MeterReading';
 
 @Entity('meters')
+@Index('idx_meters_unit_id', ['unitId'])
+@Index('idx_meters_meter_type_id', ['meterTypeId'])
+@Index('idx_meters_unit_active', ['unitId', 'isActive'])
 export class Meter {
   @PrimaryGeneratedColumn('uuid')
   id: string;
