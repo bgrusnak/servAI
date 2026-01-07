@@ -10,7 +10,13 @@ import { errorHandler } from '../../middleware/errorHandler';
 
 /**
  * Creates a test Express app with real routes for integration testing
- * This is NOT a mock - it uses actual route handlers
+ * 
+ * This is NOT a mock - it uses actual route handlers.
+ * However, it skips some middleware that requires external services:
+ * - CSRF (skipped for testing convenience)
+ * - Rate limiting (skipped to avoid test flakiness)
+ * 
+ * Authentication IS enabled and required for protected routes.
  */
 export function createTestApp(dataSource?: DataSource): Express {
   const app = express();
@@ -20,7 +26,7 @@ export function createTestApp(dataSource?: DataSource): Express {
   app.use(express.urlencoded({ extended: true }));
   app.use(cookieParser());
 
-  // Skip CSRF in tests
+  // Skip CSRF in tests (would require session management)
   app.use((req, res, next) => {
     req.csrfToken = () => 'test-csrf-token';
     next();
@@ -29,7 +35,7 @@ export function createTestApp(dataSource?: DataSource): Express {
   // API routes (v1)
   const apiV1Router = express.Router();
   
-  // Mount real routes
+  // Mount real routes with real authentication
   apiV1Router.use('/auth', authRoutes);
   apiV1Router.use('/', metersRoutes);
   apiV1Router.use('/', invoicesRoutes);
@@ -43,7 +49,7 @@ export function createTestApp(dataSource?: DataSource): Express {
     res.status(404).json({ error: 'Not found' });
   });
 
-  // Error handler
+  // Error handler (must be last)
   app.use(errorHandler);
 
   return app;

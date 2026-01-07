@@ -3,6 +3,25 @@ import { createTestDataSource } from './utils/test-db';
 
 let testDataSource: DataSource;
 
+// Mock Redis for tests
+jest.mock('../utils/redis', () => ({
+  redis: {
+    get: jest.fn().mockResolvedValue(null),
+    set: jest.fn().mockResolvedValue('OK'),
+    del: jest.fn().mockResolvedValue(1),
+    setex: jest.fn().mockResolvedValue('OK'),
+    exists: jest.fn().mockResolvedValue(0),
+  },
+}));
+
+// Mock token blacklist service
+jest.mock('../services/token-blacklist.service', () => ({
+  tokenBlacklistService: {
+    isTokenRevoked: jest.fn().mockResolvedValue(false),
+    revokeToken: jest.fn().mockResolvedValue(undefined),
+  },
+}));
+
 beforeAll(async () => {
   testDataSource = await createTestDataSource();
 }, 30000);
@@ -13,12 +32,9 @@ afterAll(async () => {
   }
 }, 10000);
 
-// Optimized: only clear tables that are actually used in tests
+// Optimized: only clear critical tables that accumulate across tests
 beforeEach(async () => {
   if (testDataSource?.isInitialized) {
-    // Instead of clearing all tables, we'll use transactions in individual tests
-    // This significantly speeds up test execution
-    // For now, only clear critical tables
     const criticalTables = [
       'refresh_tokens',
       'audit_logs',
