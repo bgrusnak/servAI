@@ -7,6 +7,7 @@ import { entrancesRouter } from './entrances';
 import { unitsRouter } from './units';
 import { invitesRouter } from './invites';
 import { residentsRouter } from './residents';
+import vehiclesRouter from './vehicles';
 
 const apiRouter = Router();
 
@@ -21,6 +22,7 @@ apiRouter.use('/entrances', entrancesRouter);
 apiRouter.use('/units', unitsRouter);
 apiRouter.use('/invites', invitesRouter);
 apiRouter.use('/residents', residentsRouter);
+apiRouter.use('/vehicles', vehiclesRouter);
 
 // Health check for API
 apiRouter.get('/ping', (req, res) => {
