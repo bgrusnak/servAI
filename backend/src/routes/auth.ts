@@ -7,8 +7,44 @@ import { authorize } from '../middleware/authorize.middleware';
 import { asyncHandler } from '../utils/asyncHandler';
 import rateLimit from 'express-rate-limit';
 import { config } from '../config';
+import crypto from 'crypto';
 
 const router = Router();
+
+// Email validation regex (RFC 5322 compliant)
+const EMAIL_REGEX = /^[a-zA-Z0-9.!#$%&'*+\/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
+
+/**
+ * Validate email format
+ */
+function isValidEmail(email: string): boolean {
+  if (!email || typeof email !== 'string') return false;
+  if (email.length > 254) return false; // RFC max length
+  return EMAIL_REGEX.test(email);
+}
+
+// CSRF token storage (should be Redis in production)
+const csrfTokens = new Map<string, { token: string; expiresAt: number }>();
+
+/**
+ * Generate CSRF token
+ */
+function generateCSRFToken(): string {
+  return crypto.randomBytes(32).toString('hex');
+}
+
+/**
+ * Validate CSRF token
+ */
+function validateCSRFToken(sessionId: string, token: string): boolean {
+  const stored = csrfTokens.get(sessionId);
+  if (!stored) return false;
+  if (Date.now() > stored.expiresAt) {
+    csrfTokens.delete(sessionId);
+    return false;
+  }
+  return stored.token === token;
+}
 
 // Rate limiters
 const loginLimiter = rateLimit({
@@ -17,6 +53,17 @@ const loginLimiter = rateLimit({
   message: 'Too many login attempts, please try again later',
   standardHeaders: true,
   legacyHeaders: false,
+  // Use both IP and email for rate limiting
+  keyGenerator: (req) => {
+    const email = req.body?.email || 'unknown';
+    return `${req.ip}_${email}`;
+  }
+});
+
+const registerLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 3, // 3 registrations per hour per IP
+  message: 'Too many registration attempts, please try again later',
 });
 
 const refreshLimiter = rateLimit({
@@ -26,13 +73,53 @@ const refreshLimiter = rateLimit({
 });
 
 // Cookie options
-const getCookieOptions = (maxAge: number) => ({
-  httpOnly: true,
-  secure: config.env === 'production',
-  sameSite: 'strict' as const,
-  maxAge,
-  path: '/'
-});
+const getCookieOptions = (maxAge: number) => {
+  // CRITICAL: Use secure cookies in staging and production
+  const isSecure = config.env === 'production' || config.env === 'staging';
+  
+  return {
+    httpOnly: true,
+    secure: isSecure,
+    sameSite: 'strict' as const,
+    maxAge,
+    path: '/'
+  };
+};
+
+/**
+ * GET /auth/csrf-token
+ * Get CSRF token for form submissions
+ */
+router.get('/csrf-token', asyncHandler(async (req, res) => {
+  const sessionId = req.sessionID || crypto.randomBytes(16).toString('hex');
+  const token = generateCSRFToken();
+  
+  csrfTokens.set(sessionId, {
+    token,
+    expiresAt: Date.now() + 15 * 60 * 1000 // 15 minutes
+  });
+  
+  res.cookie('sessionId', sessionId, getCookieOptions(15 * 60 * 1000));
+  res.json({ csrfToken: token });
+}));
+
+/**
+ * CSRF validation middleware
+ */
+const validateCSRF = (req: any, res: any, next: any) => {
+  const sessionId = req.cookies?.sessionId;
+  const csrfToken = req.headers['x-csrf-token'];
+  
+  if (!sessionId || !csrfToken) {
+    return res.status(403).json({ error: 'CSRF token required' });
+  }
+  
+  if (!validateCSRFToken(sessionId, csrfToken as string)) {
+    return res.status(403).json({ error: 'Invalid CSRF token' });
+  }
+  
+  next();
+};
 
 /**
  * POST /auth/register
@@ -40,16 +127,29 @@ const getCookieOptions = (maxAge: number) => ({
  */
 router.post(
   '/register',
+  registerLimiter,
+  validateCSRF,
   validate(registerSchema),
   asyncHandler(async (req, res) => {
     const { email, password, firstName, lastName, phone } = req.body;
     
+    // Validate email format
+    const trimmedEmail = email.trim().toLowerCase();
+    if (!isValidEmail(trimmedEmail)) {
+      return res.status(400).json({ error: 'Invalid email format' });
+    }
+    
+    // Validate names
+    if (!firstName?.trim() || !lastName?.trim()) {
+      return res.status(400).json({ error: 'First name and last name are required' });
+    }
+    
     const result = await authService.register({
-      email: email.trim().toLowerCase(),
+      email: trimmedEmail,
       password,
       firstName: firstName.trim(),
       lastName: lastName.trim(),
-      phone,
+      phone: phone?.trim(),
       role: 'resident',
     });
 
@@ -70,9 +170,16 @@ router.post(
   '/create-user',
   authenticate,
   authorize('superadmin'),
+  validateCSRF,
   validate(registerSchema),
   asyncHandler(async (req, res) => {
     const { email, password, firstName, lastName, phone, role, companyId, condoId } = req.body;
+    
+    // Validate email format
+    const trimmedEmail = email.trim().toLowerCase();
+    if (!isValidEmail(trimmedEmail)) {
+      return res.status(400).json({ error: 'Invalid email format' });
+    }
     
     const allowedRoles = ['resident', 'security_guard', 'employee', 'accountant', 'complex_admin', 'uk_director'];
     if (!allowedRoles.includes(role)) {
@@ -80,11 +187,11 @@ router.post(
     }
     
     const result = await authService.register({
-      email: email.trim().toLowerCase(),
+      email: trimmedEmail,
       password,
       firstName: firstName.trim(),
       lastName: lastName.trim(),
-      phone,
+      phone: phone?.trim(),
       role,
       companyId,
       condoId,
@@ -104,10 +211,18 @@ router.post(
 router.post(
   '/login',
   loginLimiter,
+  validateCSRF,
   validate(loginSchema),
   asyncHandler(async (req, res) => {
     const { email, password } = req.body;
-    const result = await authService.login(email.trim().toLowerCase(), password);
+    
+    // Validate email format
+    const trimmedEmail = email.trim().toLowerCase();
+    if (!isValidEmail(trimmedEmail)) {
+      return res.status(400).json({ error: 'Invalid email format' });
+    }
+    
+    const result = await authService.login(trimmedEmail, password);
     
     // Set httpOnly cookies for tokens
     res.cookie('accessToken', result.accessToken, getCookieOptions(15 * 60 * 1000));
@@ -159,6 +274,7 @@ router.post(
     // Clear cookies
     res.clearCookie('accessToken', { path: '/' });
     res.clearCookie('refreshToken', { path: '/' });
+    res.clearCookie('sessionId', { path: '/' });
     
     res.json({ message: 'Logged out successfully' });
   })
