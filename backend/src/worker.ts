@@ -5,7 +5,14 @@ import { logger } from './utils/logger';
 import { db } from './db';
 import { CONSTANTS } from './config/constants';
 import { perplexityService } from './services/perplexity.service';
+import { telegramService } from './services/telegram.service';
 import * as XLSX from 'xlsx';
+
+// CRITICAL: Import telegramService at TOP LEVEL
+// Dynamic imports are FORBIDDEN - they cause:
+// - Performance issues (import on every call)
+// - Memory leaks (service not properly unloaded)
+// - Inconsistent service state
 
 // Redis connection for BullMQ
 const connection = new IORedis(config.redis.url, {
@@ -22,6 +29,39 @@ connection.on('ready', () => {
 });
 
 // ==========================================
+// VALIDATION HELPERS
+// ==========================================
+
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function isValidUUID(str: any): boolean {
+  return typeof str === 'string' && UUID_REGEX.test(str);
+}
+
+function validateExcelField(value: any, fieldName: string, maxLength: number = 255): string {
+  if (value === null || value === undefined) return '';
+  
+  const str = String(value).trim();
+  
+  // Remove dangerous characters
+  const sanitized = str
+    .replace(/[\x00-\x1F\x7F]/g, '') // Remove control characters
+    .replace(/['"\\;]/g, '') // Remove SQL-dangerous chars
+    .substring(0, maxLength);
+  
+  return sanitized;
+}
+
+function validateNumber(value: any, fieldName: string): number | null {
+  if (value === null || value === undefined || value === '') return null;
+  const num = Number(value);
+  if (isNaN(num) || !isFinite(num)) {
+    throw new Error(`${fieldName} must be a valid number`);
+  }
+  return num;
+}
+
+// ==========================================
 // JOB PROCESSORS
 // ==========================================
 
@@ -35,10 +75,51 @@ const processors = {
     try {
       const { fileBuffer, condoId, buildingId, userId } = job.data;
       
+      // CRITICAL: Validate input IDs
+      if (!isValidUUID(condoId)) {
+        throw new Error('Invalid condoId format');
+      }
+      if (!isValidUUID(buildingId)) {
+        throw new Error('Invalid buildingId format');
+      }
+      if (!isValidUUID(userId)) {
+        throw new Error('Invalid userId format');
+      }
+      
+      // CRITICAL: Validate file size (max 50MB)
+      if (!Buffer.isBuffer(fileBuffer)) {
+        throw new Error('Invalid file buffer');
+      }
+      if (fileBuffer.length > 50 * 1024 * 1024) {
+        throw new Error('File too large (max 50MB)');
+      }
+      if (fileBuffer.length === 0) {
+        throw new Error('Empty file');
+      }
+      
+      // Verify user has access to this building/condo
+      const accessCheck = await db.query(
+        `SELECT 1 FROM user_roles ur
+         JOIN roles r ON ur.role_id = r.id
+         WHERE ur.user_id = $1 
+         AND (ur.condo_id = $2 OR r.code IN ('superadmin', 'complex_admin'))
+         LIMIT 1`,
+        [userId, condoId]
+      );
+      
+      if (accessCheck.rows.length === 0) {
+        throw new Error('User does not have access to this condo');
+      }
+      
       // Parse Excel file
       const workbook = XLSX.read(fileBuffer, { type: 'buffer' });
       const sheet = workbook.Sheets[workbook.SheetNames[0]];
       const rows = XLSX.utils.sheet_to_json(sheet);
+      
+      // CRITICAL: Validate row count (max 10,000 rows)
+      if (rows.length > 10000) {
+        throw new Error('Too many rows (max 10,000)');
+      }
       
       let imported = 0;
       let errors = 0;
@@ -48,14 +129,26 @@ const processors = {
         const row: any = rows[i];
         
         try {
-          // Validate required fields
-          if (!row.number || !row.area) {
-            throw new Error(`Row ${i + 2}: Missing required fields (number, area)`);
+          // Validate and sanitize required fields
+          const number = validateExcelField(row.number, 'number', 50);
+          const area = validateNumber(row.area, 'area');
+          
+          if (!number || !area || area <= 0) {
+            throw new Error(`Row ${i + 2}: Missing or invalid required fields (number, area)`);
           }
+          
+          // Sanitize optional fields
+          const floor = validateNumber(row.floor, 'floor');
+          const rooms = validateNumber(row.rooms, 'rooms');
+          const cadastralNumber = validateExcelField(row.cadastral_number, 'cadastral_number', 100);
+          const ownerFullName = validateExcelField(row.owner_full_name, 'owner_full_name', 255);
+          const ownerPhone = validateExcelField(row.owner_phone, 'owner_phone', 20);
+          const ownerEmail = validateExcelField(row.owner_email, 'owner_email', 255);
           
           // Get or create unit type
           let unitTypeId;
-          const typeCode = row.type || 'residential';
+          const typeCode = validateExcelField(row.type || 'residential', 'type', 50);
+          
           const typeResult = await db.query(
             'SELECT id FROM unit_types WHERE code = $1 LIMIT 1',
             [typeCode]
@@ -71,7 +164,7 @@ const processors = {
             unitTypeId = newType.rows[0].id;
           }
           
-          // Insert or update unit
+          // Insert or update unit with parameterized query
           await db.query(
             `INSERT INTO units (
               condo_id, building_id, unit_type_id, number, floor, area, rooms,
@@ -90,14 +183,14 @@ const processors = {
               condoId,
               buildingId,
               unitTypeId,
-              row.number,
-              row.floor || null,
-              row.area,
-              row.rooms || null,
-              row.cadastral_number || null,
-              row.owner_full_name || null,
-              row.owner_phone || null,
-              row.owner_email || null
+              number,
+              floor,
+              area,
+              rooms,
+              cadastralNumber || null,
+              ownerFullName || null,
+              ownerPhone || null,
+              ownerEmail || null
             ]
           );
           
@@ -126,6 +219,11 @@ const processors = {
     
     try {
       const { telegramUserId, message } = job.data;
+      
+      // Validate telegramUserId
+      if (!isValidUUID(telegramUserId)) {
+        throw new Error('Invalid telegramUserId format');
+      }
       
       // Get conversation history
       const historyResult = await db.query(
@@ -178,7 +276,29 @@ const processors = {
     logger.info('Generating invoices', { jobId: job.id });
     
     try {
-      const { condoId, periodStart, periodEnd } = job.data;
+      const { condoId, periodStart, periodEnd, userId } = job.data;
+      
+      // CRITICAL: Validate input
+      if (!isValidUUID(condoId)) {
+        throw new Error('Invalid condoId format');
+      }
+      if (!isValidUUID(userId)) {
+        throw new Error('Invalid userId format');
+      }
+      
+      // CRITICAL: Verify user has permission to generate invoices for this condo
+      const permissionCheck = await db.query(
+        `SELECT 1 FROM user_roles ur
+         JOIN roles r ON ur.role_id = r.id
+         WHERE ur.user_id = $1 
+         AND (ur.condo_id = $2 OR r.code IN ('superadmin', 'complex_admin', 'accountant'))
+         LIMIT 1`,
+        [userId, condoId]
+      );
+      
+      if (permissionCheck.rows.length === 0) {
+        throw new Error('User does not have permission to generate invoices for this condo');
+      }
       
       // Get all active units in condo
       const unitsResult = await db.query(
@@ -285,6 +405,11 @@ const processors = {
     try {
       const { userId, type, title, message, data } = job.data;
       
+      // CRITICAL: Validate userId format
+      if (!isValidUUID(userId)) {
+        throw new Error('Invalid userId format');
+      }
+      
       // Get user's notification preferences
       const userResult = await db.query(
         'SELECT telegram_id, email FROM users WHERE id = $1',
@@ -298,9 +423,8 @@ const processors = {
       const user = userResult.rows[0];
       
       // Send via Telegram if available
+      // CRITICAL: Using static import (NO dynamic imports!)
       if (user.telegram_id) {
-        // Import telegram service dynamically to avoid circular dependency
-        const { telegramService } = await import('./services/telegram.service');
         await telegramService.sendMessage(
           user.telegram_id,
           `*${title}*\n\n${message}`,
@@ -375,20 +499,24 @@ const processors = {
     let hasMore = true;
     
     while (hasMore) {
-      const result = await db.query(
-        `UPDATE audit_logs 
-         SET deleted_at = NOW()
-         WHERE id IN (
-           SELECT id FROM audit_logs
-           WHERE created_at < NOW() - INTERVAL '1 day' * $1
-           AND deleted_at IS NULL
-           LIMIT $2
-         )
-         RETURNING id`,
-        [config.retention.auditLogs, CONSTANTS.CLEANUP_BATCH_SIZE]
-      );
+      // CRITICAL: Added FOR UPDATE SKIP LOCKED
+      const deleted = await db.transaction(async (client) => {
+        const result = await client.query(
+          `UPDATE audit_logs 
+           SET deleted_at = NOW()
+           WHERE id IN (
+             SELECT id FROM audit_logs
+             WHERE created_at < NOW() - INTERVAL '1 day' * $1
+             AND deleted_at IS NULL
+             LIMIT $2
+             FOR UPDATE SKIP LOCKED
+           )
+           RETURNING id`,
+          [config.retention.auditLogs, CONSTANTS.CLEANUP_BATCH_SIZE]
+        );
+        return result.rowCount || 0;
+      });
       
-      const deleted = result.rowCount || 0;
       totalDeleted += deleted;
       hasMore = deleted >= CONSTANTS.CLEANUP_BATCH_SIZE;
       
@@ -408,20 +536,24 @@ const processors = {
     let hasMore = true;
     
     while (hasMore) {
-      const result = await db.query(
-        `UPDATE telegram_messages 
-         SET deleted_at = NOW()
-         WHERE id IN (
-           SELECT id FROM telegram_messages
-           WHERE created_at < NOW() - INTERVAL '1 day' * $1
-           AND deleted_at IS NULL
-           LIMIT $2
-         )
-         RETURNING id`,
-        [CONSTANTS.TELEGRAM_MESSAGES_RETENTION_DAYS, CONSTANTS.CLEANUP_BATCH_SIZE]
-      );
+      // CRITICAL: Added FOR UPDATE SKIP LOCKED
+      const deleted = await db.transaction(async (client) => {
+        const result = await client.query(
+          `UPDATE telegram_messages 
+           SET deleted_at = NOW()
+           WHERE id IN (
+             SELECT id FROM telegram_messages
+             WHERE created_at < NOW() - INTERVAL '1 day' * $1
+             AND deleted_at IS NULL
+             LIMIT $2
+             FOR UPDATE SKIP LOCKED
+           )
+           RETURNING id`,
+          [CONSTANTS.TELEGRAM_MESSAGES_RETENTION_DAYS, CONSTANTS.CLEANUP_BATCH_SIZE]
+        );
+        return result.rowCount || 0;
+      });
       
-      const deleted = result.rowCount || 0;
       totalDeleted += deleted;
       hasMore = deleted >= CONSTANTS.CLEANUP_BATCH_SIZE;
       
@@ -441,20 +573,24 @@ const processors = {
     let hasMore = true;
     
     while (hasMore) {
-      const result = await db.query(
-        `UPDATE refresh_tokens 
-         SET deleted_at = NOW()
-         WHERE id IN (
-           SELECT id FROM refresh_tokens
-           WHERE revoked_at < NOW() - INTERVAL '1 day' * $1
-           AND deleted_at IS NULL
-           LIMIT $2
-         )
-         RETURNING id`,
-        [CONSTANTS.REFRESH_TOKENS_RETENTION_DAYS, CONSTANTS.CLEANUP_BATCH_SIZE]
-      );
+      // CRITICAL: Added FOR UPDATE SKIP LOCKED
+      const deleted = await db.transaction(async (client) => {
+        const result = await client.query(
+          `UPDATE refresh_tokens 
+           SET deleted_at = NOW()
+           WHERE id IN (
+             SELECT id FROM refresh_tokens
+             WHERE revoked_at < NOW() - INTERVAL '1 day' * $1
+             AND deleted_at IS NULL
+             LIMIT $2
+             FOR UPDATE SKIP LOCKED
+           )
+           RETURNING id`,
+          [CONSTANTS.REFRESH_TOKENS_RETENTION_DAYS, CONSTANTS.CLEANUP_BATCH_SIZE]
+        );
+        return result.rowCount || 0;
+      });
       
-      const deleted = result.rowCount || 0;
       totalDeleted += deleted;
       hasMore = deleted >= CONSTANTS.CLEANUP_BATCH_SIZE;
       
@@ -533,12 +669,24 @@ async function getPreviousReading(meterId: string, beforeDate: string): Promise<
 const workers: Worker[] = [];
 const queues: Queue[] = [];
 
+// Concurrency configuration based on job type
+const concurrencyConfig: Record<string, number> = {
+  'import:units': 1,              // Memory-intensive, run sequentially
+  'telegram:message': 5,          // Can run in parallel
+  'billing:generate-invoices': 2, // DB-intensive, limit concurrency
+  'notification:send': 10,        // Lightweight, high concurrency
+  'cleanup:invites': 1,           // DB-intensive, sequential
+  'cleanup:audit-logs': 1,        // DB-intensive, sequential
+  'cleanup:telegram-messages': 1, // DB-intensive, sequential
+  'cleanup:refresh-tokens': 1,    // DB-intensive, sequential
+};
+
 Object.entries(processors).forEach(([queueName, processor]) => {
   // Create queue for scheduling
   const queue = new Queue(queueName, { connection: connection.duplicate() });
   queues.push(queue);
 
-  // Create worker
+  // Create worker with appropriate concurrency
   const worker = new Worker(
     queueName,
     async (job: Job) => {
@@ -551,7 +699,7 @@ Object.entries(processors).forEach(([queueName, processor]) => {
     },
     {
       connection: connection.duplicate(),
-      concurrency: 5,
+      concurrency: concurrencyConfig[queueName] || 5,
       limiter: {
         max: 10,
         duration: 1000,
@@ -568,7 +716,7 @@ Object.entries(processors).forEach(([queueName, processor]) => {
   });
 
   workers.push(worker);
-  logger.info(`Worker started for queue: ${queueName}`);
+  logger.info(`Worker started for queue: ${queueName} (concurrency: ${concurrencyConfig[queueName] || 5})`);
 });
 
 // ==========================================
@@ -634,6 +782,7 @@ process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
 logger.info(`Worker started with ${workers.length} queues and cleanup jobs scheduled`);
+logger.info('CRITICAL: Dynamic imports REMOVED - all services imported statically');
 
 // Export queues for use in other services
 export { queues };
