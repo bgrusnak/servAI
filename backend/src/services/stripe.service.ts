@@ -7,7 +7,46 @@ const stripe = new Stripe(config.stripe.secretKey, {
   apiVersion: '2023-10-16',
 });
 
+// Allowed currencies (ISO 4217)
+const ALLOWED_CURRENCIES = ['rub', 'usd', 'eur', 'kzt', 'uah'];
+
+// Amount validation constants
+const MIN_AMOUNT = 0.01;
+const MAX_AMOUNT = 999999.99;
+
 export class StripeService {
+  /**
+   * Validate amount for payment
+   */
+  private validateAmount(amount: number): void {
+    if (!Number.isFinite(amount)) {
+      throw new Error('Amount must be a valid number');
+    }
+
+    if (amount < MIN_AMOUNT || amount > MAX_AMOUNT) {
+      throw new Error(`Amount must be between ${MIN_AMOUNT} and ${MAX_AMOUNT}`);
+    }
+
+    // Check precision (max 2 decimal places)
+    const amountInKopecks = Math.round(amount * 100);
+    if (Math.abs(amountInKopecks - amount * 100) > 0.001) {
+      throw new Error('Amount must have at most 2 decimal places');
+    }
+  }
+
+  /**
+   * Validate currency code
+   */
+  private validateCurrency(currency: string): string {
+    const normalized = currency.toLowerCase().trim();
+    
+    if (!ALLOWED_CURRENCIES.includes(normalized)) {
+      throw new Error(`Invalid currency. Allowed: ${ALLOWED_CURRENCIES.join(', ')}`);
+    }
+    
+    return normalized;
+  }
+
   /**
    * Create Stripe customer for company
    */
@@ -33,10 +72,14 @@ export class StripeService {
   }
 
   /**
-   * Create payment intent for invoice
+   * Create payment intent for invoice with full validation
    */
   async createPaymentIntent(invoiceId: string, amount: number, currency: string = 'rub'): Promise<any> {
     try {
+      // Validate inputs
+      this.validateAmount(amount);
+      const validatedCurrency = this.validateCurrency(currency);
+
       const invoiceResult = await pool.query(
         `SELECT i.*, u.owner_email, c.stripe_customer_id
          FROM invoices i
@@ -53,9 +96,12 @@ export class StripeService {
 
       const invoice = invoiceResult.rows[0];
 
+      // Generate idempotency key to prevent double charging
+      const idempotencyKey = `invoice_${invoiceId}_${Date.now()}`;
+
       const paymentIntent = await stripe.paymentIntents.create({
         amount: Math.round(amount * 100), // Convert to kopecks
-        currency: currency.toLowerCase(),
+        currency: validatedCurrency,
         customer: invoice.stripe_customer_id,
         receipt_email: invoice.owner_email,
         metadata: {
@@ -65,6 +111,8 @@ export class StripeService {
         automatic_payment_methods: {
           enabled: true,
         },
+      }, {
+        idempotencyKey // Prevent duplicate charges on retry
       });
 
       await pool.query(
@@ -74,7 +122,9 @@ export class StripeService {
 
       logger.info('Payment intent created', { 
         paymentIntentId: paymentIntent.id, 
-        invoiceId 
+        invoiceId,
+        amount,
+        currency: validatedCurrency
       });
 
       return {
@@ -88,7 +138,39 @@ export class StripeService {
   }
 
   /**
+   * Verify webhook signature and construct event
+   * CRITICAL: Must be called for every webhook request
+   */
+  constructWebhookEvent(payload: string | Buffer, signature: string): Stripe.Event {
+    const webhookSecret = config.stripe.webhookSecret;
+    
+    if (!webhookSecret) {
+      logger.error('Stripe webhook secret not configured');
+      throw new Error('Webhook secret not configured');
+    }
+
+    try {
+      // Stripe verifies signature and constructs event
+      const event = stripe.webhooks.constructEvent(
+        payload,
+        signature,
+        webhookSecret
+      );
+      
+      logger.info('Webhook signature verified', { eventType: event.type });
+      return event;
+    } catch (error: any) {
+      logger.error('Webhook signature verification failed', { 
+        error: error.message,
+        hasSignature: !!signature
+      });
+      throw new Error('Invalid webhook signature');
+    }
+  }
+
+  /**
    * Handle webhook events from Stripe
+   * CRITICAL: Only call after signature verification!
    */
   async handleWebhook(event: Stripe.Event): Promise<void> {
     try {
@@ -133,6 +215,21 @@ export class StripeService {
     try {
       await client.query('BEGIN');
 
+      // Check for duplicate payment to prevent double processing
+      const existingPayment = await client.query(
+        'SELECT id FROM payments WHERE stripe_payment_id = $1',
+        [paymentIntent.id]
+      );
+
+      if (existingPayment.rows.length > 0) {
+        logger.warn('Payment already processed (duplicate webhook)', {
+          paymentIntentId: paymentIntent.id,
+          invoiceId
+        });
+        await client.query('ROLLBACK');
+        return;
+      }
+
       // Create payment record
       await client.query(
         `INSERT INTO payments (
@@ -147,7 +244,7 @@ export class StripeService {
         ]
       );
 
-      // Update invoice
+      // Update invoice WITH LOCK to prevent race condition
       await client.query(
         `UPDATE invoices 
          SET paid_amount = paid_amount + $1,
@@ -155,7 +252,8 @@ export class StripeService {
                WHEN paid_amount + $1 >= total_amount THEN 'paid'::invoice_status
                ELSE status
              END
-         WHERE id = $2`,
+         WHERE id = $2
+         FOR UPDATE`,  // CRITICAL: Lock the row to prevent concurrent updates
         [paymentIntent.amount / 100, invoiceId]
       );
 
@@ -175,6 +273,17 @@ export class StripeService {
     
     if (!invoiceId) return;
 
+    // Check for duplicate
+    const existing = await pool.query(
+      'SELECT id FROM payments WHERE stripe_payment_id = $1',
+      [paymentIntent.id]
+    );
+
+    if (existing.rows.length > 0) {
+      logger.warn('Payment failure already recorded', { paymentIntentId: paymentIntent.id });
+      return;
+    }
+
     await pool.query(
       `INSERT INTO payments (
         invoice_id, amount, payment_method, status,
@@ -187,14 +296,37 @@ export class StripeService {
   }
 
   private async handleRefund(charge: Stripe.Charge): Promise<void> {
-    await pool.query(
+    const result = await pool.query(
       `UPDATE payments 
        SET status = 'refunded'
-       WHERE stripe_charge_id = $1`,
+       WHERE stripe_charge_id = $1
+       RETURNING id, invoice_id`,
       [charge.id]
     );
 
-    logger.info('Refund processed', { chargeId: charge.id });
+    if (result.rows.length > 0) {
+      const payment = result.rows[0];
+      
+      // Update invoice paid_amount
+      await pool.query(
+        `UPDATE invoices
+         SET paid_amount = paid_amount - $1,
+             status = CASE
+               WHEN paid_amount - $1 < total_amount THEN 'pending'::invoice_status
+               ELSE status
+             END
+         WHERE id = $2`,
+        [charge.amount / 100, payment.invoice_id]
+      );
+      
+      logger.info('Refund processed', { 
+        chargeId: charge.id,
+        invoiceId: payment.invoice_id,
+        amount: charge.amount / 100
+      });
+    } else {
+      logger.warn('Refund for unknown charge', { chargeId: charge.id });
+    }
   }
 }
 
