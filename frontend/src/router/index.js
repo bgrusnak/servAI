@@ -208,6 +208,61 @@ const router = createRouter({
 
 let loadingTimeout = null;
 
+/**
+ * CRITICAL: Validate route parameters for security
+ */
+function validateRouteParams(to) {
+  // Validate reset password token
+  if (to.name === 'ResetPassword' && to.params.token) {
+    const token = to.params.token;
+    
+    // Accept UUID v4 or 64-char hex token
+    const validTokenRegex = /^[a-f0-9]{64}$|^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    
+    if (!validTokenRegex.test(token)) {
+      console.warn('[Security] Invalid reset token format:', token.substring(0, 8) + '...');
+      return { path: '/login', replace: true };
+    }
+  }
+  
+  // Validate UUID parameters (id, complexId, etc)
+  const uuidParams = ['id', 'complexId', 'buildingId', 'unitId', 'userId'];
+  
+  for (const paramName of uuidParams) {
+    const paramValue = to.params[paramName];
+    
+    if (paramValue) {
+      const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{3}-[0-9a-f]{12}$/i;
+      
+      if (!uuidRegex.test(paramValue)) {
+        console.warn(`[Security] Invalid ${paramName} parameter:`, paramValue);
+        return { name: 'NotFound', replace: true };
+      }
+    }
+  }
+  
+  // Check for path traversal attempts in any parameter
+  const allParams = { ...to.params, ...to.query };
+  
+  for (const [key, value] of Object.entries(allParams)) {
+    if (typeof value === 'string') {
+      // Block path traversal patterns
+      if (value.includes('../') || value.includes('..\\') || value.includes('%2e%2e')) {
+        console.error('[Security] Path traversal attempt detected:', { key, value });
+        return { name: 'NotFound', replace: true };
+      }
+      
+      // Block null bytes
+      if (value.includes('\x00') || value.includes('%00')) {
+        console.error('[Security] Null byte injection attempt:', { key, value });
+        return { name: 'NotFound', replace: true };
+      }
+    }
+  }
+  
+  return null; // Valid
+}
+
 router.beforeEach(async (to, from, next) => {
   Loading.show();
   
@@ -215,6 +270,14 @@ router.beforeEach(async (to, from, next) => {
   loadingTimeout = setTimeout(() => {
     Loading.hide();
   }, 10000);
+  
+  // CRITICAL: Validate route parameters first
+  const paramValidation = validateRouteParams(to);
+  if (paramValidation) {
+    Loading.hide();
+    clearTimeout(loadingTimeout);
+    return next(paramValidation);
+  }
   
   const authStore = useAuthStore();
   const requiresAuth = to.matched.some(record => record.meta.requiresAuth !== false);
@@ -246,6 +309,11 @@ router.beforeEach(async (to, from, next) => {
     if (to.meta.roles && to.meta.roles.length > 0) {
       const hasRole = to.meta.roles.some(role => authStore.hasRole(role));
       if (!hasRole) {
+        console.warn('[Security] Unauthorized access attempt:', {
+          user: authStore.user?.email,
+          requiredRoles: to.meta.roles,
+          path: to.path
+        });
         Loading.hide();
         clearTimeout(loadingTimeout);
         return next({ path: '/', replace: true });
