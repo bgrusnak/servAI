@@ -5,6 +5,8 @@ import { authorize } from '../middleware/authorize.middleware';
 import { logger } from '../utils/logger';
 import rateLimit from 'express-rate-limit';
 import { Counter } from 'prom-client';
+import ipRangeCheck from 'ip-range-check';
+import { config } from '../config';
 
 const router = Router();
 
@@ -24,7 +26,8 @@ const sendMessageLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-// Telegram server IP ranges (as of 2025)
+// Telegram server IP ranges (as of 2026)
+// Source: https://core.telegram.org/bots/webhooks#the-short-version
 const TELEGRAM_IP_RANGES = [
   '149.154.160.0/20',
   '91.108.4.0/22',
@@ -38,19 +41,39 @@ const TELEGRAM_IP_RANGES = [
 ];
 
 /**
- * Check if IP is in allowed ranges
+ * Check if IP is in Telegram's allowed ranges using CIDR
  */
-function isIpInRange(ip: string, ranges: string[]): boolean {
-  // Simple IP check - in production use 'ip-range-check' library
-  // For now, allow all in development
-  if (process.env.NODE_ENV !== 'production') {
+function isIpInTelegramRanges(ip: string): boolean {
+  if (!ip || ip === 'unknown') {
+    return false;
+  }
+
+  // In development, allow localhost/private IPs but log warning
+  if (config.env === 'development') {
+    logger.debug('Development mode: IP whitelist bypassed', { ip });
     return true;
   }
-  
-  // TODO: Implement proper CIDR check with ip-range-check library
-  // For now, log and allow (but track metrics)
-  logger.debug('IP check', { ip, env: process.env.NODE_ENV });
-  return true;
+
+  // In production/staging, strictly check IP ranges
+  try {
+    // Remove IPv6 prefix if present (::ffff:x.x.x.x -> x.x.x.x)
+    const cleanIp = ip.replace(/^::ffff:/, '');
+    
+    const isInRange = ipRangeCheck(cleanIp, TELEGRAM_IP_RANGES);
+    
+    if (!isInRange) {
+      logger.warn('IP not in Telegram ranges', {
+        ip: cleanIp,
+        env: config.env
+      });
+      telegramSecurityEvents.inc({ event_type: 'ip_not_in_range', severity: 'high' });
+    }
+    
+    return isInRange;
+  } catch (error) {
+    logger.error('IP range check error', { ip, error });
+    return false;
+  }
 }
 
 /**
@@ -59,7 +82,7 @@ function isIpInRange(ip: string, ranges: string[]): boolean {
  * 
  * Security:
  * - MANDATORY webhook secret verification
- * - IP whitelist check
+ * - IP whitelist check (CIDR)
  * - Request structure validation
  */
 router.post('/webhook', async (req: Request, res: Response) => {
@@ -83,15 +106,20 @@ router.post('/webhook', async (req: Request, res: Response) => {
       return res.status(403).json({ error: 'Forbidden' });
     }
 
-    // 2. IP whitelist check (log if not from Telegram)
+    // 2. IP whitelist check (strict in production)
     const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
-    if (!isIpInRange(clientIp, TELEGRAM_IP_RANGES)) {
-      logger.warn('Webhook from non-Telegram IP', {
+    if (!isIpInTelegramRanges(clientIp)) {
+      logger.error('Webhook from non-Telegram IP blocked', {
         ip: clientIp,
-        hasValidToken: true
+        hasValidToken: true,
+        env: config.env
       });
-      telegramSecurityEvents.inc({ event_type: 'suspicious_ip', severity: 'medium' });
-      // Don't block yet, just log (could be proxy/load balancer)
+      telegramSecurityEvents.inc({ event_type: 'blocked_non_telegram_ip', severity: 'critical' });
+      
+      // In production, BLOCK non-Telegram IPs even with valid token
+      if (config.env === 'production' || config.env === 'staging') {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
     }
 
     // 3. Validate update structure
@@ -102,6 +130,8 @@ router.post('/webhook', async (req: Request, res: Response) => {
     }
 
     // 4. Process update
+    // Note: We already verified the webhook secret here,
+    // so service can trust this is a legitimate Telegram update
     await telegramService.processWebhookUpdate(req.body);
     
     res.status(200).json({ ok: true });
