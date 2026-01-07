@@ -1,17 +1,14 @@
 import { defineStore } from 'pinia';
 import { authAPI } from '../api';
-import { LocalStorage } from 'quasar';
 import { sanitizeEmail } from '../utils/sanitize';
 
 export const useAuthStore = defineStore('auth', {
   state: () => ({
     user: null,
-    token: LocalStorage.getItem('authToken') || null,
-    refreshToken: LocalStorage.getItem('refreshToken') || null,
-    isAuthenticated: !!LocalStorage.getItem('authToken'),
+    isAuthenticated: false,
     loading: false,
     error: null,
-    rememberMe: LocalStorage.getItem('rememberMe') === 'true'
+    rememberMe: localStorage.getItem('rememberMe') === 'true'
   }),
 
   getters: {
@@ -54,22 +51,20 @@ export const useAuthStore = defineStore('auth', {
         const sanitizedEmail = sanitizeEmail(credentials.email);
         const response = await authAPI.login({
           email: sanitizedEmail,
-          password: credentials.password
+          password: credentials.password,
+          rememberMe: credentials.rememberMe || false
         });
         
-        this.token = response.data.accessToken;
-        this.refreshToken = response.data.refreshToken;
+        // Токены теперь в httpOnly cookies - защищены от XSS
+        // Не сохраняем в localStorage!
         this.user = response.data.user;
         this.isAuthenticated = true;
         
-        LocalStorage.set('authToken', this.token);
-        LocalStorage.set('refreshToken', this.refreshToken);
-        
         if (credentials.rememberMe) {
-          LocalStorage.set('rememberMe', 'true');
+          localStorage.setItem('rememberMe', 'true');
           this.rememberMe = true;
         } else {
-          LocalStorage.remove('rememberMe');
+          localStorage.removeItem('rememberMe');
           this.rememberMe = false;
         }
         
@@ -79,10 +74,6 @@ export const useAuthStore = defineStore('auth', {
         throw error;
       } finally {
         this.loading = false;
-        // Security: Clear password from memory
-        if (credentials.password) {
-          credentials.password = null;
-        }
       }
     },
 
@@ -96,13 +87,9 @@ export const useAuthStore = defineStore('auth', {
           email: sanitizeEmail(userData.email)
         });
         
-        this.token = response.data.accessToken;
-        this.refreshToken = response.data.refreshToken;
+        // Токены в httpOnly cookies
         this.user = response.data.user;
         this.isAuthenticated = true;
-        
-        LocalStorage.set('authToken', this.token);
-        LocalStorage.set('refreshToken', this.refreshToken);
         
         return response.data;
       } catch (error) {
@@ -115,9 +102,7 @@ export const useAuthStore = defineStore('auth', {
 
     async logout() {
       try {
-        if (this.refreshToken) {
-          await authAPI.logout({ refreshToken: this.refreshToken });
-        }
+        await authAPI.logout();
       } catch (error) {
         console.error('Logout API error:', error);
       } finally {
@@ -127,23 +112,18 @@ export const useAuthStore = defineStore('auth', {
 
     clearAuth() {
       this.user = null;
-      this.token = null;
-      this.refreshToken = null;
       this.isAuthenticated = false;
       this.error = null;
       
-      LocalStorage.remove('authToken');
-      LocalStorage.remove('refreshToken');
+      // Токены теперь в httpOnly cookies - удаляются backend'om
+      // Оставляем rememberMe если нужно
       if (!this.rememberMe) {
-        LocalStorage.remove('rememberMe');
+        localStorage.removeItem('rememberMe');
       }
     },
 
     async fetchUser() {
-      if (!this.token) {
-        throw new Error('No token available');
-      }
-      
+      // Токен в httpOnly cookie, отправляется автоматически
       try {
         const response = await authAPI.me();
         this.user = response.data.user;
@@ -157,21 +137,10 @@ export const useAuthStore = defineStore('auth', {
     },
 
     async refreshAccessToken() {
-      if (!this.refreshToken) {
-        throw new Error('No refresh token');
-      }
-      
+      // Refresh токен тоже в httpOnly cookie
       try {
-        const response = await authAPI.refresh({ refreshToken: this.refreshToken });
-        
-        this.token = response.data.accessToken;
-        LocalStorage.set('authToken', this.token);
-        
-        if (response.data.refreshToken) {
-          this.refreshToken = response.data.refreshToken;
-          LocalStorage.set('refreshToken', this.refreshToken);
-        }
-        
+        const response = await authAPI.refresh();
+        // Новые токены автоматически устанавливаются backend'om
         return response.data;
       } catch (error) {
         console.error('Token refresh failed:', error);
@@ -198,10 +167,23 @@ export const useAuthStore = defineStore('auth', {
 
     setUser(user) {
       this.user = user;
+      this.isAuthenticated = !!user;
     },
 
     clearError() {
       this.error = null;
+    },
+
+    // Проверка авторизации при загрузке приложения
+    async initAuth() {
+      try {
+        // Пробуем получить текущего пользователя
+        // Если есть валидный cookie с токеном - получим данные
+        await this.fetchUser();
+      } catch (error) {
+        // Нет валидного токена - это нормально
+        this.clearAuth();
+      }
     }
   }
 });
