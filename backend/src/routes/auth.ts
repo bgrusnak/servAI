@@ -6,6 +6,7 @@ import { authenticate } from '../middleware/auth';
 import { authorize } from '../middleware/authorize.middleware';
 import { asyncHandler } from '../utils/asyncHandler';
 import rateLimit from 'express-rate-limit';
+import { config } from '../config';
 
 const router = Router();
 
@@ -22,6 +23,15 @@ const refreshLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
   message: 'Too many refresh requests',
+});
+
+// Cookie options
+const getCookieOptions = (maxAge: number) => ({
+  httpOnly: true,
+  secure: config.env === 'production',
+  sameSite: 'strict' as const,
+  maxAge,
+  path: '/'
 });
 
 /**
@@ -43,7 +53,12 @@ router.post(
       role: 'resident',
     });
 
-    res.status(201).json(result);
+    // Set httpOnly cookies for tokens
+    res.cookie('accessToken', result.accessToken, getCookieOptions(15 * 60 * 1000)); // 15 min
+    res.cookie('refreshToken', result.refreshToken, getCookieOptions(7 * 24 * 60 * 60 * 1000)); // 7 days
+
+    // Return only user data, NOT tokens
+    res.status(201).json({ user: result.user });
   })
 );
 
@@ -75,7 +90,11 @@ router.post(
       condoId,
     });
 
-    res.status(201).json(result);
+    // Set httpOnly cookies for tokens
+    res.cookie('accessToken', result.accessToken, getCookieOptions(15 * 60 * 1000));
+    res.cookie('refreshToken', result.refreshToken, getCookieOptions(7 * 24 * 60 * 60 * 1000));
+
+    res.status(201).json({ user: result.user });
   })
 );
 
@@ -89,40 +108,57 @@ router.post(
   asyncHandler(async (req, res) => {
     const { email, password } = req.body;
     const result = await authService.login(email.trim().toLowerCase(), password);
-    res.json(result);
+    
+    // Set httpOnly cookies for tokens
+    res.cookie('accessToken', result.accessToken, getCookieOptions(15 * 60 * 1000));
+    res.cookie('refreshToken', result.refreshToken, getCookieOptions(7 * 24 * 60 * 60 * 1000));
+
+    // Return only user data, NOT tokens
+    res.json({ user: result.user });
   })
 );
 
 /**
  * POST /auth/refresh
+ * Reads refresh token from httpOnly cookie
  */
 router.post(
   '/refresh',
   refreshLimiter,
   asyncHandler(async (req, res) => {
-    const { refreshToken } = req.body;
+    const refreshToken = req.cookies.refreshToken;
     
     if (!refreshToken) {
-      return res.status(400).json({ error: 'Refresh token required' });
+      return res.status(401).json({ error: 'Refresh token required' });
     }
     
     const result = await authService.refreshAccessToken(refreshToken);
-    res.json(result);
+    
+    // Set new httpOnly cookies
+    res.cookie('accessToken', result.accessToken, getCookieOptions(15 * 60 * 1000));
+    res.cookie('refreshToken', result.refreshToken, getCookieOptions(7 * 24 * 60 * 60 * 1000));
+
+    res.json({ success: true });
   })
 );
 
 /**
  * POST /auth/logout
+ * Reads refresh token from httpOnly cookie
  */
 router.post(
   '/logout',
   authenticate,
   asyncHandler(async (req, res) => {
-    const { refreshToken } = req.body;
+    const refreshToken = req.cookies.refreshToken;
     
     if (refreshToken) {
       await authService.logout(refreshToken);
     }
+    
+    // Clear cookies
+    res.clearCookie('accessToken', { path: '/' });
+    res.clearCookie('refreshToken', { path: '/' });
     
     res.json({ message: 'Logged out successfully' });
   })
